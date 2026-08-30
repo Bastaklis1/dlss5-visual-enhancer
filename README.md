@@ -2,6 +2,15 @@
 
 This Windows application renders every frame through the supplied DLSS 5 Neural Rendering feature-18 runtime and writes a new video with the original audio and metadata. Optical flow supplies only the current-to-previous motion vectors required by the model. No heuristic depth, masks, sharpening, denoising, resizing, DLAA, ReShade, or RenoDX stage modifies the image.
 
+<img width="1411" height="368" alt="image" src="https://github.com/user-attachments/assets/fc5aceb8-c010-4bf0-be9e-f5e38b29fffa" />
+
+
+# Original
+https://github.com/user-attachments/assets/e959f362-4802-4124-8715-6ebc8491ddeb
+
+# DLSS 5
+https://github.com/user-attachments/assets/d91591a9-2df1-4b4b-b18f-bd4dff73d5bc
+
 ## Start
 
 Double-click `start.bat`. The portable Gradio interface opens at `http://127.0.0.1:7860`. No installation or internet connection is required.

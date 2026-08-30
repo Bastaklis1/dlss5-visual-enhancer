@@ -30,16 +30,6 @@ The native host explicitly selects an NVIDIA adapter on hybrid AMD/Intel systems
 - Optical-flow motion cannot equal engine-provided object motion. Fast motion, occlusions, thin objects, and cuts may show temporal artifacts.
 - The supplied modified model is experimental. Its original snippet checks that its caller is named `nvngx.dll`, so the standalone executable intentionally uses that filename; it is not NVIDIA's NGX core DLL.
 
-## Verified build
-
-Before release cleanup, the test sample rendered completely through the clean runtime: 124/124 direct feature-18 evaluations, 1344×768 H.264, AAC audio, and 5.166 s output duration. A Strong/Cinematic render differed from an encoding-only baseline by RGB MAE 7.41 and PSNR 27.33 dB. Test media and generated results are intentionally not included in this clean package.
-
-The worker uses binary protocol `D5V2`; launch it through `start.bat` rather than interactively.
-
-## Publishing to GitHub
-
-Portable FFmpeg and the DLSSNR model exceed GitHub's normal per-file size limit. This repository includes Git LFS attributes, so install Git LFS and run `git lfs install` before the first commit. Confirm that you have redistribution rights for the supplied modified NVIDIA model before publishing it publicly.
-
 ## Source layout
 
 - `app.py` — Gradio interface.

@@ -1,4 +1,4 @@
-# Portable DLSS 5 Video Converter
+# DLSS 5 Video Converter (Experimental)
 
 This Windows application renders every frame through the supplied DLSS 5 Neural Rendering feature-18 runtime and writes a new video with the original audio and metadata. Optical flow supplies only the current-to-previous motion vectors required by the model. No heuristic depth, masks, sharpening, denoising, resizing, DLAA, ReShade, or RenoDX stage modifies the image.
 

@@ -19,8 +19,6 @@ Outputs and their JSON reports are written to the automatically created `outputs
 - RTX 30: allowed in beta mode and may be extremely slow.
 - RTX 20, non-RTX NVIDIA, AMD, and Intel GPUs: rejected for DLSS processing.
 
-The native host explicitly selects an NVIDIA adapter on hybrid AMD/Intel systems. It was functionally tested here on an RTX 4060 Ti with driver 616.56.
-
 ## Output and limitations
 
 - Source resolution is always preserved. There is no pre-upscaling or DLSS Super Resolution pass.

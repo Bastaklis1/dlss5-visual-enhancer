@@ -6,7 +6,7 @@ This Windows application renders every frame through the supplied DLSS 5 Neural 
 
 
 # Original
-https://github.com/user-attachments/assets/e959f362-4802-4124-8715-6ebc8491ddeb
+https://github.com/user-attachments/assets/f27f61a3-cad3-4278-af66-eb11c54600fb
 
 # DLSS 5
 https://github.com/user-attachments/assets/d91591a9-2df1-4b4b-b18f-bd4dff73d5bc

@@ -1,8 +1,8 @@
 # DLSS 5 Visual Enhancer
 
-Experimental, source-only Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline to images and video through a local Gradio interface. It is an independent community project and is not affiliated with, sponsored by, or endorsed by NVIDIA, ReShade, RenoDX, FFmpeg, or their contributors.
+Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline to images and video through a local Gradio interface. It is an independent community project and is not affiliated with, sponsored by, or endorsed by NVIDIA, ReShade, RenoDX, FFmpeg, or their contributors.
 
-<img width="1411" height="368" alt="image" src="https://github.com/user-attachments/assets/fc5aceb8-c010-4bf0-be9e-f5e38b29fffa" />
+<img width="1403" height="630" alt="image" src="https://github.com/user-attachments/assets/4530410a-af0f-42b5-9ba7-72106e1f5517" />
 
 ### Original
 

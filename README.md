@@ -4,8 +4,6 @@
 
 Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline to images and video through a local Gradio interface. It is an independent community project and is not affiliated with, sponsored by, or endorsed by NVIDIA, ReShade, RenoDX, FFmpeg, or their contributors.
 
-The portable build includes sequential image/video batch processing, shared DLSS model-preset selection, verified feature-18 diagnostics, and RenoDX DLSS5 4.70. See the [changelog](CHANGELOG.md) for the complete update history.
-
 <img width="1403" height="630" alt="image" src="https://github.com/user-attachments/assets/4530410a-af0f-42b5-9ba7-72106e1f5517" />
 
 ### Original

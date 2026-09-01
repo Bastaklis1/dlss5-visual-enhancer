@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 
 import av
@@ -91,17 +92,31 @@ def _run_json(command: list[str]) -> dict:
     return json.loads(result.stdout)
 
 
-def probe_video(path: str | os.PathLike[str]) -> dict:
+def probe_video(
+    path: str | os.PathLike[str], *, count_mode: str = "exact"
+) -> dict:
+    """Probe video metadata, optionally counting decoded frames or packets.
+
+    The default remains the legacy exact decoded-frame count for external callers.
+    Conversion paths use metadata first and pay for exact counting only as fallback.
+    """
+    if count_mode not in {"metadata", "exact", "packets"}:
+        raise ValueError(f"Unknown video count mode: {count_mode!r}.")
+    count_args = {
+        "metadata": [],
+        "exact": ["-count_frames"],
+        "packets": ["-count_packets"],
+    }[count_mode]
     data = _run_json(
         [
             str(FFPROBE),
             "-v",
             "error",
-            "-count_frames",
+            *count_args,
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,time_base,duration,nb_frames,nb_read_frames,color_primaries,color_transfer,color_space:stream_tags=rotate:stream_side_data=rotation",
+            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,time_base,duration,nb_frames,nb_read_frames,nb_read_packets,color_primaries,color_transfer,color_space:stream_tags=rotate:stream_side_data=rotation",
             "-show_entries",
             "format=duration,format_name",
             "-of",
@@ -121,8 +136,16 @@ def probe_video(path: str | os.PathLike[str]) -> dict:
     width, height = int(stream["width"]), int(stream["height"])
     if rotation in (90, 270):
         width, height = height, width
-    frames = int(stream.get("nb_read_frames") or stream.get("nb_frames") or 0)
-    if frames <= 0:
+    if count_mode == "packets":
+        frames = int(stream.get("nb_read_packets") or stream.get("nb_frames") or 0)
+        frame_count_source = "packets" if stream.get("nb_read_packets") else "metadata"
+    elif count_mode == "exact":
+        frames = int(stream.get("nb_read_frames") or stream.get("nb_frames") or 0)
+        frame_count_source = "decoded" if stream.get("nb_read_frames") else "metadata"
+    else:
+        frames = int(stream.get("nb_frames") or 0)
+        frame_count_source = "metadata" if frames > 0 else "unavailable"
+    if count_mode == "exact" and frames <= 0:
         raise ValueError("Could not determine an exact frame count for this video.")
     rate_text = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "30/1"
     rate = Fraction(rate_text) if rate_text != "0/0" else Fraction(30, 1)
@@ -134,6 +157,7 @@ def probe_video(path: str | os.PathLike[str]) -> dict:
         "coded_height": int(stream["height"]),
         "rotation": rotation,
         "frames": frames,
+        "frame_count_source": frame_count_source,
         "fps": float(rate),
         "rate": rate,
         "time_base": Fraction(stream.get("time_base") or "1/1000"),
@@ -147,6 +171,7 @@ def probe_video(path: str | os.PathLike[str]) -> dict:
     }
 
 
+@lru_cache(maxsize=64)
 def _encoder_probe(codec: str, width: int, height: int) -> bool:
     command = [
         str(FFMPEG),
@@ -330,7 +355,13 @@ def _probe_rendered_duration(path: Path) -> float:
     )
 
 
-def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> None:
+def final_mux(
+    temp_video: Path,
+    source: Path,
+    output: Path,
+    container: str,
+    controller: JobController | None = None,
+) -> None:
     duration = _probe_rendered_duration(temp_video)
     if container == "MKV":
         maps = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?"]
@@ -367,15 +398,23 @@ def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> N
         *streams,
         str(output),
     ]
-    result = subprocess.run(
+    process = subprocess.Popen(
         command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
-    if result.returncode:
-        raise RuntimeError("Final audio/metadata mux failed:\n" + result.stderr[-4000:])
+    if controller is not None:
+        controller.register(process)
+    try:
+        _stdout, stderr = process.communicate()
+    finally:
+        if controller is not None:
+            controller.unregister(process)
+    if process.returncode:
+        raise RuntimeError("Final audio/metadata mux failed:\n" + stderr[-4000:])
 
 
 def preview_frame_count(source: Path, seconds: float) -> int:

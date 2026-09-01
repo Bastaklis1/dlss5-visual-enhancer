@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import traceback
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,12 +15,14 @@ from src.images import (
     ImageConversionOptions,
     convert_images,
     decode_image,
+    take_image_preview,
 )
 from src.runtime import (
     LOGS,
     OUTPUTS,
     cancel_active_job,
 )
+from src.prepare import prepare_runtime
 from src.settings import (
     CODEC_CHOICES,
     CONTAINER_CHOICES,
@@ -42,6 +45,7 @@ CONFIG_PATH = Path(__file__).resolve().with_name("config.ini")
 PREVIEW_SECONDS = 3.0
 AUTOMATIC_MASK_CHOICES = ("Off", "On")
 _CONFIG_LOCK = threading.Lock()
+_CURRENT_SETTINGS: UISettings | None = None
 
 APP_CSS = """
 /* Keep the header links identical even when one URL has been visited. */
@@ -149,8 +153,9 @@ def persist_image_settings(
     image_format: str,
     image_quality: float,
 ) -> tuple[str, str, float, float, float, float, float, str]:
+    global _CURRENT_SETTINGS
     with _CONFIG_LOCK:
-        current = load_settings(CONFIG_PATH)
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
         settings = replace(
             current,
             nr_preset=nr_preset,
@@ -164,7 +169,9 @@ def persist_image_settings(
             image_format=image_format,
             image_quality=int(image_quality),
         )
-        save_settings(CONFIG_PATH, settings)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        _CURRENT_SETTINGS = settings
     return _neural_values(settings)
 
 
@@ -181,8 +188,9 @@ def persist_video_settings(
     container: str,
     quality: str,
 ) -> tuple[str, str, float, float, float, float, float, str]:
+    global _CURRENT_SETTINGS
     with _CONFIG_LOCK:
-        current = load_settings(CONFIG_PATH)
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
         settings = replace(
             current,
             nr_preset=nr_preset,
@@ -197,13 +205,17 @@ def persist_video_settings(
             container=container,
             quality=quality,
         )
-        save_settings(CONFIG_PATH, settings)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        _CURRENT_SETTINGS = settings
     return _neural_values(settings)
 
 
 def reset_saved_settings() -> tuple:
+    global _CURRENT_SETTINGS
     with _CONFIG_LOCK:
         save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
+        _CURRENT_SETTINGS = DEFAULT_SETTINGS
     neural = _neural_values(DEFAULT_SETTINGS)
     message = "All Image and Video settings were reset to defaults."
     return (
@@ -413,10 +425,13 @@ def render_image_batch(
 
     gallery = []
     for item in result.successes:
-        with Image.open(item.output_path) as output:
-            preview = output.convert("RGBA")
-            preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
-            gallery.append((preview.copy(), Path(item.output_path).name))
+        preview = take_image_preview(item.output_path)
+        if preview is None:
+            with Image.open(item.output_path) as output:
+                preview = output.convert("RGBA")
+                preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+                preview = preview.copy()
+        gallery.append((preview, Path(item.output_path).name))
     files = [item.output_path for item in result.successes]
     rows = [
         [Path(item.input_path).name, "Complete", Path(item.output_path).name, "; ".join(item.warnings)]
@@ -481,9 +496,10 @@ def build_neural_controls(settings: UISettings):
 
 
 def build_app() -> gr.Blocks:
-    """Build the UI and create a default config only when the application is used."""
-    settings = load_settings(CONFIG_PATH)
-    save_settings(CONFIG_PATH, settings)
+    """Build the UI from the cached settings without rewriting configuration."""
+    global _CURRENT_SETTINGS
+    settings = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+    _CURRENT_SETTINGS = settings
     upload_types = ["image", ".svg", ".heic", ".heif", *sorted(RAW_EXTENSIONS)]
 
     with gr.Blocks(title="DLSS 5 Visual Enhancer") as demo:
@@ -715,6 +731,16 @@ def build_app() -> gr.Blocks:
 
 
 def main() -> None:
+    print("Preparing DLSS, GPU, image, and FFmpeg runtime before launching the UI...", flush=True)
+    try:
+        prepared = prepare_runtime()
+    except Exception as exc:
+        print(f"Startup preparation failed: {exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from exc
+    print(
+        f"Runtime ready on {prepared.gpu['display_name']}; launching Gradio.",
+        flush=True,
+    )
     OUTPUTS.mkdir(exist_ok=True)
     LOGS.mkdir(exist_ok=True)
     demo = build_app()

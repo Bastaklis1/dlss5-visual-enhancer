@@ -7,7 +7,9 @@ import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -76,6 +78,7 @@ def inspect_runtime_bundle(
     neural = neural_path or NEURAL_RUNTIME
     addon_hash = _file_sha256(addon)
     neural_hash = _file_sha256(neural)
+    worker_hash = _file_sha256(WORKER)
     known_pair = (
         addon_hash == EXPECTED_AMPERE_ADDON_SHA256
         and neural_hash == EXPECTED_AMPERE_NEURAL_SHA256
@@ -97,6 +100,10 @@ def inspect_runtime_bundle(
             "matches_expected": neural_hash == EXPECTED_AMPERE_NEURAL_SHA256,
             "version": "310.8.SF-v2",
             "release": "DLSS NR 310.8.SF-v2",
+        },
+        "worker": {
+            "path": str(WORKER.resolve()),
+            "sha256": worker_hash,
         },
     }
 
@@ -221,6 +228,12 @@ class JobController:
     def register(self, process: subprocess.Popen) -> None:
         with self._lock:
             self._processes.append(process)
+            cancelled = self.cancel.is_set()
+        if cancelled and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
 
     def unregister(self, process: subprocess.Popen) -> None:
         with self._lock:
@@ -280,8 +293,61 @@ def drain_text(stream, lines: list[str]) -> None:
         lines.append(raw.decode("utf-8", "replace").rstrip())
 
 
+class BoundedLogBuffer:
+    """Keep diagnostic evidence and a bounded tail instead of every frame log."""
+
+    _IMPORTANT = (
+        "profile applied",
+        "DLSS 5 add-on",
+        "carrier ready",
+        "stream source",
+        "optimal settings",
+        "complete:",
+        "failed",
+        "error",
+        "exception",
+    )
+
+    def __init__(self, max_tail: int = 500, max_important: int = 100) -> None:
+        self._tail: deque[str] = deque(maxlen=max_tail)
+        self._important: list[str] = []
+        self._max_important = max_important
+        self._seen = 0
+        self._lock = threading.Lock()
+
+    def append(self, line: str) -> None:
+        with self._lock:
+            self._seen += 1
+            self._tail.append(line)
+            lowered = line.casefold()
+            if (
+                len(self._important) < self._max_important
+                and any(marker.casefold() in lowered for marker in self._IMPORTANT)
+            ):
+                self._important.append(line)
+
+    def snapshot(self) -> list[str]:
+        with self._lock:
+            important = list(self._important)
+            tail = list(self._tail)
+        seen: set[str] = set()
+        return [line for line in [*important, *tail] if not (line in seen or seen.add(line))]
+
+    @property
+    def dropped_lines(self) -> int:
+        with self._lock:
+            return max(0, self._seen - len(self._tail))
+
+
+def drain_bounded_text(stream, buffer: BoundedLogBuffer) -> None:
+    for raw in iter(stream.readline, b""):
+        buffer.append(raw.decode("utf-8", "replace").rstrip())
+
+
 def resize_fit(rgba: np.ndarray, width: int, height: int) -> np.ndarray:
     source_height, source_width = rgba.shape[:2]
+    if source_width == width and source_height == height:
+        return np.ascontiguousarray(rgba, dtype=np.uint8)
     scale = min(width / source_width, height / source_height)
     fit_width = max(1, min(width, int(round(source_width * scale))))
     fit_height = max(1, min(height, int(round(source_height * scale))))
@@ -304,6 +370,7 @@ def rotate_frame(frame: np.ndarray, rotation: int) -> np.ndarray:
     return frame
 
 
+@lru_cache(maxsize=1)
 def detect_gpu() -> dict:
     command = [
         "nvidia-smi",
@@ -368,6 +435,23 @@ def _read_exact(stream, size: int) -> bytes:
     return bytes(chunks)
 
 
+def _read_exact_into(stream, target: np.ndarray) -> None:
+    view = memoryview(target).cast("B")
+    offset = 0
+    while offset < len(view):
+        count = stream.readinto(view[offset:])
+        if not count:
+            raise EOFError(
+                f"Native worker stopped after {offset} of {len(view)} output bytes"
+            )
+        offset += count
+
+
+def _array_bytes(array: np.ndarray, dtype: np.dtype) -> memoryview:
+    contiguous = np.ascontiguousarray(array, dtype=dtype)
+    return memoryview(contiguous).cast("B")
+
+
 class DLSSFrameSession:
     """A reusable native DLSSNR feature-18 frame stream."""
 
@@ -388,7 +472,7 @@ class DLSSFrameSession:
         controller: JobController,
     ) -> None:
         self.controller = controller
-        self.worker_logs: list[str] = []
+        self._worker_log_buffer = BoundedLogBuffer()
         self.closed = False
         self.factor = factor
         self.mode = mode
@@ -396,9 +480,14 @@ class DLSSFrameSession:
         self.gpu = gpu
         self.runtime_bundle = runtime_bundle
         reshade_log_path = RUNTIME / "ReShade.log"
-        self._reshade_log_baseline = (
-            reshade_log_path.read_bytes() if reshade_log_path.exists() else b""
-        )
+        self._reshade_log_baseline_size = 0
+        self._reshade_log_baseline_tail = b""
+        if reshade_log_path.exists():
+            self._reshade_log_baseline_size = reshade_log_path.stat().st_size
+            with reshade_log_path.open("rb") as stream:
+                tail_size = min(256, self._reshade_log_baseline_size)
+                stream.seek(self._reshade_log_baseline_size - tail_size)
+                self._reshade_log_baseline_tail = stream.read(tail_size)
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.worker = subprocess.Popen(
             [str(WORKER), "--video"],
@@ -411,8 +500,8 @@ class DLSSFrameSession:
         controller.register(self.worker)
         assert self.worker.stderr is not None
         self.worker_thread = threading.Thread(
-            target=drain_text,
-            args=(self.worker.stderr, self.worker_logs),
+            target=drain_bounded_text,
+            args=(self.worker.stderr, self._worker_log_buffer),
             daemon=True,
         )
         self.worker_thread.start()
@@ -506,27 +595,41 @@ class DLSSFrameSession:
         path = RUNTIME / "ReShade.log"
         if not path.exists():
             return ""
-        current = path.read_bytes()
-        if self._reshade_log_baseline and current.startswith(self._reshade_log_baseline):
-            current = current[len(self._reshade_log_baseline) :]
-        return current.decode("utf-8", errors="replace")
+        with path.open("rb") as stream:
+            size = path.stat().st_size
+            can_seek = size >= self._reshade_log_baseline_size
+            tail = self._reshade_log_baseline_tail
+            if can_seek and tail:
+                stream.seek(self._reshade_log_baseline_size - len(tail))
+                can_seek = stream.read(len(tail)) == tail
+            stream.seek(self._reshade_log_baseline_size if can_seek else 0)
+            current = stream.read()
+        text = current.decode("utf-8", errors="replace")
+        process_marker = f"[{self.worker.pid}]"
+        process_lines = [line for line in text.splitlines() if process_marker in line]
+        return "\n".join(process_lines) if process_lines else text
+
+    @property
+    def worker_logs(self) -> list[str]:
+        return self._worker_log_buffer.snapshot()
+
+    @property
+    def worker_log_dropped_lines(self) -> int:
+        return self._worker_log_buffer.dropped_lines
 
     def reshade_diagnostics(self, limit: int = 300) -> list[str]:
         """Return new log lines from this worker, favoring feature-18 evidence."""
         lines = self.reshade_log_text().splitlines()
-        process_marker = f"[{self.worker.pid}]"
-        current_process = [line for line in lines if process_marker in line]
-        selected = current_process or lines
         relevant = [
             line
-            for line in selected
+            for line in lines
             if "DLSS 5 Neural Rendering" in line
             or "DLSSNR" in line
             or "feature 18" in line
             or "exception" in line.lower()
             or "failed" in line.lower()
         ]
-        return (relevant or selected)[-limit:]
+        return (relevant or lines)[-limit:]
 
     def process(
         self,
@@ -542,8 +645,8 @@ class DLSSFrameSession:
         assert self.worker.stdin is not None and self.worker.stdout is not None
         frame_header = struct.pack("<4Iq", FRAME_MAGIC, index, int(reset), 0, pts)
         self.worker.stdin.write(frame_header)
-        self.worker.stdin.write(np.ascontiguousarray(rgba, dtype=np.uint8).tobytes())
-        self.worker.stdin.write(np.ascontiguousarray(motion, dtype=np.float16).tobytes())
+        self.worker.stdin.write(_array_bytes(rgba, np.dtype(np.uint8)))
+        self.worker.stdin.write(_array_bytes(motion, np.dtype(np.float16)))
         self.worker.stdin.flush()
         try:
             result_header = _read_exact(self.worker.stdout, struct.calcsize("<5Iq"))
@@ -569,10 +672,9 @@ class DLSSFrameSession:
             raise RuntimeError(
                 f"Direct feature-18 evaluation failed on frame {index}: 0x{ngx_result:08X}"
             )
-        output = np.frombuffer(
-            _read_exact(self.worker.stdout, byte_count), dtype=np.uint8
-        ).reshape(self.output_height, self.output_width, 4)
-        return output.copy(), out_pts
+        output = np.empty((self.output_height, self.output_width, 4), dtype=np.uint8)
+        _read_exact_into(self.worker.stdout, output)
+        return output, out_pts
 
     def close(self) -> None:
         if self.closed:

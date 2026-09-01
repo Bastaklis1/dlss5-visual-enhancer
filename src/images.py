@@ -26,9 +26,12 @@ from .runtime import (
     DLSSFrameSession,
     active_job,
     detect_gpu,
+    inspect_runtime_bundle,
     resize_fit,
+    validate_gpu_runtime,
     validate_runtime_files,
     verify_feature_18,
+    write_failure_report,
 )
 from .video import (
     ConversionOptions,
@@ -65,6 +68,7 @@ class ImageConversionOptions:
     preserve_metadata: bool = True
     warmup_frames: int = 120
     nr_preset: str = "Default"
+    automatic_mask: bool = False
 
     def neural_options(self) -> ConversionOptions:
         return ConversionOptions(
@@ -74,6 +78,7 @@ class ImageConversionOptions:
             local_tone_strength=self.local_tone_strength,
             local_structure_strength=self.local_structure_strength,
             skin_structure_strength=self.skin_structure_strength,
+            automatic_mask=self.automatic_mask,
             upscaling_factor=self.upscaling_factor,
             warmup_frames=self.warmup_frames,
         )
@@ -430,6 +435,20 @@ def convert_images(
     processed_total = 0
     with active_job() as controller:
         gpu = detect_gpu()
+        runtime_bundle = inspect_runtime_bundle()
+        try:
+            validate_gpu_runtime(gpu, runtime_bundle)
+        except Exception as exc:
+            report_path = write_failure_report(
+                operation="image-batch-runtime-validation",
+                source="; ".join(str(path) for path in paths),
+                error=exc,
+                gpu=gpu,
+                runtime_bundle=runtime_bundle,
+            )
+            raise RuntimeError(f"{exc}\nDiagnostic report: {report_path}") from exc
+        if progress:
+            progress(0.0, f"Starting feature 18 on {gpu['display_name']}")
         total = len(probes)
         for (output_width, output_height), group in groups.items():
             cursor = 0
@@ -451,12 +470,22 @@ def convert_images(
                         factor=factor,
                         mode=mode,
                         native_settings=resolve_native_settings(neural),
+                        gpu=gpu,
+                        runtime_bundle=runtime_bundle,
                         controller=controller,
                     )
                 except Exception as exc:
                     controller.terminate_processes()
+                    report_path = write_failure_report(
+                        operation="image-batch-dlss-setup",
+                        source="; ".join(str(item.path) for item in remaining),
+                        error=exc,
+                        gpu=gpu,
+                        runtime_bundle=runtime_bundle,
+                    )
+                    failure = f"{exc}\nDiagnostic report: {report_path}"
                     for item in remaining:
-                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), str(exc))
+                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), failure)
                     break
 
                 segment: list[tuple[_ImageProbe, ImageConversionResult, _DecodedImage]] = []
@@ -509,7 +538,7 @@ def convert_images(
                             str(output),
                             "",
                             time.perf_counter() - started,
-                            str(gpu["name"]),
+                            str(gpu["display_name"]),
                             item.width,
                             item.height,
                             session.render_width,
@@ -529,8 +558,20 @@ def convert_images(
                         interrupted = True
                         break
                     except Exception as exc:
-                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), str(exc))
                         session.abort()
+                        report_path = write_failure_report(
+                            operation="image-render",
+                            source=str(item.path),
+                            error=exc,
+                            gpu=gpu,
+                            runtime_bundle=runtime_bundle,
+                            worker_code=session.worker.poll(),
+                            worker_logs=session.worker_logs,
+                            reshade_lines=session.reshade_diagnostics(),
+                        )
+                        failures_by_index[item.index] = ImageConversionFailure(
+                            str(item.path), f"{exc}\nDiagnostic report: {report_path}"
+                        )
                         interrupted = True
                         cursor += 1
                         processed_total += 1
@@ -540,6 +581,10 @@ def convert_images(
                     if progress:
                         progress(processed_total / total, f"Rendered {item.path.name}")
 
+                if not segment and interrupted:
+                    if cancelled:
+                        break
+                    continue
                 if not interrupted:
                     try:
                         session.close()
@@ -548,7 +593,9 @@ def convert_images(
                 try:
                     if close_error:
                         raise close_error
-                    evidence = verify_feature_18(session.worker_logs)
+                    evidence = verify_feature_18(
+                        session.worker_logs, session.reshade_log_text()
+                    )
                     assert gpu is not None
                     for item, result, decoded in segment:
                         result.report_path = _write_report(
@@ -556,11 +603,22 @@ def convert_images(
                         )
                         successes_by_index[item.index] = result
                 except Exception as exc:
+                    report_path = write_failure_report(
+                        operation="image-batch-verification",
+                        source="; ".join(str(item.path) for item, _result, _decoded in segment),
+                        error=exc,
+                        gpu=gpu,
+                        runtime_bundle=runtime_bundle,
+                        worker_code=session.worker.poll(),
+                        worker_logs=session.worker_logs,
+                        reshade_lines=session.reshade_diagnostics(),
+                    )
+                    failure = f"{exc}\nDiagnostic report: {report_path}"
                     for item, result, _decoded in segment:
                         output = Path(result.output_path)
                         if output.exists():
                             output.unlink()
-                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), str(exc))
+                        failures_by_index[item.index] = ImageConversionFailure(str(item.path), failure)
                 if cancelled:
                     break
             if cancelled:

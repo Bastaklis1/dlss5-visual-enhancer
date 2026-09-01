@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import struct
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import cv2
 import numpy as np
@@ -17,9 +20,21 @@ RUNTIME = ROOT / "bin" / "runtime"
 FFMPEG = ROOT / "bin" / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFPROBE = ROOT / "bin" / "ffmpeg" / "bin" / "ffprobe.exe"
 WORKER = RUNTIME / "nvngx.dll"  # Signed-snippet caller checks require this image name.
+ADDON = RUNTIME / "renodx-dlss5.addon64"
+NEURAL_RUNTIME = RUNTIME / "nvngx_dlssnr.dll"
 OUTPUTS = ROOT / "outputs"
 LOGS = ROOT / "logs"
 JOBS = ROOT / "jobs"
+
+EXPECTED_AMPERE_ADDON_SHA256 = (
+    "245C06137AD13B1CA03AFAAD5100C1E8F0DCE8C11FE50A9272EA562F33CEA601"
+)
+EXPECTED_AMPERE_NEURAL_SHA256 = (
+    "6EB209E764F39872625DEBD6ABAF45E2BB6322F6F270F781F70C059AE30B3927"
+)
+
+_FINGERPRINT_LOCK = threading.Lock()
+_FINGERPRINT_CACHE: dict[tuple[str, int, int], str] = {}
 
 VIDEO_MAGIC = 0x33563544
 SETUP_MAGIC = 0x33505553
@@ -27,6 +42,168 @@ FRAME_MAGIC = 0x314D5246
 OUT_MAGIC = 0x3154554F
 VIDEO_HEADER_FORMAT = "<13I4f"
 SETUP_RESPONSE_FORMAT = "<11I"
+
+
+def _file_sha256(path: Path) -> str:
+    """Hash a runtime component, cached until its size or modification time changes."""
+    resolved = path.resolve()
+    stat = resolved.stat()
+    key = (str(resolved), stat.st_size, stat.st_mtime_ns)
+    with _FINGERPRINT_LOCK:
+        cached = _FINGERPRINT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    value = digest.hexdigest().upper()
+    with _FINGERPRINT_LOCK:
+        stale = [entry for entry in _FINGERPRINT_CACHE if entry[0] == str(resolved)]
+        for entry in stale:
+            _FINGERPRINT_CACHE.pop(entry, None)
+        _FINGERPRINT_CACHE[key] = value
+    return value
+
+
+def inspect_runtime_bundle(
+    addon_path: Path | None = None,
+    neural_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return reproducible component identities for compatibility checks and reports."""
+    addon = addon_path or ADDON
+    neural = neural_path or NEURAL_RUNTIME
+    addon_hash = _file_sha256(addon)
+    neural_hash = _file_sha256(neural)
+    known_pair = (
+        addon_hash == EXPECTED_AMPERE_ADDON_SHA256
+        and neural_hash == EXPECTED_AMPERE_NEURAL_SHA256
+    )
+    return {
+        "known_ampere_pair": known_pair,
+        "addon": {
+            "path": str(addon.resolve()),
+            "sha256": addon_hash,
+            "expected_sha256": EXPECTED_AMPERE_ADDON_SHA256,
+            "matches_expected": addon_hash == EXPECTED_AMPERE_ADDON_SHA256,
+            "version": "4.60",
+            "release": "RenoDX DLSS5 v4.60",
+        },
+        "neural_runtime": {
+            "path": str(neural.resolve()),
+            "sha256": neural_hash,
+            "expected_sha256": EXPECTED_AMPERE_NEURAL_SHA256,
+            "matches_expected": neural_hash == EXPECTED_AMPERE_NEURAL_SHA256,
+            "version": "310.8.SF-v2",
+            "release": "DLSS NR 310.8.SF-v2",
+        },
+    }
+
+
+def validate_gpu_runtime(
+    gpu: dict[str, Any], bundle: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Require the tested community component pair for experimental Ampere use."""
+    inspected = bundle or inspect_runtime_bundle()
+    if int(gpu.get("generation", 0)) == 30 and not inspected["known_ampere_pair"]:
+        addon_hash = inspected["addon"]["sha256"]
+        neural_hash = inspected["neural_runtime"]["sha256"]
+        raise RuntimeError(
+            f"{gpu.get('name', 'RTX 30-series GPU')} requires the tested experimental Ampere "
+            "runtime pair: RenoDX DLSS5 v4.60 plus DLSS NR 310.8.SF-v2. "
+            f"Installed hashes are add-on {addon_hash} and neural runtime {neural_hash}. "
+            "Restore the matching runtime files before rendering."
+        )
+    return inspected
+
+
+def classify_worker_failure(
+    *,
+    worker_code: int,
+    frame_index: int,
+    worker_logs: list[str],
+    reshade_lines: list[str],
+    gpu: dict[str, Any],
+    runtime_bundle: dict[str, Any],
+) -> str:
+    """Translate native/add-on failures into an actionable feature-18 diagnosis."""
+    evidence = "\n".join([*worker_logs, *reshade_lines])
+    access_violation = (
+        "evaluate raised 0xC0000005" in evidence
+        or "feature 18 evaluate raised an exception" in evidence
+    )
+    generation = int(gpu.get("generation", 0))
+    if access_violation and generation == 30:
+        summary = (
+            "DLSS 5 feature 18 hit access violation 0xC0000005 on the experimental "
+            f"RTX 30-series path before frame {frame_index} completed. Ordinary D3D12/NGX "
+            "initialization may still have succeeded; the failure is inside the patched neural "
+            "runtime/add-on evaluation."
+        )
+        if runtime_bundle.get("known_ampere_pair"):
+            summary += (
+                " The tested v4.60/SF-v2 component pair is installed. Update to the latest "
+                "NVIDIA driver; if the failure remains, this closed community runtime is "
+                "incompatible with this Ampere system and there is no truthful non-neural fallback."
+            )
+    elif access_violation:
+        summary = (
+            f"DLSS 5 feature 18 raised access violation 0xC0000005 before frame {frame_index} "
+            "completed inside the neural runtime/add-on evaluation."
+        )
+    else:
+        summary = (
+            f"Native DLSS worker exited with code {worker_code} before frame {frame_index} "
+            "completed."
+        )
+
+    addon_hash = runtime_bundle.get("addon", {}).get("sha256", "unavailable")
+    neural_hash = runtime_bundle.get("neural_runtime", {}).get("sha256", "unavailable")
+    details = [
+        summary,
+        f"GPU: {gpu.get('name', 'unknown')} | driver: {gpu.get('driver', 'unknown')}",
+        f"RenoDX add-on SHA-256: {addon_hash}",
+        f"DLSSNR runtime SHA-256: {neural_hash}",
+    ]
+    if worker_logs:
+        details.append("Worker log:\n" + "\n".join(worker_logs[-60:]))
+    if reshade_lines:
+        details.append("ReShade feature-18 log:\n" + "\n".join(reshade_lines[-60:]))
+    return "\n".join(details)
+
+
+def write_failure_report(
+    *,
+    operation: str,
+    source: str,
+    error: BaseException | str,
+    gpu: dict[str, Any] | None,
+    runtime_bundle: dict[str, Any] | None,
+    worker_code: int | None = None,
+    worker_logs: list[str] | None = None,
+    reshade_lines: list[str] | None = None,
+    logs_dir: Path | None = None,
+) -> Path:
+    """Persist diagnostics even when the incomplete media output is removed."""
+    destination = logs_dir or LOGS
+    destination.mkdir(parents=True, exist_ok=True)
+    safe_operation = re.sub(r"[^A-Za-z0-9_.-]+", "-", operation).strip("-") or "render"
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
+    report_path = destination / f"{safe_operation}-failure-{stamp}.json"
+    report = {
+        "status": "failure",
+        "operation": operation,
+        "input": source,
+        "error": str(error),
+        "gpu": gpu,
+        "runtime_bundle": runtime_bundle,
+        "worker_exit_code": worker_code,
+        "worker_log": list(worker_logs or []),
+        "reshade_feature_18_log": list(reshade_lines or []),
+    }
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report_path.resolve()
 
 
 class Cancelled(RuntimeError):
@@ -153,6 +330,11 @@ def detect_gpu() -> dict:
         raise RuntimeError(f"{name} is outside the supported RTX 30/40/50 scope.")
     return {
         "name": name,
+        "display_name": (
+            f"{name} (experimental RTX 30 path; may be very slow)"
+            if generation == 30
+            else name
+        ),
         "driver": driver,
         "memory_mb": int(memory),
         "compute_capability": capability,
@@ -167,9 +349,9 @@ def validate_runtime_files() -> None:
         FFPROBE,
         WORKER,
         RUNTIME / "dxgi.dll",
-        RUNTIME / "renodx-dlss5.addon64",
+        ADDON,
         RUNTIME / "nvngx_dlss.dll",
-        RUNTIME / "nvngx_dlssnr.dll",
+        NEURAL_RUNTIME,
     ]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
@@ -201,6 +383,8 @@ class DLSSFrameSession:
         factor: float,
         mode: dict[str, str | int],
         native_settings: dict[str, int | float],
+        gpu: dict[str, Any],
+        runtime_bundle: dict[str, Any],
         controller: JobController,
     ) -> None:
         self.controller = controller
@@ -209,6 +393,12 @@ class DLSSFrameSession:
         self.factor = factor
         self.mode = mode
         self.native_settings = native_settings
+        self.gpu = gpu
+        self.runtime_bundle = runtime_bundle
+        reshade_log_path = RUNTIME / "ReShade.log"
+        self._reshade_log_baseline = (
+            reshade_log_path.read_bytes() if reshade_log_path.exists() else b""
+        )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.worker = subprocess.Popen(
             [str(WORKER), "--video"],
@@ -311,6 +501,33 @@ class DLSSFrameSession:
             self.abort()
             raise
 
+    def reshade_log_text(self) -> str:
+        """Return only ReShade output created during this worker session."""
+        path = RUNTIME / "ReShade.log"
+        if not path.exists():
+            return ""
+        current = path.read_bytes()
+        if self._reshade_log_baseline and current.startswith(self._reshade_log_baseline):
+            current = current[len(self._reshade_log_baseline) :]
+        return current.decode("utf-8", errors="replace")
+
+    def reshade_diagnostics(self, limit: int = 300) -> list[str]:
+        """Return new log lines from this worker, favoring feature-18 evidence."""
+        lines = self.reshade_log_text().splitlines()
+        process_marker = f"[{self.worker.pid}]"
+        current_process = [line for line in lines if process_marker in line]
+        selected = current_process or lines
+        relevant = [
+            line
+            for line in selected
+            if "DLSS 5 Neural Rendering" in line
+            or "DLSSNR" in line
+            or "feature 18" in line
+            or "exception" in line.lower()
+            or "failed" in line.lower()
+        ]
+        return (relevant or selected)[-limit:]
+
     def process(
         self,
         *,
@@ -333,14 +550,15 @@ class DLSSFrameSession:
         except EOFError as exc:
             worker_code = self.worker.wait(timeout=10)
             self.worker_thread.join(timeout=2)
-            details = (
-                "\n".join(self.worker_logs[-60:])
-                or "The worker produced no diagnostic output."
+            details = classify_worker_failure(
+                worker_code=worker_code,
+                frame_index=index,
+                worker_logs=self.worker_logs,
+                reshade_lines=self.reshade_diagnostics(),
+                gpu=self.gpu,
+                runtime_bundle=self.runtime_bundle,
             )
-            raise RuntimeError(
-                f"Native DLSS worker exited with code {worker_code} before frame {index} "
-                f"completed:\n{details}"
-            ) from exc
+            raise RuntimeError(details) from exc
         magic, out_index, ok, byte_count, ngx_result, out_pts = struct.unpack(
             "<5Iq", result_header
         )
@@ -387,13 +605,16 @@ class DLSSFrameSession:
         self.closed = True
 
 
-def verify_feature_18(worker_logs: list[str]) -> dict[str, object]:
-    reshade_log_path = RUNTIME / "ReShade.log"
-    reshade_log = (
-        reshade_log_path.read_text(encoding="utf-8", errors="replace")
-        if reshade_log_path.exists()
-        else ""
-    )
+def verify_feature_18(
+    worker_logs: list[str], reshade_log: str | None = None
+) -> dict[str, object]:
+    if reshade_log is None:
+        reshade_log_path = RUNTIME / "ReShade.log"
+        reshade_log = (
+            reshade_log_path.read_text(encoding="utf-8", errors="replace")
+            if reshade_log_path.exists()
+            else ""
+        )
     feature_created = "feature 18 created via the signed snippet" in reshade_log
     feature_evaluated = "inline feature 18 evaluation succeeded" in reshade_log
     runtime_initialized = "signed DLSSNR 310.8.0 D3D12 runtime initialized" in reshade_log

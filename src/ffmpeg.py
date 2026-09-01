@@ -297,7 +297,41 @@ def start_encoder(
     return process, thread, logs, selected, quality
 
 
+def _probe_rendered_duration(path: Path) -> float:
+    """Read the intermediate video's duration without decoding/counting its frames."""
+    data = _run_json(
+        [
+            str(FFPROBE),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    streams = data.get("streams") or []
+    values = [
+        (streams[0] if streams else {}).get("duration"),
+        (data.get("format") or {}).get("duration"),
+    ]
+    for raw_value in values:
+        try:
+            duration = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    raise RuntimeError(
+        "Could not determine the rendered video's duration for the final audio mux."
+    )
+
+
 def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> None:
+    duration = _probe_rendered_duration(temp_video)
     if container == "MKV":
         maps = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?"]
         streams = ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]
@@ -321,6 +355,8 @@ def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> N
         "-y",
         "-i",
         str(temp_video),
+        "-t",
+        f"{duration:.9f}",
         "-i",
         str(source),
         *maps,
@@ -329,7 +365,6 @@ def final_mux(temp_video: Path, source: Path, output: Path, container: str) -> N
         "-map_chapters",
         "1",
         *streams,
-        "-shortest",
         str(output),
     ]
     result = subprocess.run(

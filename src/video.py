@@ -27,10 +27,13 @@ from .runtime import (
     DLSSFrameSession,
     active_job,
     detect_gpu,
+    inspect_runtime_bundle,
     resize_fit,
     rotate_frame,
+    validate_gpu_runtime,
     validate_runtime_files,
     verify_feature_18,
+    write_failure_report,
 )
 
 
@@ -57,6 +60,7 @@ class ConversionOptions:
     preview_seconds: float | None = None
     preview_frames: int | None = None
     nr_preset: str = "Default"
+    automatic_mask: bool = False
 
 
 NR_PRESETS = {
@@ -179,11 +183,14 @@ def resolve_native_settings(options: ConversionOptions) -> dict[str, int | float
             raise ValueError(f"{label} must be between {minimum:g} and {maximum:g}.")
         validated[label] = value
 
+    if not isinstance(options.automatic_mask, bool):
+        raise ValueError("Automatic Mask must be a boolean value.")
+
     return {
         "profile": 0,
         "preset": preset,
         "style": style,
-        "auto_mask": 0,
+        "auto_mask": int(options.automatic_mask),
         "ui_correction": 0,
         "intensity": validated["NR Intensity"],
         "local_tone": validated["Local Tone Strength"],
@@ -353,6 +360,8 @@ def convert_video(
         job_dir: Path | None = None
         output: Path | None = None
         session: DLSSFrameSession | None = None
+        gpu: dict | None = None
+        runtime_bundle: dict | None = None
         encoder = None
         nut = None
         input_container = None
@@ -365,6 +374,8 @@ def convert_video(
             else:
                 frame_count = int(metadata["frames"])
             gpu = detect_gpu()
+            runtime_bundle = inspect_runtime_bundle()
+            validate_gpu_runtime(gpu, runtime_bundle)
             input_width = int(metadata["width"])
             input_height = int(metadata["height"])
             factor, mode = resolve_upscaling_mode(options.upscaling_factor)
@@ -395,7 +406,7 @@ def convert_video(
             temp_video = job_dir / "processed-video.mkv"
             native = resolve_native_settings(options)
             if progress:
-                progress(0.01, f"Starting feature 18 on {gpu['name']}")
+                progress(0.01, f"Starting feature 18 on {gpu['display_name']}")
 
             session = DLSSFrameSession(
                 input_width=input_width,
@@ -407,6 +418,8 @@ def convert_video(
                 factor=factor,
                 mode=mode,
                 native_settings=native,
+                gpu=gpu,
+                runtime_bundle=runtime_bundle,
                 controller=controller,
             )
             render_width = session.render_width
@@ -513,7 +526,9 @@ def convert_video(
                     "Video encoder failed:\n" + "\n".join(encoder_logs[-40:])
                 )
 
-            feature_evidence = verify_feature_18(session.worker_logs)
+            feature_evidence = verify_feature_18(
+                session.worker_logs, session.reshade_log_text()
+            )
             nr_count = delivered
             nr_upscaling_requested = factor > 1.0
             nr_upscaling_active = bool(feature_evidence["nr_upscaling_active"])
@@ -615,7 +630,7 @@ def convert_video(
                 delivered,
                 nr_count,
                 elapsed,
-                gpu["name"],
+                gpu["display_name"],
                 input_width,
                 input_height,
                 render_width,
@@ -644,7 +659,22 @@ def convert_video(
                 output.unlink()
             if was_cancelled and not isinstance(exc, Cancelled):
                 raise Cancelled("Render stopped by user.") from exc
-            raise
+            if isinstance(exc, Cancelled):
+                raise
+            worker_logs = session.worker_logs if session is not None else []
+            reshade_lines = session.reshade_diagnostics() if session is not None else []
+            worker_code = session.worker.poll() if session is not None else None
+            report_path = write_failure_report(
+                operation="video-render",
+                source=str(source),
+                error=exc,
+                gpu=gpu,
+                runtime_bundle=runtime_bundle,
+                worker_code=worker_code,
+                worker_logs=worker_logs,
+                reshade_lines=reshade_lines,
+            )
+            raise RuntimeError(f"{exc}\nDiagnostic report: {report_path}") from exc
         finally:
             if job_dir and job_dir.exists():
                 shutil.rmtree(job_dir, ignore_errors=True)

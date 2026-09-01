@@ -37,8 +37,11 @@ class UISettings:
     image_format: str = "PNG"
     image_quality: int = 95
     nr_preset: str = "Default"
+    automatic_mask: bool = False
 
-    def component_values(self) -> tuple[str, str, float, float, float, float, float, str, str, str]:
+    def component_values(
+        self,
+    ) -> tuple[str, str, float, float, float, float, float, bool, str, str, str]:
         return (
             self.nr_preset,
             self.nr_style,
@@ -47,6 +50,7 @@ class UISettings:
             self.local_structure_strength,
             self.skin_structure_strength,
             self.upscaling_factor,
+            self.automatic_mask,
             self.codec,
             self.container,
             self.quality,
@@ -65,10 +69,13 @@ def _validate(settings: UISettings) -> UISettings:
             local_tone_strength=settings.local_tone_strength,
             local_structure_strength=settings.local_structure_strength,
             skin_structure_strength=settings.skin_structure_strength,
+            automatic_mask=settings.automatic_mask,
             upscaling_factor=settings.upscaling_factor,
         )
     )
     resolve_upscaling_mode(settings.upscaling_factor)
+    if not isinstance(settings.automatic_mask, bool):
+        raise ValueError("Automatic Mask must be a boolean value.")
     allowed = {
         "Video codec": (settings.codec, CODEC_CHOICES),
         "Container": (settings.container, CONTAINER_CHOICES),
@@ -117,6 +124,13 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         value = number("image_quality", 1, 100, DEFAULT_SETTINGS.image_quality)
         return int(value) if float(value).is_integer() else DEFAULT_SETTINGS.image_quality
 
+    def boolean(key: str, default: bool) -> bool:
+        raw_value = section.get(key)
+        if raw_value is None:
+            return default
+        parsed = configparser.ConfigParser.BOOLEAN_STATES.get(str(raw_value).casefold())
+        return parsed if parsed is not None else default
+
     return UISettings(
         nr_preset=choice("nr_preset", tuple(NR_PRESETS), DEFAULT_SETTINGS.nr_preset),
         nr_style=choice("nr_style", tuple(NR_STYLES), DEFAULT_SETTINGS.nr_style),
@@ -130,6 +144,7 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         skin_structure_strength=number(
             "skin_structure_strength", -1.0, 2.0, DEFAULT_SETTINGS.skin_structure_strength
         ),
+        automatic_mask=boolean("automatic_mask", DEFAULT_SETTINGS.automatic_mask),
         upscaling_factor=upscaling_factor(),
         codec=choice("codec", CODEC_CHOICES, DEFAULT_SETTINGS.codec),
         container=choice("container", CONTAINER_CHOICES, DEFAULT_SETTINGS.container),
@@ -153,6 +168,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "local_tone_strength": f"{settings.local_tone_strength:.2f}",
         "local_structure_strength": f"{settings.local_structure_strength:.2f}",
         "skin_structure_strength": f"{settings.skin_structure_strength:.2f}",
+        "automatic_mask": str(settings.automatic_mask).lower(),
         "upscaling_factor": f"{settings.upscaling_factor:g}",
         "codec": settings.codec,
         "container": settings.container,

@@ -40,11 +40,22 @@ from src.video import (
 
 CONFIG_PATH = Path(__file__).resolve().with_name("config.ini")
 PREVIEW_SECONDS = 3.0
+AUTOMATIC_MASK_CHOICES = ("Off", "On")
 _CONFIG_LOCK = threading.Lock()
 
 APP_CSS = """
+/* Keep the header links identical even when one URL has been visited. */
+#app-title a,
+#app-title a:visited,
+#app-title a:hover,
+#app-title a:active {
+    color: #00bfff !important;
+    opacity: 1 !important;
+}
+
 /* Keep large upload batches compact: roughly three file rows, then scroll. */
-#image-upload-list .file-preview-holder {
+#image-upload-list .file-preview-holder,
+#image-output-list .file-preview-holder {
     max-height: 210px !important;
     overflow-x: hidden !important;
     overflow-y: auto !important;
@@ -52,12 +63,14 @@ APP_CSS = """
     scrollbar-gutter: stable;
 }
 
-#image-upload-list .file-preview {
+#image-upload-list .file-preview,
+#image-output-list .file-preview {
     max-height: none !important;
 }
 
-/* A single input preview is a true 16:9 viewport containing the whole image. */
-#image-input-preview:has(.gallery-item:only-child) {
+/* A single input or output preview is a full 16:9 viewport without scrolling. */
+#image-input-preview:has(.gallery-item:only-child),
+#image-output-preview:has(.gallery-item:only-child) {
     aspect-ratio: 16 / 9;
     height: auto !important;
     min-height: 0 !important;
@@ -67,22 +80,30 @@ APP_CSS = """
 #image-input-preview:has(.gallery-item:only-child) .grid-wrap,
 #image-input-preview:has(.gallery-item:only-child) .grid-container,
 #image-input-preview:has(.gallery-item:only-child) .gallery-item,
-#image-input-preview:has(.gallery-item:only-child) .thumbnail-lg {
+#image-input-preview:has(.gallery-item:only-child) .thumbnail-lg,
+#image-output-preview:has(.gallery-item:only-child) .gallery-container,
+#image-output-preview:has(.gallery-item:only-child) .grid-wrap,
+#image-output-preview:has(.gallery-item:only-child) .grid-container,
+#image-output-preview:has(.gallery-item:only-child) .gallery-item,
+#image-output-preview:has(.gallery-item:only-child) .thumbnail-lg {
     box-sizing: border-box;
     height: 100% !important;
     min-height: 0 !important;
 }
 
-#image-input-preview:has(.gallery-item:only-child) .grid-wrap {
+#image-input-preview:has(.gallery-item:only-child) .grid-wrap,
+#image-output-preview:has(.gallery-item:only-child) .grid-wrap {
     overflow: hidden !important;
 }
 
-#image-input-preview:has(.gallery-item:only-child) .grid-container {
+#image-input-preview:has(.gallery-item:only-child) .grid-container,
+#image-output-preview:has(.gallery-item:only-child) .grid-container {
     grid-template-rows: minmax(0, 1fr) !important;
     grid-auto-rows: minmax(0, 1fr) !important;
 }
 
-#image-input-preview:has(.gallery-item:only-child) img {
+#image-input-preview:has(.gallery-item:only-child) img,
+#image-output-preview:has(.gallery-item:only-child) img {
     height: 100% !important;
     width: 100% !important;
     object-fit: contain !important;
@@ -90,7 +111,20 @@ APP_CSS = """
 """
 
 
-def _neural_values(settings: UISettings) -> tuple[str, str, float, float, float, float, float]:
+def _automatic_mask_choice(enabled: bool) -> str:
+    return "On" if enabled else "Off"
+
+
+def _parse_automatic_mask(value: str) -> bool:
+    if value not in AUTOMATIC_MASK_CHOICES:
+        choices = ", ".join(AUTOMATIC_MASK_CHOICES)
+        raise ValueError(f"Automatic Mask must be one of: {choices}.")
+    return value == "On"
+
+
+def _neural_values(
+    settings: UISettings,
+) -> tuple[str, str, float, float, float, float, float, str]:
     return (
         settings.nr_preset,
         settings.nr_style,
@@ -99,6 +133,7 @@ def _neural_values(settings: UISettings) -> tuple[str, str, float, float, float,
         settings.local_structure_strength,
         settings.skin_structure_strength,
         settings.upscaling_factor,
+        _automatic_mask_choice(settings.automatic_mask),
     )
 
 
@@ -110,9 +145,10 @@ def persist_image_settings(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     image_format: str,
     image_quality: float,
-) -> tuple[str, float, float, float, float, float]:
+) -> tuple[str, str, float, float, float, float, float, str]:
     with _CONFIG_LOCK:
         current = load_settings(CONFIG_PATH)
         settings = replace(
@@ -124,6 +160,7 @@ def persist_image_settings(
             local_structure_strength=local_structure_strength,
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
+            automatic_mask=_parse_automatic_mask(automatic_mask),
             image_format=image_format,
             image_quality=int(image_quality),
         )
@@ -139,10 +176,11 @@ def persist_video_settings(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     codec: str,
     container: str,
     quality: str,
-) -> tuple[str, float, float, float, float, float]:
+) -> tuple[str, str, float, float, float, float, float, str]:
     with _CONFIG_LOCK:
         current = load_settings(CONFIG_PATH)
         settings = replace(
@@ -154,6 +192,7 @@ def persist_video_settings(
             local_structure_strength=local_structure_strength,
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
+            automatic_mask=_parse_automatic_mask(automatic_mask),
             codec=codec,
             container=container,
             quality=quality,
@@ -189,6 +228,7 @@ def _process_video(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     codec: str,
     container: str,
     quality: str,
@@ -206,6 +246,7 @@ def _process_video(
         local_tone_strength=local_tone_strength,
         local_structure_strength=local_structure_strength,
         skin_structure_strength=skin_structure_strength,
+        automatic_mask=_parse_automatic_mask(automatic_mask),
         upscaling_factor=upscaling_factor,
         codec="H.264" if is_preview else codec,
         container="MP4" if is_preview else container,
@@ -256,6 +297,7 @@ def render_video(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     codec: str,
     container: str,
     quality: str,
@@ -263,7 +305,8 @@ def render_video(
 ):
     return _process_video(
         input_path, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor, codec, container, quality, progress, None, None
+        skin_structure_strength, upscaling_factor, automatic_mask, codec, container, quality,
+        progress, None, None
     )
 
 
@@ -276,6 +319,7 @@ def preview_video(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     codec: str,
     container: str,
     quality: str,
@@ -283,8 +327,8 @@ def preview_video(
 ):
     return _process_video(
         input_path, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor, codec, container, quality, progress,
-        PREVIEW_SECONDS, None
+        skin_structure_strength, upscaling_factor, automatic_mask, codec, container, quality,
+        progress, PREVIEW_SECONDS, None
     )
 
 
@@ -297,6 +341,7 @@ def preview_one_frame(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     codec: str,
     container: str,
     quality: str,
@@ -304,7 +349,8 @@ def preview_one_frame(
 ):
     return _process_video(
         input_path, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor, codec, container, quality, progress, None, 1
+        skin_structure_strength, upscaling_factor, automatic_mask, codec, container, quality,
+        progress, None, 1
     )
 
 
@@ -334,6 +380,7 @@ def render_image_batch(
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
+    automatic_mask: str,
     image_format: str,
     image_quality: float,
     progress=gr.Progress(track_tqdm=False),
@@ -349,6 +396,7 @@ def render_image_batch(
         local_tone_strength=local_tone_strength,
         local_structure_strength=local_structure_strength,
         skin_structure_strength=skin_structure_strength,
+        automatic_mask=_parse_automatic_mask(automatic_mask),
         upscaling_factor=upscaling_factor,
         output_format=image_format,
         quality=int(image_quality),
@@ -417,9 +465,18 @@ def build_neural_controls(settings: UISettings):
             label="Skin Structure Strength", info="Skin-specific structure; -1.00 is the native default.",
             buttons=["reset"]
         )
+    automatic_mask = gr.Radio(
+        choices=AUTOMATIC_MASK_CHOICES,
+        value=_automatic_mask_choice(settings.automatic_mask),
+        label="Automatic Mask",
+        info=(
+            "Experimental runtime-generated mask that changes where Neural Rendering is "
+            "applied; it may cause flicker or inconsistent results."
+        ),
+    )
     return [
         nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor
+        skin_structure_strength, upscaling_factor, automatic_mask
     ]
 
 
@@ -430,7 +487,12 @@ def build_app() -> gr.Blocks:
     upload_types = ["image", ".svg", ".heic", ".heif", *sorted(RAW_EXTENSIONS)]
 
     with gr.Blocks(title="DLSS 5 Visual Enhancer") as demo:
-        gr.Markdown("# DLSS 5 Visual Enhancer")
+        gr.Markdown(
+            "# DLSS 5 Visual Enhancer\n"
+            "[Support on Patreon](https://www.patreon.com/MM744) | "
+            "[GitHub](https://github.com/Merserk/dlss5-visual-enhancer)",
+            elem_id="app-title",
+        )
         with gr.Tabs(selected="image"):
             with gr.Tab("Image", id="image"):
                 with gr.Row():
@@ -494,11 +556,13 @@ def build_app() -> gr.Blocks:
                             object_fit="contain",
                             interactive=False,
                             buttons=["download", "download_all", "fullscreen"],
+                            elem_id="image-output-preview",
                         )
                         image_output_files = gr.File(
                             label="Rendered image files",
                             file_count="multiple",
                             interactive=False,
+                            elem_id="image-output-list",
                         )
                         image_zip = gr.DownloadButton(
                             "Download successful images as ZIP"

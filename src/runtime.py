@@ -29,7 +29,7 @@ LOGS = ROOT / "logs"
 JOBS = ROOT / "jobs"
 
 EXPECTED_AMPERE_ADDON_SHA256 = (
-    "245C06137AD13B1CA03AFAAD5100C1E8F0DCE8C11FE50A9272EA562F33CEA601"
+    "D5ADF82EB44B065F4C590AC91FE824BAB07AFEA0EB9F994BDE936710C8593952"
 )
 EXPECTED_AMPERE_NEURAL_SHA256 = (
     "6EB209E764F39872625DEBD6ABAF45E2BB6322F6F270F781F70C059AE30B3927"
@@ -38,12 +38,12 @@ EXPECTED_AMPERE_NEURAL_SHA256 = (
 _FINGERPRINT_LOCK = threading.Lock()
 _FINGERPRINT_CACHE: dict[tuple[str, int, int], str] = {}
 
-VIDEO_MAGIC = 0x33563544
-SETUP_MAGIC = 0x33505553
+VIDEO_MAGIC = 0x34563544
+SETUP_MAGIC = 0x34505553
 FRAME_MAGIC = 0x314D5246
 OUT_MAGIC = 0x3154554F
-VIDEO_HEADER_FORMAT = "<13I4f"
-SETUP_RESPONSE_FORMAT = "<11I"
+VIDEO_HEADER_FORMAT = "<14I4f"
+SETUP_RESPONSE_FORMAT = "<12I"
 
 
 def _file_sha256(path: Path) -> str:
@@ -90,8 +90,8 @@ def inspect_runtime_bundle(
             "sha256": addon_hash,
             "expected_sha256": EXPECTED_AMPERE_ADDON_SHA256,
             "matches_expected": addon_hash == EXPECTED_AMPERE_ADDON_SHA256,
-            "version": "4.60",
-            "release": "RenoDX DLSS5 v4.60",
+            "version": "4.70",
+            "release": "RenoDX DLSS5 v4.70",
         },
         "neural_runtime": {
             "path": str(neural.resolve()),
@@ -118,7 +118,7 @@ def validate_gpu_runtime(
         neural_hash = inspected["neural_runtime"]["sha256"]
         raise RuntimeError(
             f"{gpu.get('name', 'RTX 30-series GPU')} requires the tested experimental Ampere "
-            "runtime pair: RenoDX DLSS5 v4.60 plus DLSS NR 310.8.SF-v2. "
+            "runtime pair: RenoDX DLSS5 v4.70 plus DLSS NR 310.8.SF-v2. "
             f"Installed hashes are add-on {addon_hash} and neural runtime {neural_hash}. "
             "Restore the matching runtime files before rendering."
         )
@@ -150,7 +150,7 @@ def classify_worker_failure(
         )
         if runtime_bundle.get("known_ampere_pair"):
             summary += (
-                " The tested v4.60/SF-v2 component pair is installed. Update to the latest "
+                " The tested v4.70/SF-v2 component pair is installed. Update to the latest "
                 "NVIDIA driver; if the failure remains, this closed community runtime is "
                 "incompatible with this Ampere system and there is no truthful non-neural fallback."
             )
@@ -298,6 +298,7 @@ class BoundedLogBuffer:
 
     _IMPORTANT = (
         "profile applied",
+        "model preset",
         "DLSS 5 add-on",
         "carrier ready",
         "stream source",
@@ -516,6 +517,7 @@ class DLSSFrameSession:
             int(warmup_frames),
             frame_count,
             int(mode["perf_quality"]),
+            int(native["dlss_model_preset"]),
             native["profile"],
             native["preset"],
             native["style"],
@@ -542,7 +544,7 @@ class DLSSFrameSession:
                     or "The worker produced no diagnostic output."
                 )
                 raise RuntimeError(
-                    "The native worker is incompatible with the version-3 upscaling protocol "
+                    "The native worker is incompatible with the version-4 model-preset protocol "
                     f"or failed during DLSS setup (exit {worker_code}):\n{details}"
                 ) from exc
             (
@@ -557,10 +559,11 @@ class DLSSFrameSession:
                 self.minimum_height,
                 self.maximum_width,
                 self.maximum_height,
+                self.applied_dlss_model_preset,
             ) = struct.unpack(SETUP_RESPONSE_FORMAT, setup_data)
             if setup_magic != SETUP_MAGIC:
                 raise RuntimeError(
-                    "The installed native worker does not support the version-3 upscaling protocol. "
+                    "The installed native worker does not support the version-4 model-preset protocol. "
                     "Rebuild it."
                 )
             if not setup_ok:
@@ -577,6 +580,13 @@ class DLSSFrameSession:
             ):
                 raise RuntimeError(
                     "The native worker returned output dimensions different from the request."
+                )
+            requested_model_preset = int(native["dlss_model_preset"])
+            if self.applied_dlss_model_preset != requested_model_preset:
+                raise RuntimeError(
+                    "The native worker acknowledged DLSS model preset "
+                    f"{self.applied_dlss_model_preset} instead of the requested "
+                    f"{requested_model_preset}."
                 )
             if self.render_width < 64 or self.render_height < 64:
                 raise RuntimeError(

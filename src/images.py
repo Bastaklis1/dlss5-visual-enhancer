@@ -18,8 +18,9 @@ import numpy as np
 import pillow_heif
 import rawpy
 import resvg_py
-from PIL import Image, ImageCms, ImageOps
+from PIL import Image, ImageCms, ImageOps, TiffImagePlugin
 
+from .naming import output_filename, require_available_output, validate_rename
 from .runtime import (
     LOGS,
     OUTPUTS,
@@ -33,6 +34,7 @@ from .runtime import (
 )
 from .video import (
     ConversionOptions,
+    DLSS_MODEL_PRESETS,
     resolve_native_settings,
     resolve_output_size,
     resolve_upscaling_mode,
@@ -70,6 +72,9 @@ class ImageConversionOptions:
     warmup_frames: int = 0
     nr_preset: str = "Default"
     automatic_mask: bool = False
+    rename_mode: str = "Auto"
+    custom_suffix: str = "_DLSS5"
+    dlss_model_preset: str = "Default"
 
     def neural_options(self) -> ConversionOptions:
         return ConversionOptions(
@@ -82,6 +87,7 @@ class ImageConversionOptions:
             automatic_mask=self.automatic_mask,
             upscaling_factor=self.upscaling_factor,
             warmup_frames=self.warmup_frames,
+            dlss_model_preset=self.dlss_model_preset,
         )
 
 
@@ -101,6 +107,8 @@ class ImageConversionResult:
     upscaling_factor: float
     dlss_mode: str
     output_format: str
+    dlss_model_preset: str = "Default"
+    applied_dlss_model_preset: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -151,6 +159,21 @@ def _report_data(decoded: _DecodedImage) -> _ImageReportData:
     return _ImageReportData(decoded.decoder, decoded.metadata, decoded.warnings)
 
 
+def _json_safe_metadata(value: object) -> object:
+    """Create a report-only JSON-safe copy without changing save metadata."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, TiffImagePlugin.IFDRational):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe_metadata(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_metadata(item) for item in value]
+    if isinstance(value, bytes):
+        return {"type": "bytes", "length": len(value)}
+    return str(value)
+
+
 def _validate_options(options: ImageConversionOptions) -> ConversionOptions:
     if options.output_format not in IMAGE_FORMATS:
         raise ValueError(f"Unknown image output format: {options.output_format!r}.")
@@ -162,6 +185,7 @@ def _validate_options(options: ImageConversionOptions) -> ConversionOptions:
         raise ValueError("Image quality must be an integer from 1 to 100.") from exc
     if quality != options.quality or not 1 <= quality <= 100:
         raise ValueError("Image quality must be an integer from 1 to 100.")
+    validate_rename(options.rename_mode, options.custom_suffix)
     neural = options.neural_options()
     resolve_native_settings(neural)
     resolve_upscaling_mode(neural.upscaling_factor)
@@ -390,10 +414,23 @@ def save_image(
     return warnings
 
 
-def _output_path(source: Path, output_format: str, stamp: str, index: int) -> Path:
+def _output_path(
+    source: Path,
+    output_format: str,
+    stamp: str,
+    index: int,
+    rename_mode: str,
+    custom_suffix: str,
+) -> Path:
     suffix = IMAGE_EXTENSIONS[output_format]
     safe_stem = source.stem.strip().rstrip(".") or "image"
-    return OUTPUTS / f"{safe_stem}_DLSS5_IMAGE_{stamp}-{index + 1:04d}{suffix}"
+    return OUTPUTS / output_filename(
+        source,
+        suffix,
+        rename_mode,
+        custom_suffix,
+        f"{safe_stem}_DLSS5_IMAGE_{stamp}-{index + 1:04d}",
+    )
 
 
 def _write_report(
@@ -412,7 +449,7 @@ def _write_report(
         "gpu": gpu,
         "decoder": decoded.decoder,
         "source_metadata": {
-            key: value
+            key: _json_safe_metadata(value)
             for key, value in decoded.metadata.items()
             if key not in {"icc_profile", "exif", "xmp"}
         },
@@ -426,12 +463,25 @@ def _write_report(
         "output_dimensions": {"width": result.output_width, "height": result.output_height},
         "dlss_mode": result.dlss_mode,
         "requested_upscaling_factor": result.upscaling_factor,
+        "dlss_model_preset": result.dlss_model_preset,
+        "requested_dlss_model_preset": result.dlss_model_preset,
+        "requested_dlss_model_preset_code": DLSS_MODEL_PRESETS[
+            result.dlss_model_preset
+        ],
+        "applied_dlss_model_preset": result.applied_dlss_model_preset,
+        "applied_dlss_model_preset_name": next(
+            name
+            for name, code in DLSS_MODEL_PRESETS.items()
+            if code == result.applied_dlss_model_preset
+        ),
         "pipeline": "renodx-dlssnr-feature18-image",
         "feature_id": 18,
         "feature_18_confirmed": True,
         "ngx_setup_result": f"0x{session.setup_result:08X}",
         "carrier_create_result": evidence["carrier_create_result"],
         "native_settings": session.native_settings,
+        "addon_release": session.runtime_bundle["addon"]["release"],
+        "addon_sha256": session.runtime_bundle["addon"]["sha256"].lower(),
         "model_sha256": session.runtime_bundle["neural_runtime"]["sha256"].lower(),
         "worker_sha256": session.runtime_bundle["worker"]["sha256"].lower(),
         "worker_log": session.worker_logs,
@@ -515,6 +565,36 @@ def convert_images(
             )
         except Exception as exc:
             failures_by_index[index] = ImageConversionFailure(str(path), str(exc))
+
+    planned_outputs: dict[int, Path] = {}
+    reserved_outputs: set[str] = set()
+    available_probes: list[_ImageProbe] = []
+    for probe in probes:
+        output = _output_path(
+            probe.path,
+            options.output_format,
+            stamp,
+            probe.index,
+            options.rename_mode,
+            options.custom_suffix,
+        )
+        output_key = str(output.resolve()).casefold()
+        try:
+            require_available_output(output)
+            if output_key in reserved_outputs:
+                raise FileExistsError(
+                    f"More than one input would create {output.name}. "
+                    "Choose Auto naming or use unique input names."
+                )
+        except Exception as exc:
+            failures_by_index[probe.index] = ImageConversionFailure(
+                str(probe.path), str(exc)
+            )
+            continue
+        reserved_outputs.add(output_key)
+        planned_outputs[probe.index] = output
+        available_probes.append(probe)
+    probes = available_probes
 
     if not probes:
         manifest_path, zip_path = _build_manifest_and_zip(
@@ -658,7 +738,7 @@ def convert_images(
                                 )
                             )
                             processed[..., 3] = alpha
-                            output = _output_path(item.path, options.output_format, stamp, item.index)
+                            output = planned_outputs[item.index]
                             result = ImageConversionResult(
                                 str(item.path),
                                 str(output),
@@ -674,6 +754,8 @@ def convert_images(
                                 float(options.upscaling_factor),
                                 str(session.mode["name"]),
                                 options.output_format,
+                                options.dlss_model_preset,
+                                session.applied_dlss_model_preset,
                                 list(decoded.warnings),
                             )
                             encoding = encode_executor.submit(

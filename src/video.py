@@ -7,17 +7,18 @@ import queue
 import shutil
 import threading
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import av
 import cv2
 import numpy as np
 
 from . import ffmpeg
+from .naming import output_filename, require_available_output, validate_rename
 from .runtime import (
     JOBS,
     LOGS,
@@ -56,6 +57,9 @@ class ConversionOptions:
     preview_frames: int | None = None
     nr_preset: str = "Default"
     automatic_mask: bool = False
+    rename_mode: str = "Auto"
+    custom_suffix: str = "_DLSS5"
+    dlss_model_preset: str = "Default"
 
 
 NR_PRESETS = {
@@ -69,6 +73,14 @@ NR_STYLES = {
     "Default": 0,
     "Natural": 1,
     "Cinematic": 2,
+}
+
+DLSS_MODEL_PRESETS = {
+    "Default": 0,
+    "J": 10,
+    "K": 11,
+    "L": 12,
+    "M": 13,
 }
 
 UPSCALING_MODES = {
@@ -160,6 +172,15 @@ def resolve_native_settings(options: ConversionOptions) -> dict[str, int | float
             f"Unknown NR Style: {options.nr_style!r}. Choose one of: {choices}."
         ) from exc
 
+    try:
+        model_preset = DLSS_MODEL_PRESETS[options.dlss_model_preset]
+    except KeyError as exc:
+        choices = ", ".join(DLSS_MODEL_PRESETS)
+        raise ValueError(
+            f"Unknown DLSS Model Preset: {options.dlss_model_preset!r}. "
+            f"Choose one of: {choices}."
+        ) from exc
+
     controls = {
         "NR Intensity": (options.nr_intensity, 0.0, 2.0),
         "Local Tone Strength": (options.local_tone_strength, 0.0, 2.0),
@@ -191,6 +212,7 @@ def resolve_native_settings(options: ConversionOptions) -> dict[str, int | float
         "local_tone": validated["Local Tone Strength"],
         "local_structure": validated["Local Structure Strength"],
         "skin_structure": validated["Skin Structure Strength"],
+        "dlss_model_preset": model_preset,
     }
 
 
@@ -210,6 +232,34 @@ class ConversionResult:
     output_height: int
     upscaling_factor: float
     dlss_mode: str
+    dlss_model_preset: str = "Default"
+    applied_dlss_model_preset: int = 0
+
+
+@dataclass(slots=True)
+class VideoConversionSuccess:
+    index: int
+    input_path: str
+    result: ConversionResult
+
+
+@dataclass(slots=True)
+class VideoConversionFailure:
+    index: int
+    input_path: str
+    error: str
+    cancelled: bool = False
+
+
+@dataclass(slots=True)
+class VideoBatchResult:
+    successes: list[VideoConversionSuccess]
+    failures: list[VideoConversionFailure]
+    cancelled: bool
+    manifest_path: str
+
+
+_BATCH_CONTEXT = threading.local()
 
 
 @dataclass(slots=True)
@@ -310,6 +360,7 @@ def convert_video(
     if not source.is_file():
         raise FileNotFoundError(source)
     validate_codec_container(options.codec, options.container)
+    validate_rename(options.rename_mode, options.custom_suffix)
     preview_seconds, preview_frames = _validate_preview_options(options)
     is_preview = preview_seconds is not None or preview_frames is not None
     if options.preserve_hdr:
@@ -317,9 +368,14 @@ def convert_video(
             "HDR preservation is disabled in this build because the verified DLSSNR path is "
             "RGBA8. HDR input is converted to SDR instead of being mislabeled as HDR."
         )
-    prepared_runtime = prepare_runtime()
+    prepared_runtime = getattr(_BATCH_CONTEXT, "prepared_runtime", None)
+    if prepared_runtime is None:
+        prepared_runtime = prepare_runtime()
+    batch_controller = getattr(_BATCH_CONTEXT, "controller", None)
+    job_context = nullcontext(batch_controller) if batch_controller is not None else active_job()
 
-    with active_job() as controller:
+    with job_context as controller:
+        assert controller is not None
         started = time.perf_counter()
         timings: dict[str, float] = {}
         job_dir: Path | None = None
@@ -383,7 +439,14 @@ def convert_video(
                     else "DLSS5_PREVIEW"
                 )
             )
-            output = OUTPUTS / f"{source.stem}_{output_kind}_{stamp}{extension}"
+            output = OUTPUTS / output_filename(
+                source,
+                extension,
+                options.rename_mode,
+                options.custom_suffix,
+                f"{source.stem}_{output_kind}_{stamp}",
+            )
+            require_available_output(output)
             temp_video = job_dir / "processed-video.mkv"
             native = resolve_native_settings(options)
             if progress:
@@ -708,6 +771,15 @@ def convert_video(
                     else ("preview-frame" if preview_frames is not None else "preview")
                 ),
                 "dlss_mode": mode["name"],
+                "dlss_model_preset": options.dlss_model_preset,
+                "requested_dlss_model_preset": options.dlss_model_preset,
+                "requested_dlss_model_preset_code": native["dlss_model_preset"],
+                "applied_dlss_model_preset": session.applied_dlss_model_preset,
+                "applied_dlss_model_preset_name": next(
+                    name
+                    for name, code in DLSS_MODEL_PRESETS.items()
+                    if code == session.applied_dlss_model_preset
+                ),
                 "requested_upscaling_factor": factor,
                 "input_dimensions": {"width": input_width, "height": input_height},
                 "negotiated_render_dimensions": {
@@ -733,6 +805,8 @@ def convert_video(
                 "feature_18_confirmed": True,
                 "carrier_create_result": carrier_create_result,
                 "successful_neural_rendering_frames": nr_count,
+                "addon_release": runtime_bundle["addon"]["release"],
+                "addon_sha256": runtime_bundle["addon"]["sha256"].lower(),
                 "model_sha256": runtime_bundle["neural_runtime"]["sha256"].lower(),
                 "worker_sha256": runtime_bundle["worker"]["sha256"].lower(),
                 "loaded_module_inventory": [
@@ -771,11 +845,16 @@ def convert_video(
                 output_height,
                 factor,
                 str(mode["name"]),
+                options.dlss_model_preset,
+                session.applied_dlss_model_preset,
             )
         except Exception as exc:
             was_cancelled = controller.cancel.is_set()
             pipeline_stop.set()
-            controller.stop()
+            if controller.cancel.is_set():
+                controller.stop()
+            else:
+                controller.terminate_processes()
             for target in (prepared_frames if "prepared_frames" in locals() else None,
                            rendered_frames if "rendered_frames" in locals() else None):
                 if target is not None:
@@ -814,3 +893,122 @@ def convert_video(
             pipeline_stop.set()
             if job_dir and job_dir.exists():
                 shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def _write_video_batch_manifest(
+    stamp: str,
+    options: ConversionOptions,
+    successes: list[VideoConversionSuccess],
+    failures: list[VideoConversionFailure],
+    cancelled: bool,
+) -> str:
+    LOGS.mkdir(exist_ok=True)
+    manifest = {
+        "status": "cancelled" if cancelled else ("partial" if failures else "success"),
+        "options": asdict(options),
+        "successes": [asdict(item) for item in successes],
+        "failures": [asdict(item) for item in failures],
+    }
+    manifest_path = LOGS / f"DLSS5_VIDEO_BATCH_{stamp}.manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return str(manifest_path)
+
+
+def convert_videos(
+    input_paths: Iterable[str | os.PathLike[str]],
+    options: ConversionOptions | None = None,
+    progress: Callable[[float, str], None] | None = None,
+) -> VideoBatchResult:
+    """Convert videos sequentially while holding one cancellable GPU batch slot."""
+    from .prepare import prepare_runtime
+
+    options = options or ConversionOptions()
+    paths = [Path(path).resolve() for path in input_paths]
+    if not paths:
+        raise ValueError("Choose at least one video.")
+
+    prepared_runtime = prepare_runtime()
+    LOGS.mkdir(exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
+    successes: list[VideoConversionSuccess] = []
+    failures: list[VideoConversionFailure] = []
+    cancelled = False
+    total = len(paths)
+
+    with active_job() as controller:
+        if getattr(_BATCH_CONTEXT, "controller", None) is not None:
+            raise RuntimeError("A video batch is already active on this worker thread.")
+        _BATCH_CONTEXT.controller = controller
+        _BATCH_CONTEXT.prepared_runtime = prepared_runtime
+        try:
+            for index, path in enumerate(paths):
+                position = index + 1
+                prefix = f"[{position}/{total}] {path.name}"
+                if controller.cancel.is_set():
+                    cancelled = True
+                    failures.extend(
+                        VideoConversionFailure(
+                            queued_index,
+                            str(queued),
+                            "Cancelled before rendering.",
+                            cancelled=True,
+                        )
+                        for queued_index, queued in enumerate(paths[index:], start=index)
+                    )
+                    break
+
+                def report_item(
+                    value: float,
+                    message: str,
+                    *,
+                    item_index: int = index,
+                    item_prefix: str = prefix,
+                ) -> None:
+                    bounded = min(1.0, max(0.0, float(value)))
+                    overall = (item_index + bounded) / total
+                    if progress:
+                        progress(overall, f"{item_prefix} — {message}")
+
+                if progress:
+                    progress(index / total, f"{prefix} — starting")
+                try:
+                    result = convert_video(path, options, progress=report_item)
+                except Cancelled:
+                    cancelled = True
+                    failures.append(
+                        VideoConversionFailure(
+                            index,
+                            str(path),
+                            "Cancelled during rendering.",
+                            cancelled=True,
+                        )
+                    )
+                    failures.extend(
+                        VideoConversionFailure(
+                            queued_index,
+                            str(queued),
+                            "Cancelled before rendering.",
+                            cancelled=True,
+                        )
+                        for queued_index, queued in enumerate(paths[position:], start=position)
+                    )
+                    break
+                except Exception as exc:
+                    failures.append(VideoConversionFailure(index, str(path), str(exc)))
+                    if progress:
+                        progress(position / total, f"{prefix} — failed")
+                    continue
+
+                successes.append(VideoConversionSuccess(index, str(path), result))
+                if progress:
+                    progress(position / total, f"{prefix} — complete")
+        finally:
+            del _BATCH_CONTEXT.controller
+            del _BATCH_CONTEXT.prepared_runtime
+
+    manifest_path = _write_video_batch_manifest(
+        stamp, options, successes, failures, cancelled
+    )
+    if progress:
+        progress(1.0, "Cancelled" if cancelled else "Complete")
+    return VideoBatchResult(successes, failures, cancelled, manifest_path)

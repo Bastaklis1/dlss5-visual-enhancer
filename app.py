@@ -17,6 +17,7 @@ from src.images import (
     decode_image,
     take_image_preview,
 )
+from src.naming import RENAME_MODES
 from src.runtime import (
     LOGS,
     OUTPUTS,
@@ -34,10 +35,12 @@ from src.settings import (
 )
 from src.video import (
     ConversionOptions,
+    DLSS_MODEL_PRESETS,
     NR_PRESETS,
     NR_STYLES,
     UPSCALING_CHOICES,
     convert_video,
+    convert_videos,
 )
 
 
@@ -59,7 +62,9 @@ APP_CSS = """
 
 /* Keep large upload batches compact: roughly three file rows, then scroll. */
 #image-upload-list .file-preview-holder,
-#image-output-list .file-preview-holder {
+#image-output-list .file-preview-holder,
+#video-upload-list .file-preview-holder,
+#video-output-list .file-preview-holder {
     max-height: 210px !important;
     overflow-x: hidden !important;
     overflow-y: auto !important;
@@ -68,7 +73,9 @@ APP_CSS = """
 }
 
 #image-upload-list .file-preview,
-#image-output-list .file-preview {
+#image-output-list .file-preview,
+#video-upload-list .file-preview,
+#video-output-list .file-preview {
     max-height: none !important;
 }
 
@@ -126,6 +133,10 @@ def _parse_automatic_mask(value: str) -> bool:
     return value == "On"
 
 
+def rename_suffix_update(mode: str):
+    return gr.update(interactive=mode == "Custom")
+
+
 def _neural_values(
     settings: UISettings,
 ) -> tuple[str, str, float, float, float, float, float, str]:
@@ -141,6 +152,12 @@ def _neural_values(
     )
 
 
+def _shared_dlss_values(
+    settings: UISettings,
+) -> tuple[str, str, float, float, float, float, float, str, str]:
+    return (*_neural_values(settings), settings.dlss_model_preset)
+
+
 def persist_image_settings(
     nr_preset: str,
     nr_style: str,
@@ -150,9 +167,12 @@ def persist_image_settings(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
     image_format: str,
     image_quality: float,
-) -> tuple[str, str, float, float, float, float, float, str]:
+    rename_mode: str,
+    custom_suffix: str,
+) -> tuple[str, str, float, float, float, float, float, str, str]:
     global _CURRENT_SETTINGS
     with _CONFIG_LOCK:
         current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
@@ -166,13 +186,16 @@ def persist_image_settings(
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
             automatic_mask=_parse_automatic_mask(automatic_mask),
+            dlss_model_preset=dlss_model_preset,
             image_format=image_format,
             image_quality=int(image_quality),
+            image_rename_mode=rename_mode,
+            image_custom_suffix=custom_suffix,
         )
         if settings != current:
             save_settings(CONFIG_PATH, settings)
         _CURRENT_SETTINGS = settings
-    return _neural_values(settings)
+    return _shared_dlss_values(settings)
 
 
 def persist_video_settings(
@@ -184,10 +207,13 @@ def persist_video_settings(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
     codec: str,
     container: str,
     quality: str,
-) -> tuple[str, str, float, float, float, float, float, str]:
+    rename_mode: str,
+    custom_suffix: str,
+) -> tuple[str, str, float, float, float, float, float, str, str]:
     global _CURRENT_SETTINGS
     with _CONFIG_LOCK:
         current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
@@ -201,14 +227,17 @@ def persist_video_settings(
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
             automatic_mask=_parse_automatic_mask(automatic_mask),
+            dlss_model_preset=dlss_model_preset,
             codec=codec,
             container=container,
             quality=quality,
+            video_rename_mode=rename_mode,
+            video_custom_suffix=custom_suffix,
         )
         if settings != current:
             save_settings(CONFIG_PATH, settings)
         _CURRENT_SETTINGS = settings
-    return _neural_values(settings)
+    return _shared_dlss_values(settings)
 
 
 def reset_saved_settings() -> tuple:
@@ -216,23 +245,27 @@ def reset_saved_settings() -> tuple:
     with _CONFIG_LOCK:
         save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
         _CURRENT_SETTINGS = DEFAULT_SETTINGS
-    neural = _neural_values(DEFAULT_SETTINGS)
+    shared = _shared_dlss_values(DEFAULT_SETTINGS)
     message = "All Image and Video settings were reset to defaults."
     return (
-        *neural,
-        *neural,
+        *shared,
+        *shared,
         DEFAULT_SETTINGS.image_format,
         DEFAULT_SETTINGS.image_quality,
+        DEFAULT_SETTINGS.image_rename_mode,
+        gr.update(value=DEFAULT_SETTINGS.image_custom_suffix, interactive=False),
         DEFAULT_SETTINGS.codec,
         DEFAULT_SETTINGS.container,
         DEFAULT_SETTINGS.quality,
+        DEFAULT_SETTINGS.video_rename_mode,
+        gr.update(value=DEFAULT_SETTINGS.video_custom_suffix, interactive=False),
         message,
         message,
     )
 
 
 def _process_video(
-    input_path: str,
+    input_path: str | None,
     nr_preset: str,
     nr_style: str,
     nr_intensity: float,
@@ -241,6 +274,7 @@ def _process_video(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
     codec: str,
     container: str,
     quality: str,
@@ -259,6 +293,7 @@ def _process_video(
         local_structure_strength=local_structure_strength,
         skin_structure_strength=skin_structure_strength,
         automatic_mask=_parse_automatic_mask(automatic_mask),
+        dlss_model_preset=dlss_model_preset,
         upscaling_factor=upscaling_factor,
         codec="H.264" if is_preview else codec,
         container="MP4" if is_preview else container,
@@ -276,15 +311,18 @@ def _process_video(
         traceback.print_exc()
         raise gr.Error(str(exc)) from exc
     output_preview = result.output_path if options.container == "MP4" else None
+    source_name = Path(input_path).name
     if preview_frames is not None:
         return output_preview, (
-            f"One-frame preview complete on {result.gpu} in {result.elapsed_seconds:.1f}s. "
+            f"One-frame preview complete for {source_name} on {result.gpu} "
+            f"in {result.elapsed_seconds:.1f}s. "
             f"DLSS {result.dlss_mode}: {result.render_width}×{result.render_height} → "
             f"{result.output_width}×{result.output_height}. Signed feature 18 confirmed."
         )
     if is_preview:
         return output_preview, (
-            f"Preview complete: {result.frames} frames from the first {PREVIEW_SECONDS:g} seconds processed "
+            f"Preview complete for {source_name}: {result.frames} frames from the first "
+            f"{PREVIEW_SECONDS:g} seconds processed "
             f"on {result.gpu} in {result.elapsed_seconds:.1f}s. DLSS {result.dlss_mode}: "
             f"{result.render_width}×{result.render_height} → {result.output_width}×{result.output_height}. "
             "All frames returned success with signed feature 18 confirmed."
@@ -310,6 +348,7 @@ def render_video(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
     codec: str,
     container: str,
     quality: str,
@@ -317,13 +356,37 @@ def render_video(
 ):
     return _process_video(
         input_path, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor, automatic_mask, codec, container, quality,
+        skin_structure_strength, upscaling_factor, automatic_mask, dlss_model_preset,
+        codec, container, quality,
         progress, None, None
     )
 
 
-def preview_video(
-    input_path: str,
+def _normalize_video_paths(paths: list[str] | str | None) -> list[str]:
+    if not paths:
+        return []
+    return [paths] if isinstance(paths, str) else list(paths)
+
+
+def first_video_path(paths: list[str] | str | None) -> str | None:
+    normalized = _normalize_video_paths(paths)
+    return normalized[0] if normalized else None
+
+
+def update_video_preview_mode(paths: list[str] | str | None):
+    normalized = _normalize_video_paths(paths)
+    single = len(normalized) == 1
+    input_value = normalized[0] if single else None
+    return (
+        gr.update(value=input_value, visible=single),
+        gr.update(value=None, visible=single),
+        gr.update(visible=single),
+        gr.update(visible=single),
+    )
+
+
+def render_video_batch(
+    input_paths: list[str] | str | None,
     nr_preset: str,
     nr_style: str,
     nr_intensity: float,
@@ -332,20 +395,122 @@ def preview_video(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
+    codec: str,
+    container: str,
+    quality: str,
+    rename_mode: str,
+    custom_suffix: str,
+    progress=gr.Progress(track_tqdm=False),
+) -> tuple[object, list[str], list[list[str]], str]:
+    paths = _normalize_video_paths(input_paths)
+    if not paths:
+        raise gr.Error("Choose at least one video first.")
+    options = ConversionOptions(
+        nr_preset=nr_preset,
+        nr_style=nr_style,
+        nr_intensity=nr_intensity,
+        local_tone_strength=local_tone_strength,
+        local_structure_strength=local_structure_strength,
+        skin_structure_strength=skin_structure_strength,
+        automatic_mask=_parse_automatic_mask(automatic_mask),
+        dlss_model_preset=dlss_model_preset,
+        upscaling_factor=upscaling_factor,
+        codec=codec,
+        container=container,
+        quality=quality,
+        rename_mode=rename_mode,
+        custom_suffix=custom_suffix,
+    )
+
+    def report(value: float, message: str) -> None:
+        progress(value, desc=message)
+
+    try:
+        result = convert_videos(paths, options, progress=report)
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(str(exc)) from exc
+
+    ordered_rows: list[tuple[int, list[str]]] = []
+    for item in result.successes:
+        conversion = item.result
+        details = (
+            f"{conversion.frames} frames in {conversion.elapsed_seconds:.1f}s; "
+            f"DLSS {conversion.dlss_mode}: "
+            f"{conversion.render_width}×{conversion.render_height} → "
+            f"{conversion.output_width}×{conversion.output_height}; "
+            f"report: {conversion.report_path}"
+        )
+        ordered_rows.append(
+            (
+                item.index,
+                [
+                    Path(item.input_path).name,
+                    "Complete",
+                    Path(conversion.output_path).name,
+                    details,
+                ],
+            )
+        )
+    for item in result.failures:
+        state = "Skipped" if item.error == "Cancelled before rendering." else (
+            "Cancelled" if item.cancelled else "Failed"
+        )
+        ordered_rows.append(
+            (item.index, [Path(item.input_path).name, state, "", item.error])
+        )
+    rows = [row for _index, row in sorted(ordered_rows, key=lambda entry: entry[0])]
+    files = [item.result.output_path for item in result.successes]
+    output_preview = None
+    if len(paths) == 1 and result.successes:
+        candidate = result.successes[0].result.output_path
+        if Path(candidate).suffix.lower() == ".mp4":
+            output_preview = candidate
+    failed_count = sum(not item.cancelled for item in result.failures)
+    cancelled_count = sum(
+        item.cancelled and item.error != "Cancelled before rendering."
+        for item in result.failures
+    )
+    skipped_count = sum(
+        item.error == "Cancelled before rendering." for item in result.failures
+    )
+    state = "Cancelled" if result.cancelled else "Complete"
+    status = (
+        f"{state}: {len(result.successes)} completed, {failed_count} failed, "
+        f"{cancelled_count} cancelled, {skipped_count} skipped. "
+        f"Batch manifest: {result.manifest_path}"
+    )
+    return gr.update(value=output_preview, visible=len(paths) == 1), files, rows, status
+
+
+def preview_video(
+    input_path: list[str] | str | None,
+    nr_preset: str,
+    nr_style: str,
+    nr_intensity: float,
+    local_tone_strength: float,
+    local_structure_strength: float,
+    skin_structure_strength: float,
+    upscaling_factor: float,
+    automatic_mask: str,
+    dlss_model_preset: str,
     codec: str,
     container: str,
     quality: str,
     progress=gr.Progress(track_tqdm=False),
 ):
+    selected = first_video_path(input_path)
     return _process_video(
-        input_path, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor, automatic_mask, codec, container, quality,
+        selected, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
+        skin_structure_strength, upscaling_factor, automatic_mask, dlss_model_preset,
+        codec, container, quality,
         progress, PREVIEW_SECONDS, None
     )
 
 
 def preview_one_frame(
-    input_path: str,
+    input_path: list[str] | str | None,
     nr_preset: str,
     nr_style: str,
     nr_intensity: float,
@@ -354,14 +519,17 @@ def preview_one_frame(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
     codec: str,
     container: str,
     quality: str,
     progress=gr.Progress(track_tqdm=False),
 ):
+    selected = first_video_path(input_path)
     return _process_video(
-        input_path, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
-        skin_structure_strength, upscaling_factor, automatic_mask, codec, container, quality,
+        selected, nr_preset, nr_style, nr_intensity, local_tone_strength, local_structure_strength,
+        skin_structure_strength, upscaling_factor, automatic_mask, dlss_model_preset,
+        codec, container, quality,
         progress, None, 1
     )
 
@@ -393,8 +561,11 @@ def render_image_batch(
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
+    dlss_model_preset: str,
     image_format: str,
     image_quality: float,
+    rename_mode: str,
+    custom_suffix: str,
     progress=gr.Progress(track_tqdm=False),
 ):
     if not input_paths:
@@ -409,9 +580,12 @@ def render_image_batch(
         local_structure_strength=local_structure_strength,
         skin_structure_strength=skin_structure_strength,
         automatic_mask=_parse_automatic_mask(automatic_mask),
+        dlss_model_preset=dlss_model_preset,
         upscaling_factor=upscaling_factor,
         output_format=image_format,
         quality=int(image_quality),
+        rename_mode=rename_mode,
+        custom_suffix=custom_suffix,
     )
 
     def report(value: float, message: str) -> None:
@@ -495,6 +669,18 @@ def build_neural_controls(settings: UISettings):
     ]
 
 
+def build_dlss_model_control(settings: UISettings):
+    return gr.Dropdown(
+        choices=list(DLSS_MODEL_PRESETS),
+        value=settings.dlss_model_preset,
+        label="DLSS Model Preset",
+        info=(
+            "Default lets NVIDIA select its normal mode-specific presets. "
+            "J, K, L, or M forces that model preset for every DLSS scaling mode."
+        ),
+    )
+
+
 def build_app() -> gr.Blocks:
     """Build the UI from the cached settings without rewriting configuration."""
     global _CURRENT_SETTINGS
@@ -534,6 +720,8 @@ def build_app() -> gr.Blocks:
                             "DLSS 5 Neural Rendering Settings", open=True
                         ):
                             image_neural = build_neural_controls(settings)
+                        with gr.Accordion("DLSS 5 Settings", open=True):
+                            image_model_preset = build_dlss_model_control(settings)
                         with gr.Row():
                             image_format = gr.Dropdown(
                                 list(IMAGE_FORMATS),
@@ -554,6 +742,22 @@ def build_app() -> gr.Blocks:
                                 info=(
                                     "Used by JPEG, WebP, and AVIF; ignored by PNG/TIFF."
                                 ),
+                            )
+                        with gr.Row():
+                            image_rename_mode = gr.Radio(
+                                RENAME_MODES,
+                                value=settings.image_rename_mode,
+                                label="Rename",
+                                info=(
+                                    "Auto adds the current DLSS5 timestamp; Copy keeps the "
+                                    "original base name; Custom appends your suffix."
+                                ),
+                            )
+                            image_custom_suffix = gr.Textbox(
+                                value=settings.image_custom_suffix,
+                                label="Custom suffix",
+                                placeholder="_DLSS5",
+                                interactive=settings.image_rename_mode == "Custom",
                             )
                         gr.Markdown(
                             "Images are processed as 8-bit SDR sRGB. Animated and multipage "
@@ -594,13 +798,25 @@ def build_app() -> gr.Blocks:
             with gr.Tab("Video", id="video"):
                 with gr.Row():
                     with gr.Column(scale=3):
-                        video_source = gr.Video(
-                            label="Input video", sources=["upload"], format=None
+                        video_sources = gr.File(
+                            label="Input video(s)",
+                            file_count="multiple",
+                            file_types=["video"],
+                            type="filepath",
+                            allow_reordering=True,
+                            elem_id="video-upload-list",
+                        )
+                        video_input_preview = gr.Video(
+                            label="Input video preview",
+                            interactive=False,
+                            visible=False,
                         )
                         with gr.Accordion(
                             "DLSS 5 Neural Rendering Settings", open=True
                         ):
                             video_neural = build_neural_controls(settings)
+                        with gr.Accordion("DLSS 5 Settings", open=True):
+                            video_model_preset = build_dlss_model_control(settings)
                         video_quality = gr.Radio(
                             QUALITY_CHOICES,
                             value=settings.quality,
@@ -624,6 +840,22 @@ def build_app() -> gr.Blocks:
                                 value=settings.container,
                                 label="Container",
                             )
+                        with gr.Row():
+                            video_rename_mode = gr.Radio(
+                                RENAME_MODES,
+                                value=settings.video_rename_mode,
+                                label="Rename",
+                                info=(
+                                    "Auto adds the current DLSS5 timestamp; Copy keeps the "
+                                    "original base name; Custom appends your suffix."
+                                ),
+                            )
+                            video_custom_suffix = gr.Textbox(
+                                value=settings.video_custom_suffix,
+                                label="Custom suffix",
+                                placeholder="_DLSS5",
+                                interactive=settings.video_rename_mode == "Custom",
+                            )
                         gr.Checkbox(
                             value=False,
                             interactive=False,
@@ -633,29 +865,77 @@ def build_app() -> gr.Blocks:
                             ),
                         )
                         with gr.Row():
-                            video_preview_frame = gr.Button("Preview 1 frame")
-                            video_preview = gr.Button("Preview 3 sec")
-                            video_render = gr.Button("Render", variant="primary")
+                            video_preview_frame = gr.Button(
+                                "Preview 1 frame", visible=False
+                            )
+                            video_preview = gr.Button("Preview 3 sec", visible=False)
+                            video_render = gr.Button("Render video(s)", variant="primary")
                             video_stop = gr.Button("Stop", variant="stop")
                             video_reset = gr.Button("Reset settings")
                         video_status = gr.Textbox(label="Status", interactive=False)
                     with gr.Column(scale=3):
-                        output_video = gr.Video(label="Output video", interactive=False)
+                        output_video = gr.Video(
+                            label="Output video",
+                            interactive=False,
+                            visible=False,
+                        )
+                        video_output_files = gr.File(
+                            label="Rendered video files",
+                            file_count="multiple",
+                            interactive=False,
+                            elem_id="video-output-list",
+                        )
+                        video_results = gr.Dataframe(
+                            headers=["Input", "Result", "Output", "Details"],
+                            datatype=["str", "str", "str", "str"],
+                            interactive=False,
+                            label="Batch results",
+                            wrap=True,
+                        )
 
-        image_inputs = [image_sources, *image_neural, image_format, image_quality]
+        image_inputs = [
+            image_sources,
+            *image_neural,
+            image_model_preset,
+            image_format,
+            image_quality,
+            image_rename_mode,
+            image_custom_suffix,
+        ]
         video_inputs = [
-            video_source,
+            video_sources,
             *video_neural,
+            video_model_preset,
+            video_codec,
+            video_container,
+            video_quality,
+            video_rename_mode,
+            video_custom_suffix,
+        ]
+        video_preview_inputs = [
+            video_sources,
+            *video_neural,
+            video_model_preset,
             video_codec,
             video_container,
             video_quality,
         ]
-        image_settings_inputs = [*image_neural, image_format, image_quality]
+        image_settings_inputs = [
+            *image_neural,
+            image_model_preset,
+            image_format,
+            image_quality,
+            image_rename_mode,
+            image_custom_suffix,
+        ]
         video_settings_inputs = [
             *video_neural,
+            video_model_preset,
             video_codec,
             video_container,
             video_quality,
+            video_rename_mode,
+            video_custom_suffix,
         ]
 
         image_sources.change(
@@ -665,18 +945,42 @@ def build_app() -> gr.Blocks:
             queue=False,
             show_progress="hidden",
         )
+        video_sources.change(
+            update_video_preview_mode,
+            inputs=video_sources,
+            outputs=[
+                video_input_preview,
+                output_video,
+                video_preview_frame,
+                video_preview,
+            ],
+            queue=False,
+            show_progress="hidden",
+        )
+        image_rename_mode.change(
+            rename_suffix_update,
+            inputs=image_rename_mode,
+            outputs=image_custom_suffix,
+            queue=False,
+        )
+        video_rename_mode.change(
+            rename_suffix_update,
+            inputs=video_rename_mode,
+            outputs=video_custom_suffix,
+            queue=False,
+        )
         for component in image_settings_inputs:
             component.input(
                 persist_image_settings,
                 inputs=image_settings_inputs,
-                outputs=video_neural,
+                outputs=[*video_neural, video_model_preset],
                 queue=False,
             )
         for component in video_settings_inputs:
             component.input(
                 persist_video_settings,
                 inputs=video_settings_inputs,
-                outputs=image_neural,
+                outputs=[*image_neural, image_model_preset],
                 queue=False,
             )
 
@@ -695,20 +999,20 @@ def build_app() -> gr.Blocks:
         image_stop.click(cancel_active_job, outputs=image_status, queue=False)
 
         video_render.click(
-            render_video,
+            render_video_batch,
             inputs=video_inputs,
-            outputs=[output_video, video_status],
+            outputs=[output_video, video_output_files, video_results, video_status],
             concurrency_limit=1,
         )
         video_preview.click(
             preview_video,
-            inputs=video_inputs,
+            inputs=video_preview_inputs,
             outputs=[output_video, video_status],
             concurrency_limit=1,
         )
         video_preview_frame.click(
             preview_one_frame,
-            inputs=video_inputs,
+            inputs=video_preview_inputs,
             outputs=[output_video, video_status],
             concurrency_limit=1,
         )
@@ -716,12 +1020,18 @@ def build_app() -> gr.Blocks:
 
         reset_outputs = [
             *image_neural,
+            image_model_preset,
             *video_neural,
+            video_model_preset,
             image_format,
             image_quality,
+            image_rename_mode,
+            image_custom_suffix,
             video_codec,
             video_container,
             video_quality,
+            video_rename_mode,
+            video_custom_suffix,
             image_status,
             video_status,
         ]

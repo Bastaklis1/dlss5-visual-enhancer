@@ -12,7 +12,11 @@ https://github.com/user-attachments/assets/f27f61a3-cad3-4278-af66-eb11c54600fb
 
 ### DLSS 5
 
-https://github.com/user-attachments/assets/d91591a9-2df1-4b4b-b18f-bd4dff73d5bc
+https://github.com/user-attachments/assets/564767ae-e1ef-4dcd-89d7-862120e8ab2c
+
+### Frame Generation (DLSSG)
+
+https://github.com/user-attachments/assets/de7154ed-59d0-4a28-8005-47a7eee5d3e9
 
 ## Installation
 

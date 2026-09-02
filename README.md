@@ -45,26 +45,6 @@ The application creates `outputs/`, `logs/`, and `jobs/` when needed. Successful
 - Frame Interpolation requires a GPU and NVIDIA driver that report DLSS Frame Generation support, Hardware-accelerated GPU scheduling (HAGS) enabled in Windows, and the validated DLSSG runtime included with the release.
 - Frame Interpolation accepts SDR video. PQ/HLG HDR input is rejected instead of being silently converted.
 
-## How processing works
-
-1. The selected AI Processing GPU is validated against the supported RTX architecture and runtime before Neural Rendering starts.
-2. The input is decoded to 8-bit SDR RGBA and its orientation and dimensions are normalized.
-3. The selected fixed DLSS mode determines the output size; the native worker negotiates its required render size.
-4. `Default` leaves NVIDIA's mode-specific DLSS render-preset hints untouched. J, K, L, or M forces and verifies the selected hint for DLAA, Quality, Balanced, Performance, and Ultra Performance before optimal-settings lookup and feature creation.
-5. Images send zero motion with a history reset. Video uses OpenCV DIS optical flow for current-to-previous motion, with resets on the first frame and detected scene changes.
-6. Frames are streamed through the version 4 protocol to the project-specific D3D12 worker, which hosts the ReShade/RenoDX DLSS feature-18 path and acknowledges the applied model preset.
-7. Alpha is restored for images. Video frames are sent to FFmpeg with source presentation timestamps and encoded on the selected Video Processing GPU when using NVENC, then audio, metadata, chapters, and compatible subtitles are muxed.
-8. ReShade evidence and output properties are verified. Unverified or incomplete results are deleted; successful renders receive JSON reports containing requested/applied presets, dimensions, GPU/encoder data, RenoDX/model/worker hashes, logs, and feature evidence.
-
-Frame Interpolation uses a separate DLSS Frame Generation path:
-
-1. The source video is probed for its frame rate, timing, dimensions, rotation, and HDR state, then the selected AI GPU, NVIDIA driver, HAGS state, DLSSG runtime, and Frame Generation capability are checked.
-2. The selected output FPS is mapped to an exact output timeline. `Auto` uses an exact native DLSSG multiplier when available and otherwise uses the 2× cascade path; output rates above 6× the source rate are rejected.
-3. Source frames and optical-flow guide vectors are sent to DLSS Frame Generation. Scene cuts and timestamp discontinuities reset interpolation history so unrelated scenes are not blended together.
-4. Generated and source frames are selected on the requested output timeline and encoded using the selected Video Processing GPU when using H.264, HEVC, or AV1.
-5. Original audio, metadata, chapters, and supported subtitles are muxed into the finished file.
-6. The final FPS and frame count are verified. Successful renders receive JSON reports containing the selected interpolation path, frame counts, scene-cut data, GPU/runtime information, encoder information, and timings.
-
 ## Settings
 
 | Neural control | Values | Default |
@@ -127,25 +107,6 @@ H.264, HEVC, and AV1 require working NVENC support on the selected or automatica
 | Settings preset | Export all adjustable Image, Video, Frame Interpolation, and GPU settings to JSON, or import a preset to apply and save them |
 
 Saved GPU selections use stable GPU identity. If a previously saved GPU is no longer available, that selection returns to Automatic rather than silently switching to another saved device.
-
-## Portable runtime layout
-
-The release is self-contained and uses the runtime files under `bin/`. Startup validates the required files, NVIDIA GPU support, architecture/runtime compatibility, and pinned compatibility identities before opening the interface.
-
-| Path | Purpose and ownership |
-| --- | --- |
-| `bin/python-3.13.15-embed-amd64/` | Embedded Python 3.13 runtime and application packages |
-| `bin/ffmpeg/bin/ffmpeg.exe`, `ffprobe.exe` | FFmpeg processing, encoding, muxing, verification, and probing tools |
-| `bin/runtime/nvngx.dll` | Project-specific standalone D3D12 worker, named for its caller contract; it is **not** NVIDIA's NGX core DLL |
-| `bin/runtime/dxgi.dll` | ReShade carrier with add-on support |
-| `bin/runtime/renodx-dlss5.addon64` | RenoDX DLSS5 4.70 Neural Rendering add-on; the installed binary is checked against the pinned release hash |
-| `bin/runtime/nvngx_dlss.dll`, `nvngx_dlssnr.dll` | DLSS/NGX runtime and neural-rendering components; NVIDIA proprietary terms apply to genuine NVIDIA SDK files |
-| `bin/runtime/frame_interpolation/dlssg/nvngx_dlssg.dll` | NVIDIA DLSS Frame Generation runtime used by Frame Interpolation; its pinned hash and Windows signature are validated before use |
-| `bin/runtime/frame_interpolation/dlssg/dlssg-worker.exe` | Project-specific D3D12 worker used for DLSS Frame Generation capability probing and interpolation |
-| `bin/runtime/frame_interpolation/dlssg/manifest.json` | Pinned Frame Interpolation runtime and worker identity information |
-| `bin/runtime/ReShade.ini`, `ReShade.log` | Generated automatically while the native Neural Rendering worker runs; they are not required in a clean package |
-
-Do not replace or redistribute proprietary or closed-source components through unauthorized mirrors. A filename alone does not establish authenticity or redistribution rights.
 
 ## License and third-party notices
 

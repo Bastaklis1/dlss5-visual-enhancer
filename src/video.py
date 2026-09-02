@@ -27,6 +27,7 @@ from .runtime import (
     DLSSFrameSession,
     active_job,
     resize_fit,
+    resolve_runtime_ai_gpu,
     rotate_frame,
     verify_feature_18,
     write_failure_report,
@@ -42,6 +43,8 @@ validate_codec_container = ffmpeg.validate_codec_container
 
 @dataclass(slots=True)
 class ConversionOptions:
+    ai_gpu_uuid: str = "auto"
+    video_gpu_uuid: str = "auto"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
     local_tone_strength: float = 1.0
@@ -381,7 +384,10 @@ def convert_video(
         job_dir: Path | None = None
         output: Path | None = None
         session: DLSSFrameSession | None = None
-        gpu: dict | None = dict(prepared_runtime.gpu)
+        gpu: dict | None = resolve_runtime_ai_gpu(
+            prepared_runtime.gpus, prepared_runtime.runtime_bundle, options.ai_gpu_uuid
+        )
+        video_gpu: dict | None = None
         runtime_bundle: dict | None = prepared_runtime.runtime_bundle
         encoder = None
         encoder_setup_thread: threading.Thread | None = None
@@ -418,6 +424,13 @@ def convert_video(
             factor, mode = resolve_upscaling_mode(options.upscaling_factor)
             output_width, output_height = resolve_output_size(
                 input_width, input_height, factor
+            )
+            video_gpu = ffmpeg.resolve_video_gpu(
+                prepared_runtime.gpus,
+                options.video_gpu_uuid,
+                "H.264" if is_preview else options.codec,
+                output_width,
+                output_height,
             )
             OUTPUTS.mkdir(exist_ok=True)
             LOGS.mkdir(exist_ok=True)
@@ -467,6 +480,8 @@ def convert_video(
                             output_width,
                             output_height,
                             float(metadata["fps"]),
+                            None if video_gpu is None else int(video_gpu["cuda_ordinal"]),
+                            video_gpu is not None,
                         )
                     )
                 except BaseException as exc:
@@ -762,6 +777,8 @@ def convert_video(
                     for key, value in verified.items()
                 },
                 "gpu": gpu,
+                "ai_gpu": gpu,
+                "video_gpu": video_gpu,
                 "encoder": selected_encoder,
                 "encoding_quality": encoding_quality,
                 "frames_processed": delivered,

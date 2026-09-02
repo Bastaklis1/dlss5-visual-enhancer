@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ctypes
 import re
 import struct
 import subprocess
@@ -371,11 +372,101 @@ def rotate_frame(frame: np.ndarray, rotation: int) -> np.ndarray:
     return frame
 
 
+_RTX_ARCHITECTURES: dict[tuple[int, int], tuple[str, int]] = {
+    (8, 0): ("Ampere", 30),
+    (8, 6): ("Ampere", 30),
+    (8, 7): ("Ampere", 30),
+    (8, 8): ("Ampere", 30),
+    (8, 9): ("Ada", 40),
+    (10, 0): ("Blackwell", 50),
+    (10, 3): ("Blackwell", 50),
+    (11, 0): ("Blackwell", 50),
+    (12, 0): ("Blackwell", 50),
+    (12, 1): ("Blackwell", 50),
+}
+
+
+def _classify_rtx_architecture(name: str, capability: str) -> tuple[str, int]:
+    match = re.fullmatch(r"(\d+)\.(\d+)", capability.strip())
+    if match is None:
+        raise RuntimeError(
+            f"{name} reported malformed compute capability {capability!r}; "
+            "a current NVIDIA driver is required."
+        )
+    compute_capability = (int(match.group(1)), int(match.group(2)))
+    classified = _RTX_ARCHITECTURES.get(compute_capability)
+    if classified is None:
+        raise RuntimeError(
+            f"{name} (compute capability {capability}) is not a supported RTX architecture. "
+            "This build supports Ampere, Ada, and Blackwell RTX GPUs only."
+        )
+    return classified
+
+
+def _normalize_pci_bus_id(value: str) -> str:
+    match = re.fullmatch(
+        r"(?:([0-9A-Fa-f]{4,8}):)?([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})\.([0-7])",
+        value.strip(),
+    )
+    if match is None:
+        return value.strip().upper()
+    domain = int(match.group(1) or "0", 16)
+    return f"{domain:04X}:{match.group(2).upper()}:{match.group(3).upper()}.{match.group(4)}"
+
+
+def _cuda_device_identities() -> dict[str, dict[str, Any]]:
+    """Map normalized PCI bus IDs to the CUDA ordinal and Windows DXGI LUID."""
+    try:
+        loader = getattr(ctypes, "WinDLL", ctypes.CDLL)
+        cuda = loader("nvcuda.dll")
+    except (AttributeError, OSError):
+        return {}
+
+    c_int_p = ctypes.POINTER(ctypes.c_int)
+    cuda.cuInit.argtypes = [ctypes.c_uint]
+    cuda.cuInit.restype = ctypes.c_int
+    cuda.cuDeviceGetCount.argtypes = [c_int_p]
+    cuda.cuDeviceGetCount.restype = ctypes.c_int
+    cuda.cuDeviceGet.argtypes = [c_int_p, ctypes.c_int]
+    cuda.cuDeviceGet.restype = ctypes.c_int
+    cuda.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    cuda.cuDeviceGetPCIBusId.restype = ctypes.c_int
+    get_luid = getattr(cuda, "cuDeviceGetLuid", None)
+    if get_luid is not None:
+        get_luid.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.c_int]
+        get_luid.restype = ctypes.c_int
+
+    if cuda.cuInit(0) != 0:
+        return {}
+    count = ctypes.c_int()
+    if cuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
+        return {}
+    identities: dict[str, dict[str, Any]] = {}
+    for ordinal in range(max(0, count.value)):
+        device = ctypes.c_int()
+        if cuda.cuDeviceGet(ctypes.byref(device), ordinal) != 0:
+            continue
+        bus_buffer = ctypes.create_string_buffer(32)
+        if cuda.cuDeviceGetPCIBusId(bus_buffer, len(bus_buffer), device.value) != 0:
+            continue
+        luid_hex: str | None = None
+        if get_luid is not None:
+            luid = (ctypes.c_ubyte * 8)()
+            node_mask = ctypes.c_uint()
+            if get_luid(luid, ctypes.byref(node_mask), device.value) == 0:
+                luid_hex = bytes(luid).hex()
+        identities[_normalize_pci_bus_id(bus_buffer.value.decode("ascii", "replace"))] = {
+            "cuda_ordinal": ordinal,
+            "adapter_luid": luid_hex,
+        }
+    return identities
+
+
 @lru_cache(maxsize=1)
-def detect_gpu() -> dict:
+def detect_gpus() -> tuple[dict[str, Any], ...]:
     command = [
         "nvidia-smi",
-        "--query-gpu=name,driver_version,memory.total,compute_cap",
+        "--query-gpu=index,uuid,pci.bus_id,name,driver_version,memory.total,compute_cap",
         "--format=csv,noheader,nounits",
     ]
     try:
@@ -384,31 +475,155 @@ def detect_gpu() -> dict:
         raise RuntimeError(
             "NVIDIA driver tools are unavailable; an RTX GPU and current driver are required."
         ) from exc
-    candidates = []
-    for line in result.stdout.splitlines():
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        message = "nvidia-smi failed while detecting an RTX GPU"
+        raise RuntimeError(f"{message}: {detail}" if detail else f"{message}.")
+    cuda_identities = _cuda_device_identities()
+    devices: list[dict[str, Any]] = []
+    for fallback_index, line in enumerate(result.stdout.splitlines()):
         parts = [part.strip() for part in line.split(",")]
-        if len(parts) >= 4 and "RTX" in parts[0].upper():
-            candidates.append(parts)
+        if not parts or not any(parts):
+            continue
+        # Four-column rows preserve compatibility with isolated detector tests and
+        # older nvidia-smi builds; production drivers use the seven-column query.
+        if len(parts) == 4:
+            legacy_row = True
+            name, driver, memory, capability = parts
+            index, uuid, pci_bus_id = str(fallback_index), f"index:{fallback_index}", ""
+        elif len(parts) == 7:
+            legacy_row = False
+            index, uuid, pci_bus_id, name, driver, memory, capability = parts
+        else:
+            name = parts[3] if len(parts) > 3 else parts[0] or "NVIDIA GPU"
+            raise RuntimeError(
+                f"{name} returned incomplete nvidia-smi data; expected name, driver, "
+                "memory, compute capability, UUID, and PCI bus ID."
+            )
+        if any(not value for value in (name, driver, memory, capability)):
+            raise RuntimeError(
+                f"{name or 'NVIDIA GPU'} returned incomplete nvidia-smi data; expected name, "
+                "driver, memory, and compute capability."
+            )
+        try:
+            memory_mb = int(memory)
+            smi_index = int(index)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} reported malformed index or memory capacity through nvidia-smi."
+            ) from exc
+        normalized_pci = _normalize_pci_bus_id(pci_bus_id) if pci_bus_id else ""
+        identity = cuda_identities.get(normalized_pci, {})
+        architecture: str | None = None
+        generation: int | None = None
+        compatibility_error = ""
+        if "RTX" in name.upper():
+            try:
+                architecture, generation = _classify_rtx_architecture(name, capability)
+            except RuntimeError as exc:
+                compatibility_error = str(exc)
+        else:
+            compatibility_error = "The device name does not identify an RTX GPU."
+        devices.append(
+            {
+                "index": smi_index,
+                "uuid": uuid,
+                "pci_bus_id": normalized_pci,
+                "name": name,
+                "display_name": (
+                    f"{name} (experimental RTX 30 path; may be very slow)"
+                    if generation == 30
+                    else name
+                ),
+                "driver": driver,
+                "memory_mb": memory_mb,
+                "compute_capability": capability,
+                "architecture": architecture,
+                "generation": generation,
+                "beta": generation == 30,
+                "ai_compatible": generation is not None,
+                "compatibility_error": compatibility_error,
+                "cuda_ordinal": identity.get("cuda_ordinal")
+                if not legacy_row
+                else smi_index,
+                "adapter_luid": identity.get("adapter_luid"),
+            }
+        )
+    if not devices:
+        raise RuntimeError("No NVIDIA GPU was detected.")
+    return tuple(devices)
+
+
+def gpu_choice_label(gpu: dict[str, Any]) -> str:
+    memory_gib = float(gpu.get("memory_mb", 0)) / 1024
+    location = gpu.get("pci_bus_id") or f"index {gpu.get('index', '?')}"
+    return f"{gpu.get('name', 'NVIDIA GPU')} | {memory_gib:.0f} GB | PCI {location}"
+
+
+def resolve_ai_gpu(gpus: tuple[dict[str, Any], ...], gpu_uuid: str = "auto") -> dict[str, Any]:
+    compatible = [gpu for gpu in gpus if gpu.get("ai_compatible")]
+    if gpu_uuid != "auto":
+        selected = next((gpu for gpu in compatible if gpu.get("uuid") == gpu_uuid), None)
+        if selected is not None:
+            return dict(selected)
+        raise RuntimeError("The selected AI Processing GPU is unavailable or incompatible.")
+    if not compatible:
+        details = "; ".join(
+            str(gpu.get("compatibility_error")) for gpu in gpus if gpu.get("compatibility_error")
+        )
+        message = "No supported NVIDIA RTX GPU was detected."
+        raise RuntimeError(f"{message} {details}" if details else message)
+    return dict(compatible[0])
+
+
+def resolve_runtime_ai_gpu(
+    gpus: tuple[dict[str, Any], ...],
+    runtime_bundle: dict[str, Any],
+    gpu_uuid: str = "auto",
+) -> dict[str, Any]:
+    """Resolve an AI device and enforce architecture-specific runtime pairing."""
+    candidates = [
+        gpu
+        for gpu in gpus
+        if gpu.get("ai_compatible") and gpu.get("adapter_luid")
+    ]
+    if gpu_uuid != "auto":
+        candidates = [gpu for gpu in candidates if gpu.get("uuid") == gpu_uuid]
+        if not candidates:
+            raise RuntimeError("The selected AI Processing GPU is unavailable or incompatible.")
+    errors: list[str] = []
+    for candidate in candidates:
+        try:
+            validate_gpu_runtime(candidate, runtime_bundle)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            continue
+        return dict(candidate)
+    if errors:
+        raise RuntimeError("No compatible AI Processing GPU/runtime pair is available. " + " ".join(errors))
     if not candidates:
-        raise RuntimeError("No supported NVIDIA RTX GPU was detected.")
-    name, driver, memory, capability = candidates[0]
-    match = re.search(r"RTX\s+(\d{2})", name.upper())
-    generation = int(match.group(1)) if match else 0
-    if generation < 30:
-        raise RuntimeError(f"{name} is outside the supported RTX 30/40/50 scope.")
-    return {
-        "name": name,
-        "display_name": (
-            f"{name} (experimental RTX 30 path; may be very slow)"
-            if generation == 30
-            else name
-        ),
-        "driver": driver,
-        "memory_mb": int(memory),
-        "compute_capability": capability,
-        "generation": generation,
-        "beta": generation == 30,
-    }
+        raise RuntimeError(
+            "No compatible AI Processing GPU could be mapped to a Windows adapter LUID. "
+            "Update or reinstall the NVIDIA display driver."
+        )
+    return resolve_ai_gpu(gpus, gpu_uuid)
+
+
+@lru_cache(maxsize=32)
+def _detect_gpu_cached(gpu_uuid: str = "auto") -> dict:
+    return resolve_ai_gpu(detect_gpus(), gpu_uuid)
+
+
+def detect_gpu(gpu_uuid: str = "auto") -> dict:
+    return _detect_gpu_cached(gpu_uuid)
+
+
+def _clear_gpu_detection_cache() -> None:
+    _detect_gpu_cached.cache_clear()
+    detect_gpus.cache_clear()
+
+
+detect_gpu.cache_clear = _clear_gpu_detection_cache  # type: ignore[attr-defined]
 
 
 def validate_runtime_files() -> None:
@@ -490,8 +705,11 @@ class DLSSFrameSession:
                 stream.seek(self._reshade_log_baseline_size - tail_size)
                 self._reshade_log_baseline_tail = stream.read(tail_size)
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        worker_command = [str(WORKER), "--video"]
+        if gpu.get("adapter_luid"):
+            worker_command.extend(["--adapter-luid", str(gpu["adapter_luid"])])
         self.worker = subprocess.Popen(
-            [str(WORKER), "--video"],
+            worker_command,
             cwd=RUNTIME,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

@@ -2,7 +2,7 @@
 
 [![Downloads](https://img.shields.io/github/downloads/Merserk/dlss5-visual-enhancer/total.svg?style=flat-square&label=Downloads)](https://github.com/Merserk/dlss5-visual-enhancer/releases) [![Patreon](https://img.shields.io/badge/Patreon-MM744-F96854?style=flat-square&logo=patreon&logoColor=white)](https://www.patreon.com/MM744) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?style=flat-square&logo=windows11&logoColor=white) ![NVIDIA](https://img.shields.io/badge/NVIDIA-RTX-76B900?style=flat-square&logo=nvidia&logoColor=white) ![DLSS](https://img.shields.io/badge/DLSS-5-76B900?style=flat-square) ![Type](https://img.shields.io/badge/Type-Portable-2EA44F?style=flat-square) [![License](https://img.shields.io/badge/License-MIT-007EC6?style=flat-square)](LICENSE)
 
-Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline to images and video through a local Gradio interface. It is an independent community project and is not affiliated with, sponsored by, or endorsed by NVIDIA, ReShade, RenoDX, FFmpeg, or their contributors.
+Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline to images and video, and NVIDIA DLSS Frame Generation to video frame interpolation, through a local Gradio interface. It is an independent community project and is not affiliated with, sponsored by, or endorsed by NVIDIA, ReShade, RenoDX, FFmpeg, or their contributors.
 
 <img width="1403" height="630" alt="image" src="https://github.com/user-attachments/assets/4530410a-af0f-42b5-9ba7-72106e1f5517" />
 
@@ -25,30 +25,45 @@ https://github.com/user-attachments/assets/d91591a9-2df1-4b4b-b18f-bd4dff73d5bc
 - **Images:** single-image and batch processing with per-file success/failure results, responsive input/output previews, individual downloads, a ZIP of successful outputs, batch manifests, and diagnostic JSON reports.
 - **Image formats:** common Pillow formats plus HEIF/HEIC, SVG, and many camera RAW formats. Outputs are PNG, JPEG, WebP, AVIF, or TIFF.
 - **Image handling:** EXIF orientation is applied; ICC input is converted to sRGB; supported EXIF, DPI, and XMP metadata is retained; alpha is preserved except when JPEG composites it over white. EXIF/TIFF rational values and other unusual metadata are converted safely for diagnostic JSON without modifying the metadata used to encode the output. Animated and multipage files use only the first frame/page.
-- **Video:** single-video and reorderable batch-video rendering, plus one-frame and three-second previews for a single selected video. H.264, HEVC, AV1, and ProRes Proxy are available in MP4, MKV, or MOV where compatible.
-- **Sequential video batches:** videos run once, one by one, in the displayed uploader order using one settings snapshot. A failed item is recorded without preventing later videos from rendering. Successful outputs remain individually downloadable and every batch receives an ordered JSON manifest.
+- **Video:** single-video and reorderable batch-video Neural Rendering, plus one-frame and three-second previews for a single selected video. H.264, HEVC, AV1, and ProRes Proxy are available in MP4, MKV, or MOV where compatible.
+- **Frame Interpolation:** single-video and reorderable batch-video processing with NVIDIA DLSS Frame Generation, selectable output rates from 23.976 to 120 FPS, and a three-second preview for a single selected video.
+- **Sequential video batches:** Neural Rendering and Frame Interpolation batches run once, one by one, in the displayed uploader order using one settings snapshot. A failed item is recorded without preventing later videos from rendering. Successful outputs remain individually downloadable and every batch receives an ordered JSON manifest.
 - **Single-only video previews:** input and output players are shown when exactly one video is selected. They are hidden for multi-video batches; batch results are provided through downloadable files and the per-video results table.
-- **Media preservation:** frame timestamps and display rotation are handled; original metadata and chapters are copied. MKV copies compatible audio and subtitle streams, while MP4/MOV convert audio to 192 kbps AAC. Final muxing preserves every rendered video frame when source audio is slightly shorter.
-- **Renaming:** Image and Video outputs support Auto timestamped naming, Copy naming with the original base filename, or a Custom suffix. Existing outputs are never overwritten.
-- **Safety and diagnostics:** only one GPU render runs at a time. Stop cancels the active worker/encoder and removes only incomplete output/job data. In a video batch, completed files are retained and queued items are marked skipped. Outputs are accepted only after feature-18 execution and output dimensions/frame counts are verified.
-- **Persistent controls:** Image and Video tabs share neural settings and the DLSS Model Preset, including the experimental Automatic Mask toggle. Settings are saved in `config.ini`; Reset restores every setting to its default.
+- **Media preservation:** frame timestamps and display rotation are handled; original metadata and chapters are copied. MKV copies compatible audio and subtitle streams, while MP4/MOV convert audio to 192 kbps AAC. Frame Interpolation also preserves supported text subtitles in MP4/MOV.
+- **GPU selection:** AI Processing and Video Processing GPUs can be selected separately. The AI GPU is used for DLSS Neural Rendering and Frame Generation; the Video GPU is used for H.264, HEVC, and AV1 NVENC encoding. Automatic selection is available for both.
+- **GPU compatibility:** supported RTX GPUs are detected by architecture and compute capability, covering Ampere, Ada, and Blackwell. RTX 30 uses the tested experimental Ampere Neural Rendering path and may be significantly slower than RTX 40/50.
+- **Renaming:** Image, Video, and Frame Interpolation outputs support Auto timestamped naming, Copy naming with the original base filename, or a Custom suffix. Existing outputs are never overwritten.
+- **Safety and diagnostics:** only one GPU render runs at a time. Stop cancels the active worker/encoder and removes only incomplete output/job data. In a batch, completed files are retained and queued items are marked skipped. Outputs are accepted only after the relevant render path and output properties are verified.
+- **Persistent controls:** Image and Video tabs share neural settings and the DLSS Model Preset, including the experimental Automatic Mask toggle. Frame Interpolation settings and GPU selections are also saved in `config.ini`. Settings presets can be exported to or imported from JSON, and Reset restores the relevant controls to their defaults.
 
 The application creates `outputs/`, `logs/`, and `jobs/` when needed. Successful media is written to `outputs/`, reports and manifests to `logs/`, and temporary active-render data to `jobs/`.
 
 ## Requirements
 
 - 64-bit Windows 11 with Direct3D 12.
-- NVIDIA GeForce RTX GPU. RTX 40/50 are the primary targets; RTX 30 is enabled as a slower beta path. RTX 20 and non-RTX GPUs are rejected.
+- NVIDIA GeForce RTX GPU based on a supported Ampere, Ada, or Blackwell architecture. RTX 40/50 are the primary Neural Rendering targets; RTX 30 is enabled as a slower experimental path using the tested compatible runtime pair. RTX 20 and non-RTX GPUs are rejected.
+- Frame Interpolation requires a GPU and NVIDIA driver that report DLSS Frame Generation support, Hardware-accelerated GPU scheduling (HAGS) enabled in Windows, and the validated DLSSG runtime included with the release.
+- Frame Interpolation accepts SDR video. PQ/HLG HDR input is rejected instead of being silently converted.
 
 ## How processing works
 
-1. The input is decoded to 8-bit SDR RGBA and its orientation and dimensions are normalized.
-2. The selected fixed DLSS mode determines the output size; the native worker negotiates its required render size.
-3. `Default` leaves NVIDIA's mode-specific DLSS render-preset hints untouched. J, K, L, or M forces and verifies the selected hint for DLAA, Quality, Balanced, Performance, Ultra Performance, and Ultra Quality before optimal-settings lookup and feature creation.
-4. Images send zero motion with a history reset. Video uses OpenCV DIS optical flow for current-to-previous motion, with resets on the first frame and detected scene changes.
-5. Frames are streamed through the version 4 protocol to the project-specific D3D12 worker, which hosts the ReShade/RenoDX DLSS feature-18 path and acknowledges the applied model preset.
-6. Alpha is restored for images. Video frames are sent to FFmpeg with source presentation timestamps, then audio, metadata, chapters, and compatible subtitles are muxed.
-7. ReShade evidence and output properties are verified. Unverified or incomplete results are deleted; successful renders receive JSON reports containing requested/applied presets, dimensions, GPU/encoder data, RenoDX/model/worker hashes, logs, and feature evidence.
+1. The selected AI Processing GPU is validated against the supported RTX architecture and runtime before Neural Rendering starts.
+2. The input is decoded to 8-bit SDR RGBA and its orientation and dimensions are normalized.
+3. The selected fixed DLSS mode determines the output size; the native worker negotiates its required render size.
+4. `Default` leaves NVIDIA's mode-specific DLSS render-preset hints untouched. J, K, L, or M forces and verifies the selected hint for DLAA, Quality, Balanced, Performance, and Ultra Performance before optimal-settings lookup and feature creation.
+5. Images send zero motion with a history reset. Video uses OpenCV DIS optical flow for current-to-previous motion, with resets on the first frame and detected scene changes.
+6. Frames are streamed through the version 4 protocol to the project-specific D3D12 worker, which hosts the ReShade/RenoDX DLSS feature-18 path and acknowledges the applied model preset.
+7. Alpha is restored for images. Video frames are sent to FFmpeg with source presentation timestamps and encoded on the selected Video Processing GPU when using NVENC, then audio, metadata, chapters, and compatible subtitles are muxed.
+8. ReShade evidence and output properties are verified. Unverified or incomplete results are deleted; successful renders receive JSON reports containing requested/applied presets, dimensions, GPU/encoder data, RenoDX/model/worker hashes, logs, and feature evidence.
+
+Frame Interpolation uses a separate DLSS Frame Generation path:
+
+1. The source video is probed for its frame rate, timing, dimensions, rotation, and HDR state, then the selected AI GPU, NVIDIA driver, HAGS state, DLSSG runtime, and Frame Generation capability are checked.
+2. The selected output FPS is mapped to an exact output timeline. `Auto` uses an exact native DLSSG multiplier when available and otherwise uses the 2× cascade path; output rates above 6× the source rate are rejected.
+3. Source frames and optical-flow guide vectors are sent to DLSS Frame Generation. Scene cuts and timestamp discontinuities reset interpolation history so unrelated scenes are not blended together.
+4. Generated and source frames are selected on the requested output timeline and encoded using the selected Video Processing GPU when using H.264, HEVC, or AV1.
+5. Original audio, metadata, chapters, and supported subtitles are muxed into the finished file.
+6. The final FPS and frame count are verified. Successful renders receive JSON reports containing the selected interpolation path, frame counts, scene-cut data, GPU/runtime information, encoder information, and timings.
 
 ## Settings
 
@@ -84,6 +99,17 @@ The DLSS Model Preset is independent of the experimental Neural Rendering **NR P
 
 Output dimensions are rounded to even pixels and limited to a 7680×4320 boundary.
 
+| Frame Interpolation setting | Choices and behavior | Default |
+| --- | --- | --- |
+| Output FPS | 23.976, 25, 29.97, 30, 50, 59.94, 60, 90, or 120 FPS | 60 |
+| DLSS engine | Auto, Native DLSSG, or Cascade | Auto |
+| Video codec | H.264, HEVC, AV1, or ProRes Proxy | H.264 |
+| Container | MP4, MKV, or MOV; ProRes Proxy requires MKV or MOV | MP4 |
+| Encoding quality | Auto (Default), Good, Best, or Max | Auto (Default) |
+| Rename | Auto adds a DLSSFG timestamp; Copy keeps the original base name; Custom appends the entered suffix | Auto |
+
+`Auto` uses a supported exact native DLSSG grid when possible and the cascade path when required. If the selected output FPS is equal to or below the source rate, source frames are resampled without generating additional frames.
+
 | Output setting | Choices and behavior |
 | --- | --- |
 | Image format | PNG/TIFF are lossless; JPEG/WebP/AVIF use the 1–100 quality control (default 95) |
@@ -92,11 +118,19 @@ Output dimensions are rounded to even pixels and limited to a 7680×4320 boundar
 | Encoding quality | Auto (Default) uses resolution/FPS/codec; Good = Auto×2; Best = Auto×4; Max uses CQ/CRF 0; ProRes uses its fixed Proxy profile |
 | Rename | Auto adds the DLSS5 timestamp; Copy keeps the original base name; Custom appends the entered suffix before the output extension |
 
-H.264 and HEVC prefer NVENC and fall back to slow software encoding. AV1 requires working AV1 NVENC at the selected output size. ProRes Proxy uses 10-bit 4:2:2 encoding, although the verified neural-rendering path remains RGBA8.
+H.264, HEVC, and AV1 require working NVENC support on the selected or automatically chosen Video Processing GPU at the requested output size. ProRes Proxy uses CPU-based 10-bit 4:2:2 encoding, although the verified Neural Rendering path remains RGBA8.
+
+| Application setting | Choices and behavior |
+| --- | --- |
+| AI Processing GPU | Automatic or a compatible Ampere, Ada, or Blackwell RTX GPU; used for Neural Rendering and Frame Generation |
+| Video Processing GPU | Automatic or an available NVIDIA GPU; used for H.264, HEVC, and AV1 NVENC encoding |
+| Settings preset | Export all adjustable Image, Video, Frame Interpolation, and GPU settings to JSON, or import a preset to apply and save them |
+
+Saved GPU selections use stable GPU identity. If a previously saved GPU is no longer available, that selection returns to Automatic rather than silently switching to another saved device.
 
 ## Portable runtime layout
 
-The release is self-contained and uses the runtime files under `bin/`. Startup validates the required files, NVIDIA GPU support, and pinned compatibility identities before opening the interface.
+The release is self-contained and uses the runtime files under `bin/`. Startup validates the required files, NVIDIA GPU support, architecture/runtime compatibility, and pinned compatibility identities before opening the interface.
 
 | Path | Purpose and ownership |
 | --- | --- |
@@ -106,7 +140,10 @@ The release is self-contained and uses the runtime files under `bin/`. Startup v
 | `bin/runtime/dxgi.dll` | ReShade carrier with add-on support |
 | `bin/runtime/renodx-dlss5.addon64` | RenoDX DLSS5 4.70 Neural Rendering add-on; the installed binary is checked against the pinned release hash |
 | `bin/runtime/nvngx_dlss.dll`, `nvngx_dlssnr.dll` | DLSS/NGX runtime and neural-rendering components; NVIDIA proprietary terms apply to genuine NVIDIA SDK files |
-| `bin/runtime/ReShade.ini`, `ReShade.log` | Generated automatically while the native worker runs; they are not required in a clean package |
+| `bin/runtime/frame_interpolation/dlssg/nvngx_dlssg.dll` | NVIDIA DLSS Frame Generation runtime used by Frame Interpolation; its pinned hash and Windows signature are validated before use |
+| `bin/runtime/frame_interpolation/dlssg/dlssg-worker.exe` | Project-specific D3D12 worker used for DLSS Frame Generation capability probing and interpolation |
+| `bin/runtime/frame_interpolation/dlssg/manifest.json` | Pinned Frame Interpolation runtime and worker identity information |
+| `bin/runtime/ReShade.ini`, `ReShade.log` | Generated automatically while the native Neural Rendering worker runs; they are not required in a clean package |
 
 Do not replace or redistribute proprietary or closed-source components through unauthorized mirrors. A filename alone does not establish authenticity or redistribution rights.
 
@@ -114,7 +151,7 @@ Do not replace or redistribute proprietary or closed-source components through u
 
 Original application code is licensed under the MIT License, copyright © 2026 Merserk. That license covers only original project code; it does not relicense or grant rights to any third-party software, model, binary, trademark, media, or other asset.
 
-- **NVIDIA DLSS/NGX:** NVIDIA and its suppliers retain their rights in genuine NVIDIA SDK files. Use and distribution are governed by the [NVIDIA RTX SDK License](https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt). Their presence in a portable package does not imply a standalone redistribution right, and this project must not be represented as NVIDIA-sponsored or endorsed.
+- **NVIDIA DLSS/NGX:** NVIDIA and its suppliers retain their rights in genuine NVIDIA SDK and runtime files, including DLSS Neural Rendering and DLSS Frame Generation components. Use and distribution are governed by the [NVIDIA RTX SDK License](https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt). Their presence in a portable package does not imply a standalone redistribution right, and this project must not be represented as NVIDIA-sponsored or endorsed.
 - **FFmpeg:** the referenced Gyan.dev `9.0.1-full_build` was configured with GPL and version-3 components and is distributed under GPLv3. Its build information, license, and exact [corresponding FFmpeg source commit](https://github.com/FFmpeg/FFmpeg/commit/bf1b838f2a) are retained under `bin/ffmpeg/`. Anyone redistributing that binary must satisfy the applicable GPLv3 and corresponding-source obligations. See [FFmpeg licensing](https://github.com/FFmpeg/FFmpeg/blob/master/LICENSE.md).
 - **ReShade:** copyright belongs to Patrick Mours and contributors; ReShade is available under the [BSD 3-Clause License](https://github.com/crosire/reshade).
 - **RenoDX:** RenoDX core is copyright its authors and available under [MIT](https://github.com/clshortfuse/renodx/blob/main/LICENSE). This does not establish the license of the separate `renodx-dlss5.addon64` file.

@@ -4,7 +4,7 @@
 
 Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline to images and video, and NVIDIA DLSS Frame Generation to video frame interpolation, through a local Gradio interface. It is an independent community project and is not affiliated with, sponsored by, or endorsed by NVIDIA, ReShade, RenoDX, FFmpeg, or their contributors.
 
-<img width="1403" height="630" alt="image" src="https://github.com/user-attachments/assets/4530410a-af0f-42b5-9ba7-72106e1f5517" />
+<img width="1810" height="1000" alt="Screenshot 2026-09-03 005153" src="https://github.com/user-attachments/assets/ad15df03-2934-4a20-90ca-5a6514a5de32" />
 
 ### Original
 

@@ -30,16 +30,18 @@ https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
 - **Images:** single-image and batch processing with per-file success/failure results, responsive input/output previews, individual downloads, a ZIP of successful outputs, batch manifests, and diagnostic JSON reports.
 - **Image formats:** common Pillow formats plus HEIF/HEIC, SVG, and many camera RAW formats. Outputs are PNG, JPEG, WebP, AVIF, or TIFF.
 - **Image handling:** EXIF orientation is applied; ICC input is converted to sRGB; supported EXIF, DPI, and XMP metadata is retained; alpha is preserved except when JPEG composites it over white. EXIF/TIFF rational values and other unusual metadata are converted safely for diagnostic JSON without modifying the metadata used to encode the output. Animated and multipage files use only the first frame/page.
-- **Video:** single-video and reorderable batch-video Neural Rendering, plus one-frame and three-second previews for a single selected video. H.264, HEVC, AV1, and ProRes Proxy are available in MP4, MKV, or MOV where compatible.
+- **Video:** single-video and reorderable batch-video Neural Rendering, plus one-frame and three-second previews for a single selected video. H.264, H.265, AV1, and ProRes Proxy are available in MP4, MKV, or MOV where compatible, each in a plain CPU variant or an `(NVIDIA NVENC)` GPU variant (except ProRes Proxy, which is CPU-only).
 - **Frame Interpolation:** single-video and reorderable batch-video processing with NVIDIA DLSS Frame Generation, selectable output rates from 23.976 to 120 FPS, and a three-second preview for a single selected video.
 - **Sequential video batches:** Neural Rendering and Frame Interpolation batches run once, one by one, in the displayed uploader order using one settings snapshot. A failed item is recorded without preventing later videos from rendering. Successful outputs remain individually downloadable and every batch receives an ordered JSON manifest.
-- **Single-only video previews:** input and output players are shown when exactly one video is selected. They are hidden for multi-video batches; batch results are provided through downloadable files and the per-video results table.
+- **Single-only video previews:** input and output players are shown when exactly one video is selected. They are hidden for multi-video batches; batch results are provided through downloadable files and the per-video results table. The final-render player follows the Preview Encoding setting: Auto may show an H.264 derivative when the result itself is not browser-playable, while Disabled always shows the actual file.
 - **Media preservation:** frame timestamps and display rotation are handled; original metadata and chapters are copied. MKV copies compatible audio and subtitle streams, while MP4/MOV convert audio to 192 kbps AAC. Frame Interpolation also preserves supported text subtitles in MP4/MOV.
-- **GPU selection:** AI Processing and Video Processing GPUs can be selected separately. The AI GPU is used for DLSS Neural Rendering and Frame Generation; the Video GPU is used for H.264, HEVC, and AV1 NVENC encoding. Automatic selection is available for both.
+- **GPU selection:** AI Processing and Video Processing GPUs can be selected separately. The AI GPU is used for DLSS Neural Rendering and Frame Generation; the Video GPU is used only for codecs suffixed `(NVIDIA NVENC)`, while plain H.264/H.265/AV1 and ProRes Proxy remain CPU-based. Automatic selection is available for both.
+- **Preview Encoding:** a Settings-tab control for how in-app video previews are produced on the Video and Frame Interpolation tabs (preview buttons and final-render player). Auto uses the result directly when the browser can play it (MP4 + H.264, verified by probe) and otherwise creates an H.264 preview; Always H.264 always generates a browser-compatible preview; Disabled never creates one and sends the actual file to the browser. Non-H.264 previews can be slower and larger.
+- **HDR Mode:** an opt-in 10-bit output that copies the input colorspace and keeps HDR when the input is HDR. It is available only for H.265, AV1, and ProRes Proxy; H.264 stays 8-bit SDR. Frame Interpolation accepts SDR video only unless HDR Mode is enabled.
 - **GPU compatibility:** supported RTX GPUs are detected by architecture and compute capability, covering Ampere, Ada, and Blackwell. RTX 30 uses the tested experimental Ampere Neural Rendering path and may be significantly slower than RTX 40/50.
 - **Renaming:** Image, Video, and Frame Interpolation outputs support Auto timestamped naming, Copy naming with the original base filename, or a Custom suffix. Existing outputs are never overwritten.
 - **Safety and diagnostics:** only one GPU render runs at a time. Stop cancels the active worker/encoder and removes only incomplete output/job data. In a batch, completed files are retained and queued items are marked skipped. Outputs are accepted only after the relevant render path and output properties are verified.
-- **Persistent controls:** Image and Video tabs share neural settings and the DLSS Model Preset, including the experimental Automatic Mask toggle. Frame Interpolation settings and GPU selections are also saved in `config.ini`. Settings presets can be exported to or imported from JSON, and Reset restores the relevant controls to their defaults.
+- **Persistent controls:** Image and Video tabs share neural settings and the DLSS Model Preset, including the experimental Automatic Mask toggle. Frame Interpolation settings, HDR Mode selections, Preview Encoding, and GPU selections are also saved in `config.ini`. Settings presets can be exported to or imported from JSON, and Reset restores the relevant controls to their defaults.
 
 The application creates `outputs/`, `logs/`, and `jobs/` when needed. Successful media is written to `outputs/`, reports and manifests to `logs/`, and temporary active-render data to `jobs/`.
 
@@ -87,9 +89,10 @@ Output dimensions are rounded to even pixels and limited to a 7680×4320 boundar
 | --- | --- | --- |
 | Output FPS | 23.976, 25, 29.97, 30, 50, 59.94, 60, 90, or 120 FPS | 60 |
 | DLSS engine | Auto, Native DLSSG, or Cascade | Auto |
-| Video codec | H.264, HEVC, AV1, or ProRes Proxy | H.264 |
+| Video codec | H.264, H.265, AV1, or ProRes Proxy, each in a plain CPU variant or an `(NVIDIA NVENC)` GPU variant (ProRes Proxy is CPU-only) | H.264 |
 | Container | MP4, MKV, or MOV; ProRes Proxy requires MKV or MOV | MP4 |
 | Encoding quality | Auto (Default), Good, Best, or Max | Auto (Default) |
+| HDR Mode | Off, On; 10-bit output that copies the input colorspace; H.265 / AV1 / ProRes only | Off |
 | Rename | Auto adds a DLSSFG timestamp; Copy keeps the original base name; Custom appends the entered suffix | Auto |
 
 `Auto` uses a supported exact native DLSSG grid when possible and the cascade path when required. If the selected output FPS is equal to or below the source rate, source frames are resampled without generating additional frames.
@@ -97,18 +100,20 @@ Output dimensions are rounded to even pixels and limited to a 7680×4320 boundar
 | Output setting | Choices and behavior |
 | --- | --- |
 | Image format | PNG/TIFF are lossless; JPEG/WebP/AVIF use the 1–100 quality control (default 95) |
-| Video codec | H.264, HEVC, AV1, or ProRes Proxy |
+| Video codec | H.264, H.265, AV1, or ProRes Proxy, each in a plain CPU variant or an `(NVIDIA NVENC)` GPU variant (ProRes Proxy is CPU-only) |
 | Container | MP4, MKV, or MOV; ProRes Proxy requires MKV or MOV |
 | Encoding quality | Auto (Default) uses resolution/FPS/codec; Good = Auto×2; Best = Auto×4; Max uses CQ/CRF 0; ProRes uses its fixed Proxy profile |
+| HDR Mode | Off, On; 10-bit output that copies the input colorspace; H.265 / AV1 / ProRes only |
 | Rename | Auto adds the DLSS5 timestamp; Copy keeps the original base name; Custom appends the entered suffix before the output extension |
 
-H.264, HEVC, and AV1 require working NVENC support on the selected or automatically chosen Video Processing GPU at the requested output size. ProRes Proxy uses CPU-based 10-bit 4:2:2 encoding, although the verified Neural Rendering path remains RGBA8.
+Plain H.264/H.265/AV1 are CPU-based (libx264 / libx265 / libsvtav1) and never require a GPU. Only codecs suffixed `(NVIDIA NVENC)` need working NVENC support on the selected or automatically chosen Video Processing GPU at the requested output size. ProRes Proxy uses CPU-based 10-bit 4:2:2 encoding, although the verified Neural Rendering path remains RGBA8.
 
 | Application setting | Choices and behavior |
 | --- | --- |
 | AI Processing GPU | Automatic or a compatible Ampere, Ada, or Blackwell RTX GPU; used for Neural Rendering and Frame Generation |
-| Video Processing GPU | Automatic or an available NVIDIA GPU; used for H.264, HEVC, and AV1 NVENC encoding |
-| Settings preset | Export all adjustable Image, Video, Frame Interpolation, and GPU settings to JSON, or import a preset to apply and save them |
+| Video Processing GPU | Automatic or an available NVIDIA GPU; used only for codecs suffixed `(NVIDIA NVENC)`, while plain H.264/H.265/AV1 and ProRes stay on CPU |
+| Preview Encoding | Auto (default), Always H.264, or Disabled; controls how in-app video previews are produced on the Video and Frame Interpolation tabs |
+| Settings preset | Export all adjustable Image, Video, Frame Interpolation, GPU, HDR Mode, and Preview Encoding settings to JSON, or import a preset to apply and save them |
 
 Saved GPU selections use stable GPU identity. If a previously saved GPU is no longer available, that selection returns to Automatic rather than silently switching to another saved device.
 

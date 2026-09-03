@@ -47,7 +47,7 @@ The application creates `outputs/`, `logs/`, and `jobs/` when needed. Successful
 
 - 64-bit Windows 11 with Direct3D 12.
 - NVIDIA GeForce RTX GPU based on a supported Ampere, Ada, or Blackwell architecture. RTX 40/50 are the primary Neural Rendering targets; RTX 30 is enabled as a slower experimental path using the tested compatible runtime pair. RTX 20 and non-RTX GPUs are rejected.
-- Frame Interpolation requires a GPU and NVIDIA driver that report DLSS Frame Generation support, Hardware-accelerated GPU scheduling (HAGS) enabled in Windows, and the validated DLSSG runtime included with the release.
+- Frame Interpolation is supported only on NVIDIA Ada and Blackwell GPUs (GeForce RTX 40 and RTX 50 series). It also requires a compatible NVIDIA driver with DLSS Frame Generation support and Hardware-accelerated GPU scheduling (HAGS) enabled in Windows.
 
 ## Settings
 

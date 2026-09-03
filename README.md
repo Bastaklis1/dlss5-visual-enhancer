@@ -1,3 +1,5 @@
+
+https://github.com/user-attachments/assets/d0ce9b19-697d-4b40-898a-a260907ea656
 # DLSS 5 Visual Enhancer
 
 [![Downloads](https://img.shields.io/github/downloads/Merserk/dlss5-visual-enhancer/total.svg?style=flat-square&label=Downloads)](https://github.com/Merserk/dlss5-visual-enhancer/releases) ![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?style=flat-square&logo=windows11&logoColor=white) ![NVIDIA](https://img.shields.io/badge/NVIDIA-RTX-76B900?style=flat-square&logo=nvidia&logoColor=white) ![DLSS](https://img.shields.io/badge/DLSS-5-76B900?style=flat-square) ![DLSS Frame Generation](https://img.shields.io/badge/DLSS-Frame%20Generation-76B900?style=flat-square&logo=nvidia&logoColor=white) ![Type](https://img.shields.io/badge/Type-Portable-2EA44F?style=flat-square) [![License](https://img.shields.io/badge/License-MIT-007EC6?style=flat-square)](LICENSE)
@@ -8,15 +10,15 @@ Windows application for applying a DLSS 5 Neural Rendering feature-18 pipeline t
 
 ### Original
 
-https://github.com/user-attachments/assets/f27f61a3-cad3-4278-af66-eb11c54600fb
+https://github.com/user-attachments/assets/8df8bd4c-01b4-47dd-9705-3614a0b0ff75
 
 ### DLSS 5
 
-https://github.com/user-attachments/assets/564767ae-e1ef-4dcd-89d7-862120e8ab2c
+https://github.com/user-attachments/assets/cff68783-4ee9-4c99-8b36-4eee2a6437ec
 
 ### Frame Generation (DLSSG)
 
-https://github.com/user-attachments/assets/de7154ed-59d0-4a28-8005-47a7eee5d3e9
+https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
 
 ## Installation
 

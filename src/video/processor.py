@@ -8,321 +8,30 @@ import shutil
 import threading
 import time
 from contextlib import nullcontext, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import av
 import cv2
 import numpy as np
 
-from . import ffmpeg
-from .naming import output_filename, require_available_output, validate_rename
-from .runtime import (
-    JOBS,
-    LOGS,
-    OUTPUTS,
-    Cancelled,
-    DLSSFrameSession,
-    active_job,
-    resize_fit,
-    resolve_runtime_ai_gpu,
-    rotate_frame,
-    verify_feature_18,
+from ..core import ffmpeg
+from ..core.gpu_selection import resolve_runtime_ai_gpu
+from ..core.jobs import Cancelled, active_job
+from ..core.naming import output_filename, require_available_output, validate_rename
+from ..core.paths import JOBS, LOGS, OUTPUTS
+from ..core.runtime import (
+    DLSSFrameSession, prepare_runtime, resize_fit, rotate_frame, verify_feature_18,
     write_failure_report,
 )
+from .guides import TemporalGuideGenerator
+from .models import ConversionOptions, ConversionResult, DLSS_MODEL_PRESETS
+from .sizing import resolve_native_settings, resolve_output_size, resolve_upscaling_mode
 
-
-ENCODING_QUALITIES = ffmpeg.ENCODING_QUALITIES
-AUTO_BITRATE_DIVISORS = ffmpeg.AUTO_BITRATE_DIVISORS
-calculate_auto_bitrate_kbps = ffmpeg.calculate_auto_bitrate_kbps
-probe_video = ffmpeg.probe_video
 validate_codec_container = ffmpeg.validate_codec_container
-
-
-@dataclass(slots=True)
-class ConversionOptions:
-    ai_gpu_uuid: str = "auto"
-    video_gpu_uuid: str = "auto"
-    nr_style: str = "Default"
-    nr_intensity: float = 1.0
-    local_tone_strength: float = 1.0
-    local_structure_strength: float = 1.0
-    skin_structure_strength: float = -1.0
-    upscaling_factor: float = 1.0
-    codec: str = "H.264"
-    container: str = "MP4"
-    quality: str = "Auto (Default)"
-    preserve_hdr: bool = False
-    warmup_frames: int = 0
-    preview_seconds: float | None = None
-    preview_frames: int | None = None
-    nr_preset: str = "Default"
-    automatic_mask: bool = False
-    rename_mode: str = "Auto"
-    custom_suffix: str = "_DLSS5"
-    dlss_model_preset: str = "Default"
-
-
-NR_PRESETS = {
-    "Default": 0,
-    "Preset #1": 1,
-    "Preset #2": 2,
-    "Preset #3": 3,
-}
-
-NR_STYLES = {
-    "Default": 0,
-    "Natural": 1,
-    "Cinematic": 2,
-}
-
-DLSS_MODEL_PRESETS = {
-    "Default": 0,
-    "J": 10,
-    "K": 11,
-    "L": 12,
-    "M": 13,
-}
-
-UPSCALING_MODES = {
-    1.0: {"label": "1× (DLAA / native)", "name": "DLAA", "perf_quality": 5},
-    1.5: {"label": "1.5× (Quality)", "name": "Quality", "perf_quality": 2},
-    1.724: {"label": "1.724× (Balanced)", "name": "Balanced", "perf_quality": 1},
-    2.0: {"label": "2× (Performance)", "name": "Performance", "perf_quality": 0},
-    3.0: {
-        "label": "3× (Ultra Performance)",
-        "name": "Ultra Performance",
-        "perf_quality": 3,
-    },
-}
-UPSCALING_CHOICES = tuple(
-    (mode["label"], factor) for factor, mode in UPSCALING_MODES.items()
-)
-
-
-def resolve_upscaling_mode(raw_factor: float) -> tuple[float, dict[str, str | int]]:
-    try:
-        factor = float(raw_factor)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Upscaling factor must be one of the supported NVIDIA DLSS modes."
-        ) from exc
-    if not math.isfinite(factor):
-        raise ValueError("Upscaling factor must be one of the supported NVIDIA DLSS modes.")
-    for supported, mode in UPSCALING_MODES.items():
-        if math.isclose(factor, supported, rel_tol=0.0, abs_tol=1e-9):
-            return supported, mode
-    choices = ", ".join(f"{factor:g}×" for factor in UPSCALING_MODES)
-    raise ValueError(f"Unsupported upscaling factor {factor:g}×. Choose one of: {choices}.")
-
-
-def _nearest_even(value: float) -> int:
-    return max(2, int(math.floor(value / 2.0 + 0.5)) * 2)
-
-
-def resolve_output_size(width: int, height: int, factor: float) -> tuple[int, int]:
-    factor, _ = resolve_upscaling_mode(factor)
-    output_width = _nearest_even(int(width) * factor)
-    output_height = _nearest_even(int(height) * factor)
-    long_edge = max(output_width, output_height)
-    short_edge = min(output_width, output_height)
-    if long_edge > 7680 or short_edge > 4320:
-        valid = [
-            candidate
-            for candidate in UPSCALING_MODES
-            if max(_nearest_even(width * candidate), _nearest_even(height * candidate)) <= 7680
-                       and min(_nearest_even(width * candidate), _nearest_even(height * candidate))
-            <= 4320
-        ]
-        recommendation = max(valid) if valid else None
-        hint = (
-            f" Choose {recommendation:g}× or lower for this video."
-            if recommendation is not None
-            else " The source already exceeds the supported 8K boundary."
-        )
-        raise ValueError(
-            f"The requested {output_width}×{output_height} output exceeds the supported "
-            f"7680×4320 boundary.{hint}"
-        )
-    return output_width, output_height
-
-
-def resolve_encoding_quality(
-    options: ConversionOptions, width: int, height: int, fps: float
-) -> dict:
-    return ffmpeg.resolve_encoding_quality(
-        options.quality, options.codec, width, height, fps
-    )
-
-
-def resolve_native_settings(options: ConversionOptions) -> dict[str, int | float]:
-    """Validate public NR controls and translate them to the worker protocol."""
-    try:
-        preset = NR_PRESETS[options.nr_preset]
-    except KeyError as exc:
-        choices = ", ".join(NR_PRESETS)
-        raise ValueError(
-            f"Unknown NR Preset: {options.nr_preset!r}. Choose one of: {choices}."
-        ) from exc
-
-    try:
-        style = NR_STYLES[options.nr_style]
-    except KeyError as exc:
-        choices = ", ".join(NR_STYLES)
-        raise ValueError(
-            f"Unknown NR Style: {options.nr_style!r}. Choose one of: {choices}."
-        ) from exc
-
-    try:
-        model_preset = DLSS_MODEL_PRESETS[options.dlss_model_preset]
-    except KeyError as exc:
-        choices = ", ".join(DLSS_MODEL_PRESETS)
-        raise ValueError(
-            f"Unknown DLSS Model Preset: {options.dlss_model_preset!r}. "
-            f"Choose one of: {choices}."
-        ) from exc
-
-    controls = {
-        "NR Intensity": (options.nr_intensity, 0.0, 2.0),
-        "Local Tone Strength": (options.local_tone_strength, 0.0, 2.0),
-        "Local Structure Strength": (options.local_structure_strength, 0.0, 2.0),
-        "Skin Structure Strength": (options.skin_structure_strength, -1.0, 2.0),
-    }
-    validated: dict[str, float] = {}
-    for label, (raw_value, minimum, maximum) in controls.items():
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"{label} must be a number between {minimum:g} and {maximum:g}."
-            ) from exc
-        if not math.isfinite(value) or not minimum <= value <= maximum:
-            raise ValueError(f"{label} must be between {minimum:g} and {maximum:g}.")
-        validated[label] = value
-
-    if not isinstance(options.automatic_mask, bool):
-        raise ValueError("Automatic Mask must be a boolean value.")
-
-    return {
-        "profile": 0,
-        "preset": preset,
-        "style": style,
-        "auto_mask": int(options.automatic_mask),
-        "ui_correction": 0,
-        "intensity": validated["NR Intensity"],
-        "local_tone": validated["Local Tone Strength"],
-        "local_structure": validated["Local Structure Strength"],
-        "skin_structure": validated["Skin Structure Strength"],
-        "dlss_model_preset": model_preset,
-    }
-
-
-@dataclass(slots=True)
-class ConversionResult:
-    output_path: str
-    report_path: str
-    frames: int
-    nr_count_evidence: int
-    elapsed_seconds: float
-    gpu: str
-    input_width: int
-    input_height: int
-    render_width: int
-    render_height: int
-    output_width: int
-    output_height: int
-    upscaling_factor: float
-    dlss_mode: str
-    dlss_model_preset: str = "Default"
-    applied_dlss_model_preset: int = 0
-
-
-@dataclass(slots=True)
-class VideoConversionSuccess:
-    index: int
-    input_path: str
-    result: ConversionResult
-
-
-@dataclass(slots=True)
-class VideoConversionFailure:
-    index: int
-    input_path: str
-    error: str
-    cancelled: bool = False
-
-
-@dataclass(slots=True)
-class VideoBatchResult:
-    successes: list[VideoConversionSuccess]
-    failures: list[VideoConversionFailure]
-    cancelled: bool
-    manifest_path: str
-
-
 _BATCH_CONTEXT = threading.local()
-
-
-@dataclass(slots=True)
-class GuideFrame:
-    motion: np.ndarray
-    reset: bool
-    scene_score: float
-
-
-class TemporalGuideGenerator:
-    """Estimate the guide buffers an encoded video does not contain."""
-
-    def __init__(self, width: int, height: int, flow_width: int = 640) -> None:
-        self.width = width
-        self.height = height
-        scale = min(1.0, flow_width / width)
-        self.flow_width = max(64, int(round(width * scale / 2) * 2))
-        self.flow_height = max(64, int(round(height * scale / 2) * 2))
-        self.previous_gray: np.ndarray | None = None
-        self.zero_motion = np.zeros((height, width, 2), dtype=np.float16)
-        self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-        self.dis.setUseSpatialPropagation(True)
-        self.dis.setFinestScale(1)
-
-    def _small_gray(self, rgba: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2GRAY)
-        return cv2.resize(
-            gray,
-            (self.flow_width, self.flow_height),
-            interpolation=cv2.INTER_AREA,
-        )
-
-    def process(self, rgba: np.ndarray) -> GuideFrame:
-        current = self._small_gray(rgba)
-        if self.previous_gray is None:
-            motion = self.zero_motion
-            reset = True
-            scene_score = 1.0
-        else:
-            scene_score = float(np.mean(cv2.absdiff(current, self.previous_gray))) / 255.0
-            reset = scene_score > 0.24
-            if reset:
-                motion = self.zero_motion
-            else:
-                motion = self.dis.calc(current, self.previous_gray, None)
-                motion = cv2.resize(
-                    motion,
-                    (self.width, self.height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                motion[..., 0] *= self.width / self.flow_width
-                motion[..., 1] *= self.height / self.flow_height
-                motion = np.ascontiguousarray(motion.astype(np.float16))
-        self.previous_gray = current
-        return GuideFrame(
-            motion=motion,
-            reset=reset,
-            scene_score=scene_score,
-        )
-
 
 def _validate_preview_options(
     options: ConversionOptions,
@@ -356,8 +65,6 @@ def convert_video(
     options: ConversionOptions | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> ConversionResult:
-    from .prepare import prepare_runtime
-
     options = options or ConversionOptions()
     source = Path(input_path).resolve()
     if not source.is_file():
@@ -366,10 +73,16 @@ def convert_video(
     validate_rename(options.rename_mode, options.custom_suffix)
     preview_seconds, preview_frames = _validate_preview_options(options)
     is_preview = preview_seconds is not None or preview_frames is not None
-    if options.preserve_hdr:
-        raise RuntimeError(
-            "HDR preservation is disabled in this build because the verified DLSSNR path is "
-            "RGBA8. HDR input is converted to SDR instead of being mislabeled as HDR."
+    # Compat previews use the forced H.264 SDR 8-bit path; user-encoded previews
+    # (Preview Encoding Auto-playable / Disabled) preserve the HDR choice.
+    compat_preview = is_preview and bool(getattr(options, "preview_compat", True))
+    hdr_requested = bool(options.preserve_hdr)
+    if compat_preview:
+        hdr_requested = False
+    if hdr_requested and not ffmpeg.hdr_mode_supported(options.codec):
+        raise ValueError(
+            f"HDR Mode is only available for H.265, H.265 (NVIDIA NVENC), AV1, AV1 (NVIDIA NVENC) and ProRes Proxy; "
+            f"current codec is {options.codec!r}."
         )
     prepared_runtime = getattr(_BATCH_CONTEXT, "prepared_runtime", None)
     if prepared_runtime is None:
@@ -380,6 +93,27 @@ def convert_video(
     with job_context as controller:
         assert controller is not None
         started = time.perf_counter()
+
+        def _report_progress(value: float, desc: str) -> None:
+            if progress is None:
+                return
+            try:
+                v = float(value)
+                v = 0.0 if v < 0 else (1.0 if v > 1 else v)
+                elapsed = time.perf_counter() - started
+                if 0.01 < v < 0.99 and elapsed > 0.5:
+                    eta = elapsed * (1 - v) / max(v, 1e-6)
+                    desc = f"{desc} - Time Remaining: {eta:.1f}s"
+                else:
+                    v = float(value) if isinstance(value, (int, float)) else v
+                # Use positional `desc` so it works for both gr.Progress(desc=) and report_item(message)
+                progress(v, desc)
+            except Exception:
+                try:
+                    progress(value, desc)
+                except Exception:
+                    pass
+
         timings: dict[str, float] = {}
         job_dir: Path | None = None
         output: Path | None = None
@@ -428,10 +162,20 @@ def convert_video(
             video_gpu = ffmpeg.resolve_video_gpu(
                 prepared_runtime.gpus,
                 options.video_gpu_uuid,
-                "H.264" if is_preview else options.codec,
+                "H.264" if compat_preview else options.codec,
                 output_width,
                 output_height,
             )
+            # HDR metadata to copy – 10-bit path when HDR Mode is on
+            hdr_metadata = None
+            effective_hdr = hdr_requested and (not is_preview or not compat_preview)
+            if effective_hdr:
+                hdr_metadata = {
+                    "color_space": metadata.get("color_space", "unknown"),
+                    "color_primaries": metadata.get("color_primaries", "unknown"),
+                    "color_transfer": metadata.get("color_transfer", "unknown"),
+                    "hdr": bool(metadata.get("hdr", False)),
+                }
             OUTPUTS.mkdir(exist_ok=True)
             LOGS.mkdir(exist_ok=True)
             JOBS.mkdir(exist_ok=True)
@@ -462,8 +206,7 @@ def convert_video(
             require_available_output(output)
             temp_video = job_dir / "processed-video.mkv"
             native = resolve_native_settings(options)
-            if progress:
-                progress(0.01, f"Starting feature 18 on {gpu['display_name']}")
+            _report_progress(0.01, f"Starting feature 18 on {gpu['display_name']}")
 
             encoder_setup: list[tuple] = []
             encoding_stage_started = time.perf_counter()
@@ -482,6 +225,8 @@ def convert_video(
                             float(metadata["fps"]),
                             None if video_gpu is None else int(video_gpu["cuda_ordinal"]),
                             video_gpu is not None,
+                            hdr_mode=effective_hdr,
+                            hdr_metadata=hdr_metadata,
                         )
                     )
                 except BaseException as exc:
@@ -528,12 +273,11 @@ def convert_video(
             minimum_height = session.minimum_height
             maximum_width = session.maximum_width
             maximum_height = session.maximum_height
-            if progress:
-                progress(
-                    0.03,
-                    f"DLSS {mode['name']}: {render_width}×{render_height} → "
-                    f"{output_width}×{output_height}",
-                )
+            _report_progress(
+                0.03,
+                f"DLSS {mode['name']}: {render_width}×{render_height} → "
+                f"{output_width}×{output_height}",
+            )
 
             (
                 encoder,
@@ -691,8 +435,8 @@ def convert_video(
                     raise Cancelled("Render stopped by user.")
                 delivered += 1
                 now = time.perf_counter()
-                if progress and (delivered == frame_count or now - last_progress_update >= 0.1):
-                    progress(
+                if delivered == frame_count or now - last_progress_update >= 0.1:
+                    _report_progress(
                         0.04 + 0.84 * delivered / frame_count,
                         f"DLSS 5 frame {delivered}/{frame_count}",
                     )
@@ -737,8 +481,7 @@ def convert_video(
             nr_upscaling_active = bool(feature_evidence["nr_upscaling_active"])
             nr_native_fallback = bool(feature_evidence["nr_native_fallback"])
             carrier_create_result = str(feature_evidence["carrier_create_result"])
-            if progress:
-                progress(0.91, "Muxing original audio and metadata")
+            _report_progress(0.91, "Muxing original audio and metadata")
             mux_started = time.perf_counter()
             ffmpeg.final_mux(temp_video, source, output, options.container, controller)
             timings["final_mux_seconds"] = time.perf_counter() - mux_started
@@ -823,15 +566,12 @@ def convert_video(
                 "carrier_create_result": carrier_create_result,
                 "successful_neural_rendering_frames": nr_count,
                 "addon_release": runtime_bundle["addon"]["release"],
-                "addon_sha256": runtime_bundle["addon"]["sha256"].lower(),
-                "model_sha256": runtime_bundle["neural_runtime"]["sha256"].lower(),
-                "worker_sha256": runtime_bundle["worker"]["sha256"].lower(),
                 "loaded_module_inventory": [
-                    "nvngx.dll (standalone worker image)",
-                    "dxgi.dll (ReShade carrier)",
-                    "renodx-dlss5.addon64",
-                    "nvngx_dlss.dll",
-                    "nvngx_dlssnr.dll",
+                    "host/nvngx.dll (standalone worker image)",
+                    "host/dxgi.dll (ReShade carrier)",
+                    "host/renodx-dlss5.addon64",
+                    "dlss/nvngx_dlss.dll",
+                    "host/nvngx_dlssnr.dll",
                     "system D3D12/DXGI/NGX core",
                 ],
                 "native_settings": native,
@@ -845,8 +585,7 @@ def convert_video(
             }
             report_path = LOGS / f"{output.name}.report.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            if progress:
-                progress(1.0, "Complete — feature 18 confirmed")
+            _report_progress(1.0, "Complete — feature 18 confirmed")
             return ConversionResult(
                 str(output),
                 str(report_path),
@@ -910,122 +649,3 @@ def convert_video(
             pipeline_stop.set()
             if job_dir and job_dir.exists():
                 shutil.rmtree(job_dir, ignore_errors=True)
-
-
-def _write_video_batch_manifest(
-    stamp: str,
-    options: ConversionOptions,
-    successes: list[VideoConversionSuccess],
-    failures: list[VideoConversionFailure],
-    cancelled: bool,
-) -> str:
-    LOGS.mkdir(exist_ok=True)
-    manifest = {
-        "status": "cancelled" if cancelled else ("partial" if failures else "success"),
-        "options": asdict(options),
-        "successes": [asdict(item) for item in successes],
-        "failures": [asdict(item) for item in failures],
-    }
-    manifest_path = LOGS / f"DLSS5_VIDEO_BATCH_{stamp}.manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return str(manifest_path)
-
-
-def convert_videos(
-    input_paths: Iterable[str | os.PathLike[str]],
-    options: ConversionOptions | None = None,
-    progress: Callable[[float, str], None] | None = None,
-) -> VideoBatchResult:
-    """Convert videos sequentially while holding one cancellable GPU batch slot."""
-    from .prepare import prepare_runtime
-
-    options = options or ConversionOptions()
-    paths = [Path(path).resolve() for path in input_paths]
-    if not paths:
-        raise ValueError("Choose at least one video.")
-
-    prepared_runtime = prepare_runtime()
-    LOGS.mkdir(exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-    successes: list[VideoConversionSuccess] = []
-    failures: list[VideoConversionFailure] = []
-    cancelled = False
-    total = len(paths)
-
-    with active_job() as controller:
-        if getattr(_BATCH_CONTEXT, "controller", None) is not None:
-            raise RuntimeError("A video batch is already active on this worker thread.")
-        _BATCH_CONTEXT.controller = controller
-        _BATCH_CONTEXT.prepared_runtime = prepared_runtime
-        try:
-            for index, path in enumerate(paths):
-                position = index + 1
-                prefix = f"[{position}/{total}] {path.name}"
-                if controller.cancel.is_set():
-                    cancelled = True
-                    failures.extend(
-                        VideoConversionFailure(
-                            queued_index,
-                            str(queued),
-                            "Cancelled before rendering.",
-                            cancelled=True,
-                        )
-                        for queued_index, queued in enumerate(paths[index:], start=index)
-                    )
-                    break
-
-                def report_item(
-                    value: float,
-                    message: str,
-                    *,
-                    item_index: int = index,
-                    item_prefix: str = prefix,
-                ) -> None:
-                    bounded = min(1.0, max(0.0, float(value)))
-                    overall = (item_index + bounded) / total
-                    if progress:
-                        progress(overall, f"{item_prefix} — {message}")
-
-                if progress:
-                    progress(index / total, f"{prefix} — starting")
-                try:
-                    result = convert_video(path, options, progress=report_item)
-                except Cancelled:
-                    cancelled = True
-                    failures.append(
-                        VideoConversionFailure(
-                            index,
-                            str(path),
-                            "Cancelled during rendering.",
-                            cancelled=True,
-                        )
-                    )
-                    failures.extend(
-                        VideoConversionFailure(
-                            queued_index,
-                            str(queued),
-                            "Cancelled before rendering.",
-                            cancelled=True,
-                        )
-                        for queued_index, queued in enumerate(paths[position:], start=position)
-                    )
-                    break
-                except Exception as exc:
-                    failures.append(VideoConversionFailure(index, str(path), str(exc)))
-                    if progress:
-                        progress(position / total, f"{prefix} — failed")
-                    continue
-
-                successes.append(VideoConversionSuccess(index, str(path), result))
-                if progress:
-                    progress(position / total, f"{prefix} — complete")
-        finally:
-            del _BATCH_CONTEXT.controller
-            del _BATCH_CONTEXT.prepared_runtime
-
-    manifest_path = _write_video_batch_manifest(
-        stamp, options, successes, failures, cancelled
-    )
-    if progress:
-        progress(1.0, "Cancelled" if cancelled else "Complete")
-    return VideoBatchResult(successes, failures, cancelled, manifest_path)

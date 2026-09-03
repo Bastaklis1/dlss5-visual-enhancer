@@ -10,34 +10,24 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import av
 import numpy as np
 
-from .. import ffmpeg
-from ..naming import output_filename, require_available_output, validate_rename
-from ..runtime import (
-    JOBS,
-    LOGS,
-    OUTPUTS,
-    Cancelled,
-    active_job,
-    resolve_runtime_ai_gpu,
-    rotate_frame,
-)
+from ..core import ffmpeg
+from ..core.gpu_selection import resolve_runtime_ai_gpu
+from ..core.jobs import Cancelled, active_job
+from ..core.naming import output_filename, require_available_output, validate_rename
+from ..core.paths import JOBS, LOGS, OUTPUTS
+from ..core.runtime import prepare_runtime, rotate_frame
 from .capabilities import probe_frame_interpolation_capabilities
 from .guides import DLSSGGuideGenerator
-from .models import (
-    FrameInterpolationBatchResult,
-    FrameInterpolationFailure,
-    FrameInterpolationOptions,
-    FrameInterpolationResult,
-    FrameInterpolationSuccess,
-)
+from .models import FrameInterpolationOptions, FrameInterpolationResult
 from .native import DirectDLSSGSession
 from .scheduler import choose_interpolation_plan, output_frame_count
 
+_BATCH_CONTEXT = threading.local()
 
 @dataclass(slots=True)
 class TimedFrame:
@@ -170,10 +160,6 @@ class NearestTimestampWriter:
         for packet in self.stream.encode():
             self.nut.mux(packet)
 
-
-_BATCH_CONTEXT = threading.local()
-
-
 def _json_safe(value):
     if isinstance(value, Fraction):
         return str(value)
@@ -196,18 +182,19 @@ def _validate(options: FrameInterpolationOptions) -> None:
     _ = options.target_rate
     validate_rename(options.rename_mode, options.custom_suffix)
     ffmpeg.validate_codec_container(options.codec, options.container)
+    if getattr(options, "hdr_mode", False) and not ffmpeg.hdr_mode_supported(options.codec):
+        raise ValueError(
+            f"HDR Mode is only available for H.265, H.265 (NVIDIA NVENC), AV1, AV1 (NVIDIA NVENC) and ProRes Proxy; current codec is {options.codec!r}."
+        )
     if options.preview_seconds is not None:
         if not math.isfinite(float(options.preview_seconds)) or float(options.preview_seconds) <= 0:
             raise ValueError("Preview duration must be positive.")
-
 
 def interpolate_video(
     input_path: str | os.PathLike[str],
     options: FrameInterpolationOptions | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> FrameInterpolationResult:
-    from ..prepare import prepare_runtime
-
     options = options or FrameInterpolationOptions()
     _validate(options)
     source = Path(input_path).resolve()
@@ -227,6 +214,24 @@ def interpolate_video(
     with job_context as controller:
         assert controller is not None
         started = time.perf_counter()
+
+        def _report_progress(value: float, desc: str) -> None:
+            if progress is None:
+                return
+            try:
+                v = float(value)
+                v = 0.0 if v < 0 else (1.0 if v > 1 else v)
+                elapsed = time.perf_counter() - started
+                if 0.01 < v < 0.99 and elapsed > 0.5:
+                    eta = elapsed * (1 - v) / max(v, 1e-6)
+                    desc = f"{desc} - Time Remaining: {eta:.1f}s"
+                progress(v, desc)
+            except Exception:
+                try:
+                    progress(value, desc)
+                except Exception:
+                    pass
+
         timings: dict[str, float] = {}
         output: Path | None = None
         job_dir: Path | None = None
@@ -235,11 +240,25 @@ def interpolate_video(
         try:
             probe_started = time.perf_counter()
             metadata = ffmpeg.probe_video(source, count_mode="metadata")
-            if metadata["hdr"]:
+            is_preview = options.preview_seconds is not None
+            compat_preview = is_preview and bool(getattr(options, "preview_compat", True))
+            effective_hdr = (
+                bool(getattr(options, "hdr_mode", False))
+                and (not is_preview or not compat_preview)
+                and ffmpeg.hdr_mode_supported(options.codec)
+            )
+            if metadata["hdr"] and not effective_hdr:
                 raise ValueError(
-                    "Frame Interpolation v1 accepts SDR video only. Convert PQ/HLG input to SDR "
-                    "before using DLSSG."
+                    "Frame Interpolation v1 accepts SDR video only. Enable HDR Mode (H.265/AV1/ProRes, 10-bit, copies input colorspace) to keep HDR, or convert PQ/HLG to SDR."
                 )
+            hdr_metadata = None
+            if effective_hdr:
+                hdr_metadata = {
+                    "color_space": metadata.get("color_space", "unknown"),
+                    "color_primaries": metadata.get("color_primaries", "unknown"),
+                    "color_transfer": metadata.get("color_transfer", "unknown"),
+                    "hdr": bool(metadata.get("hdr", False)),
+                }
             source_rate = Fraction(metadata["rate"])
             cfr = bool(metadata.get("cfr", True))
             frames = int(metadata["frames"])
@@ -262,8 +281,7 @@ def interpolate_video(
             )
             output_count = output_frame_count(duration, options.target_rate)
             timings["probe_seconds"] = time.perf_counter() - probe_started
-            if progress:
-                progress(0.01, f"{plan.path}: {source_rate} → {options.target_rate} FPS")
+            _report_progress(0.01, f"{plan.path}: {source_rate} → {options.target_rate} FPS")
 
             OUTPUTS.mkdir(exist_ok=True)
             JOBS.mkdir(exist_ok=True)
@@ -280,7 +298,7 @@ def interpolate_video(
             # NUT preserves the exact rational frame clock between PyAV and FFmpeg;
             # Matroska's millisecond timestamp scale rounds 60000/1001 and short previews.
             temp_video = job_dir / "interpolated-video.nut"
-            selected_codec = "H.264" if options.preview_seconds else options.codec
+            selected_codec = "H.264" if compat_preview else options.codec
             video_gpu = ffmpeg.resolve_video_gpu(
                 prepared_runtime.gpus,
                 options.video_gpu_uuid,
@@ -298,13 +316,15 @@ def interpolate_video(
                 float(options.target_rate),
                 None if video_gpu is None else int(video_gpu["cuda_ordinal"]),
                 video_gpu is not None,
+                hdr_mode=effective_hdr,
+                hdr_metadata=hdr_metadata,
             )
             assert encoder.stdin is not None
             if plan.path == "Native DLSSG":
                 sessions.append(
                     DirectDLSSGSession(
                         int(metadata["width"]), int(metadata["height"]), frames,
-                        plan.generated_per_interval, controller, ai_gpu.get("adapter_luid"),
+                        plan.generated_per_interval, controller,
                     )
                 )
             elif plan.path == "Cascade":
@@ -313,7 +333,6 @@ def interpolate_video(
                     sessions.append(
                         DirectDLSSGSession(
                             int(metadata["width"]), int(metadata["height"]), expected, 1, controller
-                            , ai_gpu.get("adapter_luid")
                         )
                     )
             stages = [
@@ -372,8 +391,8 @@ def interpolate_video(
                     for item in items:
                         writer.push(item)
                     decoded += 1
-                    if progress and decoded % max(1, frames // 100) == 0:
-                        progress(0.04 + 0.82 * decoded / frames, f"DLSSG source frame {decoded}/{frames}")
+                    if decoded % max(1, frames // 100) == 0:
+                        _report_progress(0.04 + 0.82 * decoded / frames, f"DLSSG source frame {decoded}/{frames}")
             finally:
                 container.close()
             writer.finish()
@@ -387,8 +406,7 @@ def interpolate_video(
             controller.unregister(encoder)
             if encoder_code:
                 raise RuntimeError("Video encoder failed:\n" + "\n".join(encoder_logs[-40:]))
-            if progress:
-                progress(0.9, "Muxing original audio, subtitles, chapters, and metadata")
+            _report_progress(0.9, "Muxing original audio, subtitles, chapters, and metadata")
             ffmpeg.final_mux(
                 temp_video,
                 source,
@@ -436,8 +454,7 @@ def interpolate_video(
             }
             report_path = LOGS / f"DLSSFG_{source.stem}_{stamp}.report.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-            if progress:
-                progress(1.0, "Frame interpolation complete")
+            _report_progress(1.0, "Frame interpolation complete")
             return FrameInterpolationResult(
                 output_path=str(output.resolve()),
                 report_path=str(report_path.resolve()),
@@ -485,64 +502,3 @@ def interpolate_video(
                 encoder.terminate()
             if job_dir and job_dir.exists():
                 shutil.rmtree(job_dir, ignore_errors=True)
-
-
-def interpolate_videos(
-    input_paths: Iterable[str | os.PathLike[str]],
-    options: FrameInterpolationOptions | None = None,
-    progress: Callable[[float, str], None] | None = None,
-) -> FrameInterpolationBatchResult:
-    options = options or FrameInterpolationOptions()
-    paths = [Path(path).resolve() for path in input_paths]
-    if not paths:
-        raise ValueError("Choose at least one video.")
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-    successes: list[FrameInterpolationSuccess] = []
-    failures: list[FrameInterpolationFailure] = []
-    cancelled = False
-    with active_job() as controller:
-        _BATCH_CONTEXT.controller = controller
-        try:
-            for index, path in enumerate(paths):
-                if controller.cancel.is_set():
-                    cancelled = True
-                    failures.extend(
-                        FrameInterpolationFailure(i, str(item), "Cancelled before rendering.", True)
-                        for i, item in enumerate(paths[index:], start=index)
-                    )
-                    break
-                def item_progress(value: float, message: str, *, position=index) -> None:
-                    if progress:
-                        progress((position + value) / len(paths), f"[{position + 1}/{len(paths)}] {message}")
-                try:
-                    result = interpolate_video(path, options, item_progress)
-                    successes.append(FrameInterpolationSuccess(index, str(path), result))
-                except Cancelled as exc:
-                    cancelled = True
-                    failures.append(FrameInterpolationFailure(index, str(path), str(exc), True))
-                    failures.extend(
-                        FrameInterpolationFailure(
-                            queued_index,
-                            str(queued),
-                            "Cancelled before rendering.",
-                            True,
-                        )
-                        for queued_index, queued in enumerate(
-                            paths[index + 1 :], start=index + 1
-                        )
-                    )
-                    break
-                except Exception as exc:
-                    failures.append(FrameInterpolationFailure(index, str(path), str(exc)))
-        finally:
-            del _BATCH_CONTEXT.controller
-    manifest = {
-        "status": "cancelled" if cancelled else ("partial" if failures else "success"),
-        "options": _json_safe(asdict(options)),
-        "successes": [asdict(item) for item in successes],
-        "failures": [asdict(item) for item in failures],
-    }
-    LOGS.mkdir(exist_ok=True)
-    manifest_path = LOGS / f"DLSSFG_BATCH_{stamp}.manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return FrameInterpolationBatchResult(successes, failures, cancelled, str(manifest_path.resolve()))

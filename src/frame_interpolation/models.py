@@ -43,9 +43,13 @@ class FrameInterpolationOptions:
     codec: str = "H.264"
     container: str = "MP4"
     quality: str = "Auto (Default)"
+    hdr_mode: bool = False
     rename_mode: str = "Auto"
     custom_suffix: str = "_DLSSFG"
     preview_seconds: float | None = None
+    # True = truncated preview uses the forced H.264 SDR path (current behavior).
+    # False = truncated preview uses the user's codec/container (HDR preserved).
+    preview_compat: bool = True
 
     @property
     def target_rate(self) -> Fraction:
@@ -62,7 +66,6 @@ class FrameInterpolationCapabilities:
     native_multiplier: int
     cascade_available: bool
     runtime_version: str
-    runtime_sha256: str
     worker_version: str
     signature_status: str
     detail: str = ""

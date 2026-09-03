@@ -8,7 +8,7 @@ from fractions import Fraction
 
 import numpy as np
 
-from ..runtime import Cancelled, JobController
+from ..core.jobs import Cancelled, JobController
 from .capabilities import DLSSG_WORKER, RUNTIME_DIR
 
 
@@ -38,7 +38,6 @@ class DirectDLSSGSession:
         frame_count: int,
         generated_count: int,
         controller: JobController,
-        adapter_luid: str | None = None,
     ) -> None:
         if not DLSSG_WORKER.is_file():
             raise RuntimeError(f"Direct DLSSG worker is missing: {DLSSG_WORKER}")
@@ -49,8 +48,6 @@ class DirectDLSSGSession:
         self.controller = controller
         self.logs: collections.deque[str] = collections.deque(maxlen=300)
         command = [str(DLSSG_WORKER), "--serve"]
-        if adapter_luid:
-            command.extend(["--adapter-luid", adapter_luid])
         self.process = subprocess.Popen(
             command,
             cwd=str(RUNTIME_DIR),

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,6 +8,8 @@ from pathlib import Path
 from PIL import TiffImagePlugin
 
 from ..core.paths import LOGS, OUTPUTS
+from ..core.disk_paths import OutputFile
+from ..core.jobs import Cancelled
 from ..core.runtime import DLSSFrameSession, DLSS_MODEL_PRESETS
 from .decoder import _DecodedImage
 from .models import ImageConversionFailure, ImageConversionOptions, ImageConversionResult
@@ -47,6 +47,7 @@ def _write_report(
     gpu: dict,
     session: DLSSFrameSession,
     evidence: dict[str, object],
+    *, metadata_diagnostics: dict | None = None,
 ) -> str:
     report = {
         "status": "success",
@@ -61,6 +62,7 @@ def _write_report(
             if key not in {"icc_profile", "exif", "xmp"}
         },
         "warnings": result.warnings,
+        "metadata_embedding": metadata_diagnostics or {"status": "not_requested"},
         "input_dimensions": {"width": result.input_width, "height": result.input_height},
         "negotiated_render_dimensions": {"width": result.render_width, "height": result.render_height},
         "negotiated_render_range": {
@@ -104,25 +106,44 @@ def _build_manifest_and_zip(
     successes: list[ImageConversionResult],
     failures: list[ImageConversionFailure],
     cancelled: bool,
+    *, create_zip: bool = True, output_dir: Path | None = None, batch_diagnostics: dict | None = None,
+    controller=None,
 ) -> tuple[str, str | None]:
     manifest = {
         "status": "cancelled" if cancelled else ("partial" if failures else "success"),
         "options": asdict(options),
         "successes": [asdict(item) for item in successes],
         "failures": [asdict(item) for item in failures],
+        "batch": batch_diagnostics or {},
+        "output_directory": str(output_dir or OUTPUTS),
     }
     manifest_path = LOGS / f"DLSS5_IMAGE_BATCH_{stamp}.manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    if not successes:
+    if not successes or not create_zip:
         return str(manifest_path), None
-    zip_path = OUTPUTS / f"DLSS5_IMAGE_BATCH_{stamp}.zip"
-    temporary = zip_path.with_name(f".{zip_path.stem}.{time.time_ns()}.zip")
+    zip_path = (output_dir or OUTPUTS) / f"DLSS5_IMAGE_BATCH_{stamp}.zip"
+    output_file = OutputFile(zip_path)
     try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+        with zipfile.ZipFile(output_file.temporary, "w", compression=zipfile.ZIP_STORED) as archive:
             for item in successes:
-                archive.write(item.output_path, arcname=Path(item.output_path).name)
-        os.replace(temporary, zip_path)
+                info = zipfile.ZipInfo.from_file(item.output_path, arcname=Path(item.output_path).name)
+                with open(item.output_path, "rb") as source, archive.open(info, "w", force_zip64=True) as target:
+                    while True:
+                        if controller is not None and controller.cancel.is_set():
+                            raise Cancelled("ZIP creation cancelled.")
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        target.write(chunk)
+        if controller is not None and controller.cancel.is_set():
+            raise Cancelled("ZIP creation cancelled.")
+        output_file.publish()
+    except Cancelled:
+        manifest["status"] = "cancelled"
+        if batch_diagnostics:
+            manifest["batch"]["statistics"]["state"] = "Cancelled"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return str(manifest_path), None
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        output_file.cleanup()
     return str(manifest_path), str(zip_path)

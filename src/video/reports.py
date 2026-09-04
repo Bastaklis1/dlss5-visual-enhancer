@@ -12,6 +12,7 @@ def _write_video_batch_manifest(
     successes: list[VideoConversionSuccess],
     failures: list[VideoConversionFailure],
     cancelled: bool,
+    *, batch_diagnostics: dict | None = None, output_dir: str | None = None,
 ) -> str:
     LOGS.mkdir(exist_ok=True)
     manifest = {
@@ -19,6 +20,8 @@ def _write_video_batch_manifest(
         "options": asdict(options),
         "successes": [asdict(item) for item in successes],
         "failures": [asdict(item) for item in failures],
+        "batch": batch_diagnostics or {},
+        "output_directory": output_dir,
     }
     manifest_path = LOGS / f"DLSS5_VIDEO_BATCH_{stamp}.manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

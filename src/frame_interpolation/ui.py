@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gradio as gr
+from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
 
 from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
-from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
 from ..settings.models import CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings, coerce_hdr_mode
 from ..settings.storage import current_preview_encoding, processing_gpu_settings
@@ -38,6 +38,7 @@ def render_frame_interpolation_batch(
     rename_mode: str,
     custom_suffix: str,
     progress=gr.Progress(track_tqdm=False),
+    *, output_dir=None, controller=None, on_item_update=None, direct_disk=False,
 ):
     paths = normalize_video_paths(input_paths)
     if not paths:
@@ -60,15 +61,19 @@ def render_frame_interpolation_batch(
         progress(value, desc=message)
 
     try:
-        result = interpolate_videos(paths, options, report)
+        result = interpolate_videos(paths, options, report, output_dir=output_dir,
+                                    controller=controller, on_item_update=on_item_update)
     except Exception as exc:
         traceback.print_exc()
+        if on_item_update is not None:
+            raise
         return gr.update(value=None, visible=len(paths) == 1), [], [], f"Failed: {exc}"
     ordered: list[tuple[int, list[str]]] = []
     for item in result.successes:
         value = item.result
         details = (
             f"{value.output_frames} frames; {value.selected_path}; "
+            f"{value.elapsed_seconds:.1f}s; processing {value.output_frames / max(value.elapsed_seconds, 0.001):.1f} frames/s; "
             f"native {value.native_multiplier}×; cascade stages {value.cascade_stages}; "
             f"copied {value.copied_frames}, DLSSG {value.generated_frames}, "
             f"cuts {value.scene_cuts}; report: {value.report_path}"
@@ -89,8 +94,8 @@ def render_frame_interpolation_batch(
         preview_mode = "Auto"
     preview = None
     used_derivative = False
-    if len(paths) == 1 and result.successes:
-        preview, used_derivative = resolve_final_preview(files[0], preview_mode)
+    if not direct_disk and len(paths) == 1 and result.successes and not result.cancelled:
+        preview, used_derivative = resolve_final_preview(files[0], preview_mode, controller=controller)
     status = (
         f"{'Cancelled' if result.cancelled else 'Complete'}: "
         f"{len(result.successes)} completed, {len(result.failures)} failed/cancelled. "
@@ -100,7 +105,7 @@ def render_frame_interpolation_batch(
         status += f"\nFirst error: {result.failures[0].error}"
     if used_derivative:
         status += "\nBrowser preview transcoded to H.264; the original file is unchanged."
-    return gr.update(value=preview, visible=len(paths) == 1), files, rows, status
+    return gr.update(value=preview, visible=not direct_disk and len(paths) == 1), ([] if direct_disk else files), rows, status
 
 @dataclass(slots=True)
 class FrameInterpolationTab:
@@ -122,6 +127,9 @@ class FrameInterpolationTab:
     output_files: object
     status: object
     results: object
+    input_path: object = None
+    output_path: object = None
+    job_state: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -149,6 +157,7 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 label="Input video(s)", file_count="multiple", file_types=["video"],
                 type="filepath", allow_reordering=True, elem_id="frame-interpolation-upload-list",
             )
+            input_path, output_path = build_path_controls()
             input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
             with gr.Accordion("DLSS Frame Generation Settings", open=True):
                 with gr.Row():
@@ -198,36 +207,24 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 label="Interpolated video files", file_count="multiple", interactive=False,
                 elem_id="frame-interpolation-output-list",
             )
-            status = gr.Textbox(label="Status", interactive=False)
+            status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
-                headers=["Input", "Result", "Output", "Details"],
-                datatype=["str", "str", "str", "str"], interactive=False,
+                headers=BATCH_HEADERS,
+                datatype=["str"] * len(BATCH_HEADERS), interactive=False,
                 label="Batch results", wrap=True,
             )
     tab = FrameInterpolationTab(
         sources, input_preview, target_fps, engine, quality, codec, container, rename_mode,
         custom_suffix, hdr_mode, preview, render, stop, reset, output_video, output_files, status, results
     )
+    tab.input_path, tab.output_path = input_path, output_path
     bind_frame_interpolation_events(tab)
     return tab
 
 
 def bind_frame_interpolation_events(tab: FrameInterpolationTab) -> None:
-    tab.sources.change(
-        update_frame_interpolation_preview_mode, inputs=[tab.sources, tab.target_fps, tab.engine],
-        outputs=[tab.input_preview, tab.output_video, tab.preview],
-        queue=False, show_progress="hidden",
-    )
+    bind_batch_ui(tab, render_frame_interpolation_batch, kind="video",
+                  preview_mode=update_frame_interpolation_preview_mode,
+                  preview_actions=[(tab.preview, preview_frame_interpolation)])
     tab.codec.change(hdr_mode_update, inputs=tab.codec, outputs=tab.hdr_mode, queue=False)
     tab.rename_mode.change(rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False)
-    tab.render.click(
-        render_frame_interpolation_batch, inputs=tab.render_inputs,
-        outputs=[tab.output_video, tab.output_files, tab.results, tab.status],
-        concurrency_limit=1, show_progress="full", show_progress_on=tab.output_video,
-    )
-    tab.preview.click(
-        preview_frame_interpolation, inputs=tab.preview_inputs, outputs=[tab.output_video, tab.status],
-        concurrency_limit=1, show_progress="full", show_progress_on=tab.output_video,
-    )
-    tab.stop.click(cancel_active_job, outputs=tab.status, queue=False)
-

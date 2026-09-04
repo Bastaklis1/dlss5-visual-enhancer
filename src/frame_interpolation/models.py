@@ -13,7 +13,14 @@ FPS_RATES: dict[str, Fraction] = {
     "59.94": Fraction(60000, 1001),
     "60": Fraction(60, 1),
     "90": Fraction(90, 1),
+    "119.88": Fraction(120000, 1001),
     "120": Fraction(120, 1),
+    "144": Fraction(144, 1),
+    "165": Fraction(165, 1),
+    "180": Fraction(180, 1),
+    "240": Fraction(240, 1),
+    "360": Fraction(360, 1),
+    "480": Fraction(480, 1),
 }
 FPS_CHOICES = tuple(FPS_RATES)
 ENGINE_CHOICES = ("Auto", "Native DLSSG", "Cascade")

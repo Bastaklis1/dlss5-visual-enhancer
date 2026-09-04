@@ -17,6 +17,7 @@ from .models import (
     CODEC_CHOICES, CONFIG_SECTION, CONTAINER_CHOICES, DEFAULT_SETTINGS, IMAGE_FORMAT_CHOICES,
     PREVIEW_ENCODING_CHOICES, QUALITY_CHOICES, UISettings, _validate,
 )
+from ..core.dlss_architecture import DLSS_ARCHITECTURE_CHOICES
 
 def load_settings(path: str | os.PathLike[str]) -> UISettings:
     config_path = Path(path)
@@ -202,6 +203,11 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             PREVIEW_ENCODING_CHOICES,
             DEFAULT_SETTINGS.preview_encoding,
         ),
+        dlss_architecture=choice(
+            "dlss_architecture",
+            DLSS_ARCHITECTURE_CHOICES,
+            DEFAULT_SETTINGS.dlss_architecture,
+        ),
     )
     # Auto-disable HDR Mode if codec does not support it (e.g. H.264)
     try:
@@ -250,6 +256,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "frame_interpolation_rename_mode": settings.frame_interpolation_rename_mode,
         "frame_interpolation_custom_suffix": settings.frame_interpolation_custom_suffix,
         "preview_encoding": settings.preview_encoding,
+        "dlss_architecture": settings.dlss_architecture,
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")

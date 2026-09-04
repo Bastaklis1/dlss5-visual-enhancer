@@ -39,12 +39,6 @@ _IS_NVENC_SET = {
     "AV1 (NVIDIA NVENC)",
 }
 
-_CPU_ENCODERS = {
-    "H.264": "libx264",
-    "H.265": "libx265",
-    "AV1": "libsvtav1",
-}
-
 _NVENC_ENCODERS = {
     "H.264 (NVIDIA NVENC)": "h264_nvenc",
     "H.265 (NVIDIA NVENC)": "hevc_nvenc",
@@ -89,11 +83,6 @@ def _is_nvenc_codec(codec: str) -> bool:
 
 def _is_hdr_allowed_codec(codec: str) -> bool:
     return _normalize_codec(codec) in HDR_ALLOWED_CODECS
-
-
-def _is_hdr_allowed_for_encoding(codec: str) -> bool:
-    """Check if HDR Mode (10-bit + colorspace copy) is supported for this codec."""
-    return _is_hdr_allowed_codec(codec)
 
 
 def hdr_mode_supported(codec: str) -> bool:

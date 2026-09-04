@@ -90,6 +90,10 @@ def make_browser_preview(
     Returns the new preview path as a string. Raises RuntimeError on failure.
     """
     from ..paths import OUTPUTS
+    from ..jobs import current_job_controller
+    from ..disk_paths import OutputFile
+
+    controller = controller or current_job_controller()
 
     src = Path(source)
     if not src.is_file():
@@ -101,6 +105,7 @@ def make_browser_preview(
     while dest.exists():
         counter += 1
         dest = out_dir / f"{src.stem}_BROWSERPREVIEW_{counter}.mp4"
+    output_file = OutputFile(dest)
     command = [
         str(FFMPEG),
         "-hide_banner",
@@ -127,38 +132,33 @@ def make_browser_preview(
         "192k",
         "-movflags",
         "+faststart",
-        str(dest),
+        str(output_file.temporary),
     ]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if controller is not None:
-        try:
-            controller.register(process)
-        except Exception:
-            pass
+    process = None
     try:
-        _stdout, stderr = process.communicate()
-    finally:
-        if controller is not None:
-            try:
-                controller.unregister(process)
-            except Exception:
-                pass
-    if process.returncode:
-        raise RuntimeError(
-            "Browser preview transcode failed:\n" + (stderr or "")[-4000:]
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
         )
-    if not dest.is_file():
-        raise RuntimeError("Browser preview transcode produced no output file.")
-    # Verify the derivative is actually playable before handing it to Gradio.
-    if not is_browser_playable(dest):
-        raise RuntimeError("Browser preview transcode produced an unplayable file.")
+        if controller is not None:
+            controller.register(process)
+        _stdout, stderr = process.communicate()
+        if process.returncode:
+            raise RuntimeError("Browser preview transcode failed:\n" + (stderr or "")[-4000:])
+        if not is_browser_playable(output_file.temporary):
+            raise RuntimeError("Browser preview transcode produced an unplayable file.")
+        if controller is not None and controller.cancel.is_set():
+            from ..jobs import Cancelled
+            raise Cancelled("Preview cancelled.")
+        output_file.publish()
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.terminate()
+                process.communicate()
+            if controller is not None:
+                controller.unregister(process)
+        output_file.cleanup()
     return str(dest)
 
 

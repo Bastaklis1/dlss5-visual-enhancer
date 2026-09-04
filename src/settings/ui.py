@@ -4,16 +4,15 @@ from dataclasses import dataclass, replace
 
 import gradio as gr
 
+from ..core.dlss_architecture import apply_dlss_architecture
 from ..core.ffmpeg import hdr_mode_supported, probe_nvenc_codecs
 from ..core.gpu_selection import gpu_choice_label
 from ..core.paths import CONFIG_PATH
-from ..core.runtime import prepare_runtime
-from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
-from ..core.naming import RENAME_MODES
+from ..core.runtime import UPSCALING_MODES, prepare_runtime
 from ..core.ffmpeg.preview import normalize_preview_encoding
 from .models import (
-    AUTOMATIC_MASK_CHOICES, CODEC_CHOICES, CONTAINER_CHOICES, DEFAULT_SETTINGS, PREVIEW_ENCODING_CHOICES,
-    QUALITY_CHOICES, UISettings,
+    DEFAULT_SETTINGS, DLSS_ARCHITECTURE_CHOICES,
+    PREVIEW_ENCODING_CHOICES, UISettings,
     automatic_mask_choice, coerce_hdr_mode, parse_automatic_mask,
 )
 from .presets import export_settings_preset, import_settings_preset, preset_filename
@@ -43,6 +42,20 @@ def _shared_dlss_values(
     return (*_neural_values(settings), settings.dlss_model_preset)
 
 
+def _mirrored_dlss_values(settings: UISettings) -> tuple:
+    """Shared 9-tuple twice: feeds two sibling tabs' neural controls."""
+    shared = _shared_dlss_values(settings)
+    return (*shared, *shared)
+
+
+def _notify_live_effects(settings: UISettings) -> None:
+    # Call while holding _CONFIG_LOCK: submissions follow the saved commit
+    # order, including imports/resets. This only enqueues an immutable snapshot.
+    from ..live.pipeline import update_live_effects
+
+    update_live_effects(settings)
+
+
 def persist_image_settings(
     nr_preset: str,
     nr_style: str,
@@ -57,7 +70,7 @@ def persist_image_settings(
     image_quality: float,
     rename_mode: str,
     custom_suffix: str,
-) -> tuple[str, str, float, float, float, float, float, str, str]:
+) -> tuple:
     with _CONFIG_LOCK:
         current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
         settings = replace(
@@ -79,7 +92,8 @@ def persist_image_settings(
         if settings != current:
             save_settings(CONFIG_PATH, settings)
         SETTINGS_STATE.current = settings
-    return _shared_dlss_values(settings)
+        _notify_live_effects(settings)
+    return _mirrored_dlss_values(settings)
 
 
 def persist_video_settings(
@@ -98,7 +112,7 @@ def persist_video_settings(
     hdr_mode: bool,
     rename_mode: str,
     custom_suffix: str,
-) -> tuple[str, str, float, float, float, float, float, str, str]:
+) -> tuple:
     with _CONFIG_LOCK:
         current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
         coerced_hdr = coerce_hdr_mode(codec, hdr_mode)
@@ -123,7 +137,40 @@ def persist_video_settings(
         if settings != current:
             save_settings(CONFIG_PATH, settings)
         SETTINGS_STATE.current = settings
-    return _shared_dlss_values(settings)
+        _notify_live_effects(settings)
+    return _mirrored_dlss_values(settings)
+
+
+def persist_live_settings(
+    nr_preset: str,
+    nr_style: str,
+    nr_intensity: float,
+    local_tone_strength: float,
+    local_structure_strength: float,
+    skin_structure_strength: float,
+    upscaling_factor: float,
+    automatic_mask: str,
+    dlss_model_preset: str,
+) -> tuple:
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(
+            current,
+            nr_preset=nr_preset,
+            nr_style=nr_style,
+            nr_intensity=nr_intensity,
+            local_tone_strength=local_tone_strength,
+            local_structure_strength=local_structure_strength,
+            skin_structure_strength=skin_structure_strength,
+            upscaling_factor=upscaling_factor,
+            automatic_mask=parse_automatic_mask(automatic_mask),
+            dlss_model_preset=dlss_model_preset,
+        )
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+        _notify_live_effects(settings)
+    return _mirrored_dlss_values(settings)
 
 
 def persist_frame_interpolation_settings(
@@ -190,6 +237,8 @@ def _settings_component_values(settings: UISettings) -> tuple:
         settings.ai_gpu_uuid,
         settings.video_gpu_uuid,
         settings.preview_encoding,
+        settings.dlss_architecture,
+        *shared,
     )
 
 
@@ -239,6 +288,31 @@ def persist_preview_encoding(preview_encoding: str) -> None:
         SETTINGS_STATE.current = settings
 
 
+def persist_dlss_architecture(dlss_architecture: str) -> None:
+    if not isinstance(dlss_architecture, str) or dlss_architecture not in DLSS_ARCHITECTURE_CHOICES:
+        raise gr.Error(
+            f"DLSS Architecture must be one of: {', '.join(DLSS_ARCHITECTURE_CHOICES)}."
+        )
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, dlss_architecture=dlss_architecture)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+    # A Live worker may be between replacements. Pin its runtime for the
+    # entire session, including that brief interval with no DLL loaded.
+    from ..live.pipeline import is_live_running
+    if is_live_running():
+        return
+    # Swap the host NR runtime immediately so the next render uses it.
+    # Failures only warn (logged); the saved setting still applies later.
+    try:
+        prepared = prepare_runtime()
+        apply_dlss_architecture(settings.dlss_architecture, prepared.gpu)
+    except Exception:
+        pass
+
+
 def persist_gpu_settings(ai_gpu_uuid: str, video_gpu_uuid: str) -> str:
     prepared = prepare_runtime()
     ai_choices, video_choices = _gpu_choices(prepared)
@@ -267,6 +341,7 @@ def reset_saved_settings() -> tuple:
     with _CONFIG_LOCK:
         save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
         SETTINGS_STATE.current = DEFAULT_SETTINGS
+        _notify_live_effects(DEFAULT_SETTINGS)
     message = "All Image, Video, and Frame Interpolation settings were reset to defaults."
     return (
         *_settings_component_values(DEFAULT_SETTINGS),
@@ -316,6 +391,7 @@ def apply_settings_preset(
                 f"Import failed: {exc}",
             )
         SETTINGS_STATE.current = imported
+        _notify_live_effects(imported)
     return (
         name,
         *_settings_component_values(imported),
@@ -328,6 +404,7 @@ class SettingsTab:
     ai_gpu_selector: object
     video_gpu_selector: object
     preview_encoding_selector: object
+    architecture_selector: object
     preset_name: object
     preset_export: object
     preset_import: object
@@ -390,6 +467,19 @@ def build_settings_tab(
         ),
     )
     gr.Markdown(
+        "## DLSS 5 Architecture\n"
+        "Selects which Neural Rendering runtime build is used for Image, Video, "
+        "and Frame Interpolation. Auto picks from the AI Processing GPU: "
+        "RTX 20/30 uses Turing+, RTX 40 uses Ada Lovelace+, RTX 50 uses Blackwell+. "
+        "Takes effect on the next render."
+    )
+    architecture_selector = gr.Dropdown(
+        choices=list(DLSS_ARCHITECTURE_CHOICES),
+        value=settings.dlss_architecture,
+        label="DLSS 5 Architecture",
+        info="Auto, Turing and higher, Ada Lovelace and higher, or Blackwell and higher.",
+    )
+    gr.Markdown(
         "## Settings Presets\n"
         "Export every adjustable option from the Image, Video, and Frame "
         "Interpolation tabs, or import a preset to apply it everywhere."
@@ -418,12 +508,13 @@ def build_settings_tab(
     preset_status = gr.Markdown("", elem_id="preset-status")
     return SettingsTab(
         ai_gpu_selector, video_gpu_selector, preview_encoding_selector,
+        architecture_selector,
         preset_name, preset_export, preset_import, preset_status
     )
 
 
 
-def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab) -> list[object]:
+def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab) -> list[object]:
     return [
         *image_tab.neural,
         image_tab.model_preset,
@@ -450,22 +541,35 @@ def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab) ->
         settings_tab.ai_gpu_selector,
         settings_tab.video_gpu_selector,
         settings_tab.preview_encoding_selector,
+        settings_tab.architecture_selector,
+        *live_tab.neural,
+        live_tab.model_preset,
     ]
 
 
-def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab) -> None:
+def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab) -> None:
+    video_mirror = [*video_tab.neural, video_tab.model_preset]
+    image_mirror = [*image_tab.neural, image_tab.model_preset]
+    live_mirror = [*live_tab.neural, live_tab.model_preset]
     for component in image_tab.settings_inputs:
         component.input(
             persist_image_settings,
             inputs=image_tab.settings_inputs,
-            outputs=[*video_tab.neural, video_tab.model_preset],
+            outputs=[*video_mirror, *live_mirror],
             queue=False,
         )
     for component in video_tab.settings_inputs:
         component.input(
             persist_video_settings,
             inputs=video_tab.settings_inputs,
-            outputs=[*image_tab.neural, image_tab.model_preset],
+            outputs=[*image_mirror, *live_mirror],
+            queue=False,
+        )
+    for component in live_tab.settings_inputs:
+        component.input(
+            persist_live_settings,
+            inputs=live_tab.settings_inputs,
+            outputs=[*image_mirror, *video_mirror],
             queue=False,
         )
     for component in frame_tab.settings_inputs:
@@ -475,7 +579,7 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab) -> None:
             queue=False,
         )
 
-    outputs = settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab)
+    outputs = settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab)
     settings_tab.preset_export.click(
         settings_preset_export_status,
         inputs=settings_tab.preset_name,
@@ -497,6 +601,11 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab) -> None:
     settings_tab.preview_encoding_selector.input(
         persist_preview_encoding,
         inputs=settings_tab.preview_encoding_selector,
+        queue=False,
+    )
+    settings_tab.architecture_selector.input(
+        persist_dlss_architecture,
+        inputs=settings_tab.architecture_selector,
         queue=False,
     )
 

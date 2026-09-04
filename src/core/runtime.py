@@ -9,6 +9,7 @@ import struct
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -172,6 +173,7 @@ VIDEO_MAGIC = 0x34563544
 SETUP_MAGIC = 0x34505553
 FRAME_MAGIC = 0x314D5246
 OUT_MAGIC = 0x3154554F
+END_MAGIC = 0x31444E45  # "END1": counted completion for an unknown-length stream.
 VIDEO_HEADER_FORMAT = "<14I4f"
 SETUP_RESPONSE_FORMAT = "<12I"
 
@@ -269,6 +271,7 @@ def write_failure_report(
     worker_logs: list[str] | None = None,
     reshade_lines: list[str] | None = None,
     logs_dir: Path | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> Path:
     """Persist diagnostics even when the incomplete media output is removed."""
     destination = logs_dir or LOGS
@@ -287,6 +290,8 @@ def write_failure_report(
         "worker_log": list(worker_logs or []),
         "reshade_feature_18_log": list(reshade_lines or []),
     }
+    if diagnostics is not None:
+        report["diagnostics"] = diagnostics
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report_path.resolve()
 
@@ -391,7 +396,7 @@ class DLSSFrameSession:
         input_height: int,
         output_width: int,
         output_height: int,
-        frame_count: int,
+        frame_count: int | None,
         warmup_frames: int,
         factor: float,
         mode: dict[str, str | int],
@@ -400,7 +405,15 @@ class DLSSFrameSession:
         runtime_bundle: dict[str, Any],
         controller: JobController,
     ) -> None:
+        if frame_count is not None and (
+            isinstance(frame_count, bool) or not isinstance(frame_count, int)
+            or not 0 < frame_count <= 0xFFFFFFFF
+        ):
+            raise ValueError("Native frame count must be a positive uint32 or None.")
         self.controller = controller
+        self._streaming = frame_count is None
+        self._processed_frames = 0
+        self.completed_frames: int | None = None
         self._worker_log_buffer = BoundedLogBuffer()
         self.closed = False
         self.factor = factor
@@ -444,7 +457,7 @@ class DLSSFrameSession:
             output_width,
             output_height,
             int(warmup_frames),
-            frame_count,
+            0 if frame_count is None else frame_count,
             int(mode["perf_quality"]),
             int(native["dlss_model_preset"]),
             native["profile"],
@@ -473,8 +486,10 @@ class DLSSFrameSession:
                     or "The worker produced no diagnostic output."
                 )
                 raise RuntimeError(
-                    "The native worker is incompatible with the version-4 model-preset protocol "
+                    "The native worker is incompatible with the requested video protocol "
                     f"or failed during DLSS setup (exit {worker_code}):\n{details}"
+                    + ("\nInstall the updated native worker with streaming completion support."
+                       if self._streaming else "")
                 ) from exc
             (
                 setup_magic,
@@ -581,6 +596,12 @@ class DLSSFrameSession:
     ) -> tuple[np.ndarray, int]:
         if self.controller.cancel.is_set():
             raise Cancelled("Render stopped by user.")
+        if self.closed:
+            raise RuntimeError("The native DLSS session is closed.")
+        if self._streaming and (
+            index != self._processed_frames or self._processed_frames >= 0xFFFFFFFF
+        ):
+            raise ValueError("Streaming native frames must have consecutive uint32 indices.")
         assert self.worker.stdin is not None and self.worker.stdout is not None
         frame_header = struct.pack("<4Iq", FRAME_MAGIC, index, int(reset), 0, pts)
         self.worker.stdin.write(frame_header)
@@ -605,7 +626,8 @@ class DLSSFrameSession:
             "<5Iq", result_header
         )
         expected = self.output_width * self.output_height * 4
-        if magic != OUT_MAGIC or not ok or out_index != index or byte_count != expected:
+        if (magic != OUT_MAGIC or not ok or out_index != index
+                or byte_count != expected or out_pts != pts):
             raise RuntimeError(f"Invalid native worker response for frame {index}")
         if ngx_result != 1:
             raise RuntimeError(
@@ -613,21 +635,52 @@ class DLSSFrameSession:
             )
         output = np.empty((self.output_height, self.output_width, 4), dtype=np.uint8)
         _read_exact_into(self.worker.stdout, output)
+        self._processed_frames += 1
         return output, out_pts
 
     def close(self) -> None:
         if self.closed:
             return
-        if self.worker.stdin and not self.worker.stdin.closed:
-            self.worker.stdin.close()
-        worker_code = self.worker.wait(timeout=60)
-        self.worker_thread.join(timeout=2)
-        self.controller.unregister(self.worker)
-        self.closed = True
-        if worker_code:
-            raise RuntimeError(
-                "Native DLSS worker failed:\n" + "\n".join(self.worker_logs[-40:])
-            )
+        try:
+            if self.controller.cancel.is_set():
+                raise Cancelled("Render stopped by user.")
+            if self._streaming:
+                if not self._processed_frames:
+                    raise RuntimeError("The input video contains no decodable frames.")
+                assert self.worker.stdin is not None
+                self.worker.stdin.write(struct.pack(
+                    "<4Iq", END_MAGIC, self._processed_frames, 0, 0, 0,
+                ))
+                self.worker.stdin.flush()
+            if self.worker.stdin and not self.worker.stdin.closed:
+                self.worker.stdin.close()
+            # The completion response is only 28 bytes and fits in the pipe.
+            # Wait first so a missing acknowledgement cannot block past this timeout.
+            worker_code = self.worker.wait(timeout=60)
+            self.worker_thread.join(timeout=2)
+            if self.controller.cancel.is_set():
+                raise Cancelled("Render stopped by user.")
+            if worker_code:
+                raise RuntimeError(
+                    "Native DLSS worker failed:\n" + "\n".join(self.worker_logs[-40:])
+                )
+            if self._streaming:
+                assert self.worker.stdout is not None
+                acknowledgement = struct.unpack(
+                    "<5Iq", _read_exact(self.worker.stdout, struct.calcsize("<5Iq"))
+                )
+                if acknowledgement != (END_MAGIC, self._processed_frames, 1, 0, 1, 0):
+                    raise RuntimeError("Native DLSS worker returned an invalid completion count.")
+            self.completed_frames = self._processed_frames
+            self.controller.unregister(self.worker)
+            self.closed = True
+            for stream in (self.worker.stdout, self.worker.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        except BaseException:
+            with suppress(Exception):
+                self.abort()
+            raise
 
     def abort(self) -> None:
         if self.closed:
@@ -641,9 +694,17 @@ class DLSSFrameSession:
                     self.worker.kill()
                 except OSError:
                     pass
+                self.worker.wait(timeout=5)
         self.worker_thread.join(timeout=2)
         self.controller.unregister(self.worker)
         self.closed = True
+
+        for stream in (self.worker.stdin, self.worker.stdout, self.worker.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 def verify_feature_18(

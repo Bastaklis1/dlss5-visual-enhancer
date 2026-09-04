@@ -26,57 +26,6 @@ C_LEFT = (2, 134, 195)
 C_MID = (15, 184, 129)
 C_RIGHT = (7, 158, 110)
 
-CHEVRON = [
-    " ███      ",
-    "░░░███    ",
-    "  ░░░███  ",
-    "    ░░░███",
-    "     ███░ ",
-    "   ███░   ",
-    " ███░     ",
-    "░░░       ",
-]
-CHAR_D = [
-    "█████████  ",
-    "░░███░░░░██",
-    " ░███   ░░██",
-    " ░███    ░██",
-    " ░███   ░░██",
-    " ░███░░░░██",
-    " █████████ ",
-    "  ░░░░░░░░░",
-]
-CHAR_L = [
-    "█████    ",
-    "░░███    ",
-    " ░███    ",
-    " ░███    ",
-    " ░███   █",
-    " ░███  ██",
-    " ████████",
-    "  ░░░░░░░",
-]
-CHAR_S = [
-    " █████████ ",
-    "███░░░░░███",
-    "░███░░░ ░░░",
-    " ░░███████ ",
-    "   ░░░░░███",
-    "███░░   ███",
-    "░░█████████",
-    "  ░░░░░░░░░",
-]
-CHAR_5 = [
-    "██████████",
-    "░░███░░░░░",
-    " ░████████",
-    " ░░░░░░░███",
-    "        ░███",
-    "███░░   ███",
-    "░░█████████",
-    "  ░░░░░░░░░",
-]
-
 
 def get_gradient_rgb(t: float) -> tuple[int, int, int]:
     """Interpolate RGB color according to the 90deg linear gradient."""
@@ -230,9 +179,7 @@ class TerminalUI:
         dlss_part = "Ｄ Ｌ Ｓ Ｓ    ５"
         visual_part = "V  I  S  U  A  L     E  N  H  A  N  C  E  R"
         title_text = dlss_part + "     " + visual_part
-        # Fullwidth chars are 2 cols wide, so use display width for centering (approx)
-        title_w = len(title_text) + dlss_part.count("Ｄ") + dlss_part.count("Ｌ") + dlss_part.count("Ｓ") + dlss_part.count("５")
-        # Simpler: use len as approximation, will still center visually
+        # Use len as an approximation for centering.
         title_w = len(title_text)
         pad_title = " " * max(0, (term_cols - title_w) // 2)
 

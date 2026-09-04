@@ -4,6 +4,7 @@ import subprocess
 import threading
 from collections import deque
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Iterator
 
 
@@ -52,15 +53,29 @@ class JobController:
 _RENDER_LOCK = threading.Lock()
 _ACTIVE_LOCK = threading.Lock()
 _ACTIVE: JobController | None = None
+_JOB_CONTEXT = ContextVar("render_job_controller", default=None)
+
+
+def current_job_controller():
+    return _JOB_CONTEXT.get()
 
 
 @contextmanager
-def active_job() -> Iterator[JobController]:
+def use_job_controller(controller: JobController):
+    token = _JOB_CONTEXT.set(controller)
+    try:
+        yield
+    finally:
+        _JOB_CONTEXT.reset(token)
+
+
+@contextmanager
+def active_job(controller: JobController | None = None) -> Iterator[JobController]:
     """Claim the single GPU render slot and always release its resources."""
     global _ACTIVE
     if not _RENDER_LOCK.acquire(blocking=False):
         raise RuntimeError("Another GPU render is already running.")
-    controller = JobController()
+    controller = controller or current_job_controller() or JobController()
     with _ACTIVE_LOCK:
         _ACTIVE = controller
     try:

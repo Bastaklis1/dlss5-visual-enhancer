@@ -4,11 +4,15 @@ import math
 import subprocess
 from pathlib import Path
 
-from ..jobs import JobController
+from ..jobs import Cancelled, JobController
+from ..render_metadata import (
+    VIDEO_NOTE_FORMATS, MetadataNoteError, check_cancelled, embedding_warning,
+    merge_render_note, record_embedding,
+)
 from ..paths import FFMPEG, FFPROBE
 from .probe import _run_json
 
-def _probe_rendered_duration(path: Path) -> float:
+def _probe_rendered_duration(path: Path, controller: JobController | None = None) -> float:
     """Read the intermediate video's duration without decoding/counting its frames."""
     data = _run_json(
         [
@@ -22,7 +26,7 @@ def _probe_rendered_duration(path: Path) -> float:
             "-of",
             "json",
             str(path),
-        ]
+        ], controller=controller,
     )
     streams = data.get("streams") or []
     values = [
@@ -48,8 +52,72 @@ def final_mux(
     container: str,
     controller: JobController | None = None,
     preserve_supported_subtitles: bool = False,
+    *, render_note: str | None = None, metadata_diagnostics: dict | None = None,
 ) -> None:
-    duration = _probe_rendered_duration(temp_video)
+    check_cancelled(controller)
+    if render_note is None or container not in VIDEO_NOTE_FORMATS:
+        if render_note is not None:
+            record_embedding(metadata_diagnostics, "skipped", reason="unsupported_format")
+        elif metadata_diagnostics is not None and not metadata_diagnostics:
+            record_embedding(metadata_diagnostics, "not_requested")
+        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles)
+        return
+
+    try:
+        comment = merge_render_note(_read_comment(source, controller), render_note)
+        # Windows has a finite command-line length. Never truncate source text.
+        if len(comment.encode("utf-16-le")) > 16000:
+            raise MetadataNoteError("Existing comment is too large to safely extend")
+    except Cancelled:
+        raise
+    except (ValueError, TypeError, RuntimeError) as exc:
+        check_cancelled(controller)
+        embedding_warning(metadata_diagnostics, exc)
+        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles)
+        return
+
+    try:
+        _final_mux_once(temp_video, source, output, container, controller,
+                        preserve_supported_subtitles, comment=comment)
+        if _read_comment(output, controller) != comment:
+            raise MetadataNoteError("Saved video did not retain the settings note")
+    except Cancelled:
+        raise
+    except (ValueError, RuntimeError) as exc:
+        check_cancelled(controller)
+        if isinstance(exc, _MuxFailure) and exc.filesystem_error:
+            raise
+        embedding_warning(metadata_diagnostics, exc)
+        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles)
+        return
+    record_embedding(metadata_diagnostics, "embedded", field="format.comment")
+
+
+def _read_comment(path: Path, controller: JobController | None) -> str | None:
+    data = _run_json([
+        str(FFPROBE), "-v", "error", "-show_entries", "format_tags=comment",
+        "-of", "json", str(path),
+    ], controller=controller)
+    return next((value for key, value in (data.get("format", {}).get("tags") or {}).items()
+                 if key.casefold() == "comment"), None)
+
+
+class _MuxFailure(RuntimeError):
+    def __init__(self, stderr: str):
+        super().__init__("Final audio/metadata mux failed:\n" + stderr[-4000:])
+        self.filesystem_error = any(message in stderr.casefold() for message in (
+            "permission denied", "access is denied", "no space left", "disk full",
+            "input/output error", "i/o error", "read-only file system", "error opening output",
+        ))
+
+
+def _final_mux_once(
+    temp_video: Path, source: Path, output: Path, container: str,
+    controller: JobController | None, preserve_supported_subtitles: bool,
+    *, comment: str | None = None,
+) -> None:
+    check_cancelled(controller)
+    duration = _probe_rendered_duration(temp_video, controller)
     if container == "MKV":
         maps = ["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?"]
         streams = ["-c:v", "copy", "-c:a", "copy", "-c:s", "copy"]
@@ -78,7 +146,7 @@ def final_mux(
                     "-of",
                     "json",
                     str(source),
-                ]
+                ], controller=controller,
             )
             supported_text = {"ass", "ssa", "subrip", "mov_text", "webvtt", "text"}
             subtitle_indices = [
@@ -108,6 +176,7 @@ def final_mux(
         "-map_chapters",
         "1",
         *streams,
+        *(["-metadata", "comment=" + comment] if comment is not None else []),
         str(output),
     ]
     process = subprocess.Popen(
@@ -117,13 +186,32 @@ def final_mux(
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if controller is not None:
         controller.register(process)
     try:
-        _stdout, stderr = process.communicate()
+        while True:
+            check_cancelled(controller)
+            try:
+                _stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        check_cancelled(controller)
     finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
         if controller is not None:
             controller.unregister(process)
     if process.returncode:
-        raise RuntimeError("Final audio/metadata mux failed:\n" + stderr[-4000:])
+        raise _MuxFailure(stderr)

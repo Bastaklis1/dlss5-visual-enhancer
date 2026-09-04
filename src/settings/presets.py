@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    DEFAULT_SETTINGS, MAX_PRESET_BYTES, PRESET_FORMAT, PRESET_SCHEMA_VERSION, UISettings, _validate,
+    MAX_PRESET_BYTES, PRESET_FORMAT, PRESET_SCHEMA_VERSION, UISettings, _validate,
 )
 
 _WINDOWS_RESERVED_NAMES = {

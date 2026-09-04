@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gradio as gr
+from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
 from PIL import Image
 
-from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
 from ..settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
@@ -116,6 +116,7 @@ def render_image_batch(
     rename_mode: str,
     custom_suffix: str,
     progress=gr.Progress(track_tqdm=False),
+    *, output_dir=None, controller=None, on_item_update=None, direct_disk=False,
 ):
     if not input_paths:
         raise gr.Error("Choose at least one image first.")
@@ -142,13 +143,17 @@ def render_image_batch(
         progress(value, desc=message)
 
     try:
-        result = convert_images(input_paths, options, progress=report)
+        result = convert_images(input_paths, options, progress=report, output_dir=output_dir,
+                                controller=controller, on_item_update=on_item_update,
+                                generate_previews=not direct_disk, create_zip=not direct_disk)
     except Exception as exc:
         traceback.print_exc()
+        if on_item_update is not None:
+            raise
         return [], [], None, [], f"Failed: {exc}"
 
     gallery = []
-    for item in result.successes:
+    for item in ([] if direct_disk else result.successes):
         preview = take_image_preview(item.output_path)
         if preview is None:
             with Image.open(item.output_path) as output:
@@ -156,7 +161,7 @@ def render_image_batch(
                 preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
                 preview = preview.copy()
         gallery.append((preview, Path(item.output_path).name))
-    files = [item.output_path for item in result.successes]
+    files = [] if direct_disk else [item.output_path for item in result.successes]
     rows = [
         [Path(item.input_path).name, "Complete", Path(item.output_path).name, "; ".join(item.warnings)]
         for item in result.successes
@@ -191,6 +196,9 @@ class ImageTab:
     zip_download: object
     status: object
     results: object
+    input_path: object = None
+    output_path: object = None
+    job_state: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -209,9 +217,10 @@ def build_image_tab(settings: UISettings) -> ImageTab:
                 label="Input image(s)", file_count="multiple", file_types=upload_types,
                 type="filepath", allow_reordering=True, elem_id="image-upload-list",
             )
+            input_path, output_path = build_path_controls()
             input_gallery = gr.Gallery(
                 label="Input preview", columns=3, height=520, object_fit="contain",
-                interactive=False, buttons=["fullscreen"], elem_id="image-input-preview",
+                interactive=False, visible=False, buttons=["fullscreen"], elem_id="image-input-preview",
             )
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):
                 neural = build_neural_controls(settings)
@@ -250,32 +259,23 @@ def build_image_tab(settings: UISettings) -> ImageTab:
                 elem_id="image-output-list",
             )
             zip_download = gr.DownloadButton("Download successful images as ZIP")
-            status = gr.Textbox(label="Status", interactive=False)
+            status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
-                headers=["Input", "Result", "Output", "Details"],
-                datatype=["str", "str", "str", "str"], interactive=False,
+                headers=BATCH_HEADERS,
+                datatype=["str"] * len(BATCH_HEADERS), interactive=False,
                 label="Batch results", wrap=True,
             )
     tab = ImageTab(
         sources, input_gallery, neural, model_preset, output_format, quality, rename_mode,
         custom_suffix, render, stop, reset, output_gallery, output_files, zip_download, status, results
     )
+    tab.input_path, tab.output_path = input_path, output_path
     bind_image_events(tab)
     return tab
 
 
 def bind_image_events(tab: ImageTab) -> None:
-    tab.sources.change(
-        preview_input_images, inputs=tab.sources, outputs=tab.input_gallery,
-        queue=False, show_progress="hidden",
-    )
+    bind_batch_ui(tab, render_image_batch, kind="image", preview_mode=preview_input_images)
     tab.rename_mode.change(
         rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False,
     )
-    tab.render.click(
-        render_image_batch, inputs=tab.render_inputs,
-        outputs=[tab.output_gallery, tab.output_files, tab.zip_download, tab.results, tab.status],
-        concurrency_limit=1, show_progress="full", show_progress_on=tab.output_gallery,
-    )
-    tab.stop.click(cancel_active_job, outputs=tab.status, queue=False)
-

@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gradio as gr
+from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
 
 from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
-from ..core.jobs import cancel_active_job
 from ..core.naming import RENAME_MODES
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
 from ..settings.models import (
@@ -137,6 +137,7 @@ def render_video_batch(
     rename_mode: str,
     custom_suffix: str,
     progress=gr.Progress(track_tqdm=False),
+    *, output_dir=None, controller=None, on_item_update=None, direct_disk=False,
 ) -> tuple[object, list[str], list[list[str]], str]:
     paths = normalize_video_paths(input_paths)
     if not paths:
@@ -166,9 +167,12 @@ def render_video_batch(
         progress(value, desc=message)
 
     try:
-        result = convert_videos(paths, options, progress=report)
+        result = convert_videos(paths, options, progress=report, output_dir=output_dir,
+                                controller=controller, on_item_update=on_item_update)
     except Exception as exc:
         traceback.print_exc()
+        if on_item_update is not None:
+            raise
         return gr.update(value=None, visible=len(paths) == 1), [], [], f"Failed: {exc}"
 
     ordered_rows: list[tuple[int, list[str]]] = []
@@ -207,10 +211,10 @@ def render_video_batch(
         preview_mode = "Auto"
     output_preview = None
     used_derivative = False
-    if len(paths) == 1 and result.successes:
+    if not direct_disk and len(paths) == 1 and result.successes and not result.cancelled:
         candidate = result.successes[0].result.output_path
         output_preview, used_derivative = resolve_final_preview(
-            candidate, preview_mode
+            candidate, preview_mode, controller=controller
         )
     failed_count = sum(not item.cancelled for item in result.failures)
     cancelled_count = sum(
@@ -230,7 +234,7 @@ def render_video_batch(
         status += f"\nFirst error: {result.failures[0].error}"
     if used_derivative:
         status += "\nBrowser preview transcoded to H.264; the original file is unchanged."
-    return gr.update(value=output_preview, visible=len(paths) == 1), files, rows, status
+    return gr.update(value=output_preview, visible=not direct_disk and len(paths) == 1), ([] if direct_disk else files), rows, status
 
 @dataclass(slots=True)
 class VideoTab:
@@ -253,6 +257,9 @@ class VideoTab:
     output_files: object
     status: object
     results: object
+    input_path: object = None
+    output_path: object = None
+    job_state: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -283,6 +290,7 @@ def build_video_tab(settings: UISettings) -> VideoTab:
                 label="Input video(s)", file_count="multiple", file_types=["video"],
                 type="filepath", allow_reordering=True, elem_id="video-upload-list",
             )
+            input_path, output_path = build_path_controls()
             input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):
                 neural = build_neural_controls(settings)
@@ -325,10 +333,10 @@ def build_video_tab(settings: UISettings) -> VideoTab:
                 label="Rendered video files", file_count="multiple", interactive=False,
                 elem_id="video-output-list",
             )
-            status = gr.Textbox(label="Status", interactive=False)
+            status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
-                headers=["Input", "Result", "Output", "Details"],
-                datatype=["str", "str", "str", "str"], interactive=False,
+                headers=BATCH_HEADERS,
+                datatype=["str"] * len(BATCH_HEADERS), interactive=False,
                 label="Batch results", wrap=True,
             )
     tab = VideoTab(
@@ -336,30 +344,13 @@ def build_video_tab(settings: UISettings) -> VideoTab:
         custom_suffix, hdr_mode, preview_frame, preview, render, stop, reset, output_video,
         output_files, status, results
     )
+    tab.input_path, tab.output_path = input_path, output_path
     bind_video_events(tab)
     return tab
 
 
 def bind_video_events(tab: VideoTab) -> None:
-    tab.sources.change(
-        update_video_preview_mode, inputs=tab.sources,
-        outputs=[tab.input_preview, tab.output_video, tab.preview_frame, tab.preview],
-        queue=False, show_progress="hidden",
-    )
+    bind_batch_ui(tab, render_video_batch, kind="video", preview_mode=update_video_preview_mode,
+                  preview_actions=[(tab.preview_frame, preview_one_frame), (tab.preview, preview_video)])
     tab.rename_mode.change(rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False)
     tab.codec.change(hdr_mode_update, inputs=tab.codec, outputs=tab.hdr_mode, queue=False)
-    tab.render.click(
-        render_video_batch, inputs=tab.render_inputs,
-        outputs=[tab.output_video, tab.output_files, tab.results, tab.status],
-        concurrency_limit=1, show_progress="full", show_progress_on=tab.output_video,
-    )
-    tab.preview.click(
-        preview_video, inputs=tab.preview_inputs, outputs=[tab.output_video, tab.status],
-        concurrency_limit=1, show_progress="full", show_progress_on=tab.output_video,
-    )
-    tab.preview_frame.click(
-        preview_one_frame, inputs=tab.preview_inputs, outputs=[tab.output_video, tab.status],
-        concurrency_limit=1, show_progress="full", show_progress_on=tab.output_video,
-    )
-    tab.stop.click(cancel_active_job, outputs=tab.status, queue=False)
-

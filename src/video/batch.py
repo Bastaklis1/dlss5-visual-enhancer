@@ -2,111 +2,79 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable
 
-from ..core.jobs import Cancelled, active_job
+from ..core.batch_progress import BatchItemUpdate, BatchProgress
+from ..core.disk_paths import prepare_output_dir
+from ..core.jobs import Cancelled, JobController, active_job
 from ..core.paths import LOGS
 from ..core.runtime import prepare_runtime
-from .models import (
-    ConversionOptions, VideoBatchResult, VideoConversionFailure, VideoConversionSuccess,
-)
-from .processor import _BATCH_CONTEXT, convert_video
+from .models import ConversionOptions, VideoBatchResult, VideoConversionFailure, VideoConversionSuccess
+from . import processor
 from .reports import _write_video_batch_manifest
+
 
 def convert_videos(
     input_paths: Iterable[str | os.PathLike[str]],
     options: ConversionOptions | None = None,
     progress: Callable[[float, str], None] | None = None,
+    *, output_dir: str | os.PathLike[str] | None = None,
+    controller: JobController | None = None,
+    on_item_update: Callable[[BatchItemUpdate], None] | None = None,
 ) -> VideoBatchResult:
-    """Convert videos sequentially while holding one cancellable GPU batch slot."""
-    options = options or ConversionOptions()
+    """Render in input order, publishing a completed row before starting the next file."""
+    options = replace(options) if options else ConversionOptions()
     paths = [Path(path).resolve() for path in input_paths]
     if not paths:
         raise ValueError("Choose at least one video.")
-
-    prepared_runtime = prepare_runtime()
-    LOGS.mkdir(exist_ok=True)
+    controller = controller or JobController()
+    reporter = BatchProgress(paths, on_item_update, progress)
+    successes, failures = [], []
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-    successes: list[VideoConversionSuccess] = []
-    failures: list[VideoConversionFailure] = []
-    cancelled = False
-    total = len(paths)
-
-    with active_job() as controller:
-        if getattr(_BATCH_CONTEXT, "controller", None) is not None:
-            raise RuntimeError("A video batch is already active on this worker thread.")
-        _BATCH_CONTEXT.controller = controller
-        _BATCH_CONTEXT.prepared_runtime = prepared_runtime
-        try:
-            for index, path in enumerate(paths):
-                position = index + 1
-                prefix = f"[{position}/{total}] {path.name}"
-                if controller.cancel.is_set():
-                    cancelled = True
-                    failures.extend(
-                        VideoConversionFailure(
-                            queued_index,
-                            str(queued),
-                            "Cancelled before rendering.",
-                            cancelled=True,
+    try:
+        destination = prepare_output_dir(output_dir, default=processor.OUTPUTS)
+        with active_job(controller):
+            if controller.cancel.is_set():
+                raise Cancelled("Stopped before rendering.")
+            prepared = prepare_runtime()
+            processor._BATCH_CONTEXT.controller = controller
+            processor._BATCH_CONTEXT.prepared_runtime = prepared
+            try:
+                for index, path in enumerate(paths):
+                    if controller.cancel.is_set():
+                        break
+                    reporter.advance(index)
+                    try:
+                        result = processor.convert_video(
+                            path, options, lambda value, message, i=index: reporter.advance(i, value, message),
+                            output_dir=destination,
                         )
-                        for queued_index, queued in enumerate(paths[index:], start=index)
-                    )
-                    break
-
-                def report_item(
-                    value: float,
-                    message: str,
-                    *,
-                    item_index: int = index,
-                    item_prefix: str = prefix,
-                ) -> None:
-                    bounded = min(1.0, max(0.0, float(value)))
-                    overall = (item_index + bounded) / total
-                    if progress:
-                        progress(overall, f"{item_prefix} — {message}")
-
-                if progress:
-                    progress(index / total, f"{prefix} — starting")
-                try:
-                    result = convert_video(path, options, progress=report_item)
-                except Cancelled:
-                    cancelled = True
-                    failures.append(
-                        VideoConversionFailure(
-                            index,
-                            str(path),
-                            "Cancelled during rendering.",
-                            cancelled=True,
-                        )
-                    )
-                    failures.extend(
-                        VideoConversionFailure(
-                            queued_index,
-                            str(queued),
-                            "Cancelled before rendering.",
-                            cancelled=True,
-                        )
-                        for queued_index, queued in enumerate(paths[position:], start=position)
-                    )
-                    break
-                except Exception as exc:
-                    failures.append(VideoConversionFailure(index, str(path), str(exc)))
-                    if progress:
-                        progress(position / total, f"{prefix} — failed")
-                    continue
-
-                successes.append(VideoConversionSuccess(index, str(path), result))
-                if progress:
-                    progress(position / total, f"{prefix} — complete")
-        finally:
-            del _BATCH_CONTEXT.controller
-            del _BATCH_CONTEXT.prepared_runtime
-
-    manifest_path = _write_video_batch_manifest(
-        stamp, options, successes, failures, cancelled
-    )
-    if progress:
-        progress(1.0, "Cancelled" if cancelled else "Complete")
-    return VideoBatchResult(successes, failures, cancelled, manifest_path)
+                    except Exception as exc:
+                        cancelled = isinstance(exc, Cancelled) or controller.cancel.is_set()
+                        failures.append(VideoConversionFailure(index, str(path), str(exc), cancelled))
+                        reporter.fail(index, exc, cancelled=cancelled)
+                        if cancelled:
+                            controller.stop()
+                            break
+                    else:
+                        successes.append(VideoConversionSuccess(index, str(path), result))
+                        reporter.complete(index, result.output_path, f"{result.frames} frames; report: {result.report_path}")
+            finally:
+                del processor._BATCH_CONTEXT.controller
+                del processor._BATCH_CONTEXT.prepared_runtime
+        cancelled = controller.cancel.is_set()
+        if cancelled:
+            for item in reporter.items:
+                if item.state == "Queued":
+                    failures.append(VideoConversionFailure(item.index, item.input_path, "Cancelled before rendering.", True))
+            reporter.skip_from(0)
+        manifest = _write_video_batch_manifest(stamp, options, successes, failures, cancelled,
+                                              batch_diagnostics=reporter.diagnostics(final=True),
+                                              output_dir=str(destination))
+        reporter.finish(cancelled=cancelled, manifest_path=manifest)
+        return VideoBatchResult(successes, failures, cancelled, manifest)
+    except BaseException as exc:
+        reporter.finish(cancelled=controller.cancel.is_set(), error=str(exc))
+        raise

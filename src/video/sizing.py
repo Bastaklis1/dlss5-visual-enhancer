@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ..core import ffmpeg
 from ..core.runtime import (
-    DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES,
+    UPSCALING_MODES,
     resolve_native_settings, resolve_output_size, resolve_upscaling_mode,
 )
 from .models import ConversionOptions

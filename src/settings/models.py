@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from ..core.dlss_architecture import DLSS_ARCHITECTURE_CHOICES
 from ..core.ffmpeg import CODEC_CHOICES as FFMPEG_CODEC_CHOICES, ENCODING_QUALITIES, HDR_ALLOWED_CODECS, hdr_mode_supported
-from ..core.naming import RENAME_MODES, validate_rename
-from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, resolve_native_settings, resolve_upscaling_mode
+from ..core.naming import validate_rename
+from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
 from .migration import _migrate_codec
 
@@ -68,6 +69,7 @@ class UISettings:
     frame_interpolation_rename_mode: str = "Auto"
     frame_interpolation_custom_suffix: str = "_DLSSFG"
     preview_encoding: str = "Auto"
+    dlss_architecture: str = "Auto"
 
     def component_values(
         self,
@@ -151,6 +153,10 @@ def _validate(settings: UISettings) -> UISettings:
         "Preview encoding": (
             settings.preview_encoding,
             PREVIEW_ENCODING_CHOICES,
+        ),
+        "DLSS Architecture": (
+            settings.dlss_architecture,
+            DLSS_ARCHITECTURE_CHOICES,
         ),
     }
     for label, (value, choices) in allowed.items():

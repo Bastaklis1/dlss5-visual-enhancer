@@ -3,36 +3,85 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from fractions import Fraction
 from pathlib import Path
 
 import av
 
 from ..paths import FFPROBE
+from ..jobs import Cancelled, JobController
 
-def _run_json(command: list[str]) -> dict:
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or "Media probe failed")
-    return json.loads(result.stdout)
+def _run_json(
+    command: list[str], *, strict_decode: bool = False,
+    controller: JobController | None = None,
+) -> dict:
+    if controller is not None and controller.cancel.is_set():
+        raise Cancelled("Render stopped by user.")
+    # ffprobe can report decoding errors and still exit with code zero. Keep its
+    # error output outside RAM, and retain a bounded excerpt for diagnostics.
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=errors,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if controller is not None:
+            controller.register(process)
+        try:
+            while True:
+                if controller is not None and controller.cancel.is_set():
+                    raise Cancelled("Render stopped by user.")
+                try:
+                    stdout, _ = process.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if controller is not None and controller.cancel.is_set():
+                raise Cancelled("Render stopped by user.")
+            size = errors.seek(0, os.SEEK_END)
+            errors.seek(max(0, size - 8000))
+            details = errors.read().decode("utf-8", "replace").strip()
+            if strict_decode and size:
+                raise RuntimeError("Source decoding failed during frame-count verification:\n" + details)
+            if process.returncode:
+                raise RuntimeError(details or "Media probe failed")
+            return json.loads(stdout)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+            if controller is not None:
+                controller.unregister(process)
+
+
+def _positive_count(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (ValueError, TypeError, OverflowError):
+        return 0
 
 
 def probe_video(
-    path: str | os.PathLike[str], *, count_mode: str = "exact"
+    path: str | os.PathLike[str], *, count_mode: str = "exact",
+    strict_decode: bool = False, controller: JobController | None = None,
 ) -> dict:
     """Probe video metadata, optionally counting decoded frames or packets.
 
     The default remains the legacy exact decoded-frame count for external callers.
     Conversion paths use metadata first and pay for exact counting only as fallback.
+    Strict decoding rejects decoder errors and unavailable decoded counts, even
+    when ffprobe exits successfully or the container declares a positive count.
     """
     if count_mode not in {"metadata", "exact", "packets"}:
         raise ValueError(f"Unknown video count mode: {count_mode!r}.")
+    if strict_decode and count_mode != "exact":
+        raise ValueError("Strict decoding requires count_mode='exact'.")
     count_args = {
         "metadata": [],
         "exact": ["-count_frames"],
@@ -53,7 +102,7 @@ def probe_video(
             "-of",
             "json",
             str(path),
-        ]
+        ], strict_decode=strict_decode, controller=controller,
     )
     streams = data.get("streams") or []
     if not streams:
@@ -67,14 +116,17 @@ def probe_video(
     width, height = int(stream["width"]), int(stream["height"])
     if rotation in (90, 270):
         width, height = height, width
+    declared_frames = _positive_count(stream.get("nb_frames"))
+    decoded_frames = _positive_count(stream.get("nb_read_frames"))
+    packet_frames = _positive_count(stream.get("nb_read_packets"))
     if count_mode == "packets":
-        frames = int(stream.get("nb_read_packets") or stream.get("nb_frames") or 0)
-        frame_count_source = "packets" if stream.get("nb_read_packets") else "metadata"
+        frames = packet_frames or declared_frames
+        frame_count_source = "packets" if packet_frames else "metadata"
     elif count_mode == "exact":
-        frames = int(stream.get("nb_read_frames") or stream.get("nb_frames") or 0)
-        frame_count_source = "decoded" if stream.get("nb_read_frames") else "metadata"
+        frames = decoded_frames if strict_decode else (decoded_frames or declared_frames)
+        frame_count_source = "decoded" if decoded_frames else "metadata"
     else:
-        frames = int(stream.get("nb_frames") or 0)
+        frames = declared_frames
         frame_count_source = "metadata" if frames > 0 else "unavailable"
     if count_mode == "exact" and frames <= 0:
         raise ValueError("Could not determine an exact frame count for this video.")

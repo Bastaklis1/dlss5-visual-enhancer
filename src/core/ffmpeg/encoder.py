@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import subprocess
 import threading
-from functools import lru_cache
 from pathlib import Path
 
 from ..jobs import JobController, drain_text
@@ -302,6 +301,7 @@ def start_encoder(
     require_nvenc: bool = False,
     hdr_mode: bool = False,
     hdr_metadata: dict | None = None,
+    preserve_timestamps: bool = False,
 ):
     codec_args, selected, quality = _codec_command(
         codec, quality_name, width, height, fps, gpu_ordinal, require_nvenc, hdr_mode, hdr_metadata
@@ -322,6 +322,7 @@ def start_encoder(
         *codec_args,
         "-fps_mode",
         "passthrough",
+        *(["-enc_time_base:v", "demux"] if preserve_timestamps else []),
         str(temp_video),
     ]
     process = subprocess.Popen(

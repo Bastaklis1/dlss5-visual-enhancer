@@ -13,6 +13,10 @@ __pycache__/
 !BINARIES.md
 !LICENSE
 !LICENSE-*.txt
+!LICENSE.GPL
+!LICENSE.LGPL
+!THIRD_PARTY_LICENSES.txt
+!Copyright
 !README.txt
 !.gitkeep
 !.gitignore

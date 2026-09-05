@@ -1,7 +1,7 @@
 """Portable DLSS 5 Visual Enhancer for images and video."""
 
 from .core.ffmpeg import probe_video
-from .image import (
+from .neural_rendering.image import (
     ImageBatchResult,
     ImageConversionFailure,
     ImageConversionOptions,
@@ -19,7 +19,7 @@ from .frame_interpolation import (
     interpolate_videos,
     probe_frame_interpolation_capabilities,
 )
-from .video import (
+from .neural_rendering.video import (
     ConversionOptions,
     ConversionResult,
     VideoBatchResult,

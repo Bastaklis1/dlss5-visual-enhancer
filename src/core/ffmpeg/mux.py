@@ -53,6 +53,7 @@ def final_mux(
     controller: JobController | None = None,
     preserve_supported_subtitles: bool = False,
     *, render_note: str | None = None, metadata_diagnostics: dict | None = None,
+    source_time_origin: float | None = None,
 ) -> None:
     check_cancelled(controller)
     if render_note is None or container not in VIDEO_NOTE_FORMATS:
@@ -60,7 +61,7 @@ def final_mux(
             record_embedding(metadata_diagnostics, "skipped", reason="unsupported_format")
         elif metadata_diagnostics is not None and not metadata_diagnostics:
             record_embedding(metadata_diagnostics, "not_requested")
-        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles)
+        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles, source_time_origin=source_time_origin)
         return
 
     try:
@@ -73,12 +74,12 @@ def final_mux(
     except (ValueError, TypeError, RuntimeError) as exc:
         check_cancelled(controller)
         embedding_warning(metadata_diagnostics, exc)
-        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles)
+        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles, source_time_origin=source_time_origin)
         return
 
     try:
         _final_mux_once(temp_video, source, output, container, controller,
-                        preserve_supported_subtitles, comment=comment)
+                        preserve_supported_subtitles, comment=comment, source_time_origin=source_time_origin)
         if _read_comment(output, controller) != comment:
             raise MetadataNoteError("Saved video did not retain the settings note")
     except Cancelled:
@@ -88,7 +89,7 @@ def final_mux(
         if isinstance(exc, _MuxFailure) and exc.filesystem_error:
             raise
         embedding_warning(metadata_diagnostics, exc)
-        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles)
+        _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles, source_time_origin=source_time_origin)
         return
     record_embedding(metadata_diagnostics, "embedded", field="format.comment")
 
@@ -114,7 +115,7 @@ class _MuxFailure(RuntimeError):
 def _final_mux_once(
     temp_video: Path, source: Path, output: Path, container: str,
     controller: JobController | None, preserve_supported_subtitles: bool,
-    *, comment: str | None = None,
+    *, comment: str | None = None, source_time_origin: float | None = None,
 ) -> None:
     check_cancelled(controller)
     duration = _probe_rendered_duration(temp_video, controller)
@@ -164,10 +165,12 @@ def _final_mux_once(
         "-loglevel",
         "warning",
         "-y",
+        *(["-copyts"] if source_time_origin is not None else []),
         "-i",
         str(temp_video),
         "-t",
         f"{duration:.9f}",
+        *(["-itsoffset", f"{-source_time_origin:.9f}"] if source_time_origin is not None else []),
         "-i",
         str(source),
         *maps,
@@ -176,6 +179,7 @@ def _final_mux_once(
         "-map_chapters",
         "1",
         *streams,
+        *(["-avoid_negative_ts", "disabled", "-metadata:s:v:0", "rotate=0"] if source_time_origin is not None else []),
         *(["-metadata", "comment=" + comment] if comment is not None else []),
         str(output),
     ]

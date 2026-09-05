@@ -21,7 +21,7 @@ class LiveOptions:
 
     source: str = ""
     max_height: int = 720
-    # Shared DLSS values (mirrored with the Image/Video tabs, persisted
+    # Shared DLSS values (mirrored with the Neural Rendering modes, persisted
     # globally); effects can update during playback, sizing stays fixed.
     nr_preset: str = "Default"
     nr_style: str = "Default"

@@ -90,10 +90,12 @@ def update_frame_interpolation_preview_mode(
     engine: str,
 ):
     normalized = normalize_video_paths(paths)
+    available = bool(normalized)
     single = len(normalized) == 1
+    label = "Input video preview" if len(normalized) <= 1 else f"Input video preview (first of {len(normalized)})"
     return (
-        gr.update(value=normalized[0] if single else None, visible=single),
-        gr.update(value=None, visible=single),
+        gr.update(value=normalized[0] if available else None, visible=available, label=label),
+        gr.update(value=None, visible=True),
         gr.update(visible=single),
     )
 

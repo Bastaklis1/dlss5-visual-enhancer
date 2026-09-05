@@ -4,7 +4,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from ..jobs import JobController, drain_text
+from ..jobs import BoundedLogBuffer, JobController, drain_bounded_text, drain_text
 from ..paths import FFMPEG
 from .codecs import (
     CODEC_CHOICES, _NVENC_ENCODERS, _base_codec, _hdr_color_args,
@@ -302,6 +302,7 @@ def start_encoder(
     hdr_mode: bool = False,
     hdr_metadata: dict | None = None,
     preserve_timestamps: bool = False,
+    *, video_filter: str | None = None, keep_start_time: bool = False, bounded_logs: bool = False,
 ):
     codec_args, selected, quality = _codec_command(
         codec, quality_name, width, height, fps, gpu_ordinal, require_nvenc, hdr_mode, hdr_metadata
@@ -312,6 +313,7 @@ def start_encoder(
         "-loglevel",
         "warning",
         "-y",
+        *(["-copyts"] if keep_start_time else []),
         "-f",
         "nut",
         "-i",
@@ -319,10 +321,12 @@ def start_encoder(
         "-map",
         "0:v:0",
         "-an",
+        *(["-vf", video_filter] if video_filter else []),
         *codec_args,
         "-fps_mode",
         "passthrough",
         *(["-enc_time_base:v", "demux"] if preserve_timestamps else []),
+        *(["-avoid_negative_ts", "disabled"] if keep_start_time else []),
         str(temp_video),
     ]
     process = subprocess.Popen(
@@ -330,10 +334,11 @@ def start_encoder(
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     controller.register(process)
-    logs: list[str] = []
+    logs = BoundedLogBuffer(max_tail=60) if bounded_logs else []
     assert process.stderr is not None
-    thread = threading.Thread(target=drain_text, args=(process.stderr, logs), daemon=True)
+    thread = threading.Thread(target=drain_bounded_text if bounded_logs else drain_text, args=(process.stderr, logs), daemon=True)
     thread.start()
     return process, thread, logs, selected, quality

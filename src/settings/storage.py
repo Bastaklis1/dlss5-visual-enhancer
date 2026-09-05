@@ -15,9 +15,10 @@ from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
 from .migration import _migrate_codec
 from .models import (
     CODEC_CHOICES, CONFIG_SECTION, CONTAINER_CHOICES, DEFAULT_SETTINGS, IMAGE_FORMAT_CHOICES,
-    PREVIEW_ENCODING_CHOICES, QUALITY_CHOICES, UISettings, _validate,
+    PREVIEW_ENCODING_CHOICES, QUALITY_CHOICES, UPSCALE_MODE_CHOICES, UISettings, _validate,
 )
-from ..core.dlss_architecture import DLSS_ARCHITECTURE_CHOICES
+from ..upscale.video.models import SETTING_FIELDS, options_from_settings
+from ..upscale.image.models import SETTING_FIELDS as IMAGE_UPSCALE_FIELDS, options_from_settings as image_upscale_options
 
 def load_settings(path: str | os.PathLike[str]) -> UISettings:
     config_path = Path(path)
@@ -203,10 +204,10 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             PREVIEW_ENCODING_CHOICES,
             DEFAULT_SETTINGS.preview_encoding,
         ),
-        dlss_architecture=choice(
-            "dlss_architecture",
-            DLSS_ARCHITECTURE_CHOICES,
-            DEFAULT_SETTINGS.dlss_architecture,
+        upscale_mode=choice(
+            "upscale_mode",
+            UPSCALE_MODE_CHOICES,
+            DEFAULT_SETTINGS.upscale_mode,
         ),
     )
     # Auto-disable HDR Mode if codec does not support it (e.g. H.264)
@@ -217,7 +218,32 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             settings = replace(settings, frame_interpolation_hdr_mode=False)
     except Exception:
         pass
-    return settings
+    upscale_values = {}
+    for prefix, names, factory in (("upscale_", SETTING_FIELDS, options_from_settings),
+                                    ("upscale_image_", IMAGE_UPSCALE_FIELDS, image_upscale_options)):
+        for name in names:
+            key = prefix + name
+            default = getattr(DEFAULT_SETTINGS, key)
+            raw = section.get(key)
+            if raw is None:
+                continue
+            try:
+                if isinstance(default, bool):
+                    value = boolean(key, default)
+                elif isinstance(default, int):
+                    value = int(raw)
+                elif isinstance(default, float):
+                    value = float(raw)
+                else:
+                    value = str(raw)
+                if name == "vsr_quality" and value == 0:
+                    value = default
+                candidate = replace(settings, **upscale_values, **{key: value})
+                factory(candidate).validate(for_render=False)
+                upscale_values[key] = value
+            except (ValueError, TypeError, OverflowError):
+                continue
+    return replace(settings, **upscale_values)
 
 
 def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
@@ -226,6 +252,9 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     parser = configparser.ConfigParser()
     parser[CONFIG_SECTION] = {
+        **{"upscale_image_" + name: str(getattr(settings, "upscale_image_" + name)) for name in IMAGE_UPSCALE_FIELDS},
+        **{"upscale_" + name: str(getattr(settings, "upscale_" + name)) for name in SETTING_FIELDS},
+        "upscale_mode": settings.upscale_mode,
         "ai_gpu_uuid": settings.ai_gpu_uuid,
         "video_gpu_uuid": settings.video_gpu_uuid,
         "nr_preset": settings.nr_preset,
@@ -256,7 +285,6 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "frame_interpolation_rename_mode": settings.frame_interpolation_rename_mode,
         "frame_interpolation_custom_suffix": settings.frame_interpolation_custom_suffix,
         "preview_encoding": settings.preview_encoding,
-        "dlss_architecture": settings.dlss_architecture,
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")

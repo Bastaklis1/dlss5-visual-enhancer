@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from ..core.paths import LOGS
+from ...core.paths import LOGS
 from .models import ConversionOptions, VideoConversionFailure, VideoConversionSuccess
 
 def _write_video_batch_manifest(

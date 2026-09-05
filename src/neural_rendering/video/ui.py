@@ -5,17 +5,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gradio as gr
-from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
+from ...core.batch_ui import (
+    BATCH_HEADERS, bind_batch_ui, build_media_clear_button, build_media_select_button,
+    build_path_controls,
+)
+from ...core.disk_paths import create_media_archive
 
-from ..core.ffmpeg import hdr_mode_supported
-from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
-from ..core.naming import RENAME_MODES
-from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
-from ..settings.models import (
+from ...core.ffmpeg import hdr_mode_supported
+from ...core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
+from ...core.naming import RENAME_MODES
+from ...core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
+from ...settings.models import (
     AUTOMATIC_MASK_CHOICES, CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings,
     automatic_mask_choice, coerce_hdr_mode, parse_automatic_mask,
 )
-from ..settings.storage import current_preview_encoding, processing_gpu_settings
+from ...settings.storage import current_preview_encoding, processing_gpu_settings
 from .batch import convert_videos
 from .models import ConversionOptions
 from .preview import (
@@ -138,7 +142,7 @@ def render_video_batch(
     custom_suffix: str,
     progress=gr.Progress(track_tqdm=False),
     *, output_dir=None, controller=None, on_item_update=None, direct_disk=False,
-) -> tuple[object, list[str], list[list[str]], str]:
+) -> tuple[object, str | None, list[list[str]], str]:
     paths = normalize_video_paths(input_paths)
     if not paths:
         raise gr.Error("Choose at least one video first.")
@@ -173,7 +177,7 @@ def render_video_batch(
         traceback.print_exc()
         if on_item_update is not None:
             raise
-        return gr.update(value=None, visible=len(paths) == 1), [], [], f"Failed: {exc}"
+        return gr.update(value=None, visible=not direct_disk), None, [], f"Failed: {exc}"
 
     ordered_rows: list[tuple[int, list[str]]] = []
     for item in result.successes:
@@ -204,7 +208,6 @@ def render_video_batch(
             (item.index, [Path(item.input_path).name, state, "", item.error])
         )
     rows = [row for _index, row in sorted(ordered_rows, key=lambda entry: entry[0])]
-    files = [item.result.output_path for item in result.successes]
     try:
         preview_mode = normalize_preview_encoding(current_preview_encoding())
     except Exception:
@@ -234,12 +237,23 @@ def render_video_batch(
         status += f"\nFirst error: {result.failures[0].error}"
     if used_derivative:
         status += "\nBrowser preview transcoded to H.264; the original file is unchanged."
-    return gr.update(value=output_preview, visible=not direct_disk and len(paths) == 1), ([] if direct_disk else files), rows, status
+    archive_path = None
+    if not direct_disk and not result.cancelled:
+        archive_path = create_media_archive(
+            (item.result.output_path for item in result.successes),
+            output_dir,
+            "DLSS5_VIDEO_BATCH",
+            controller=controller,
+        )
+    return gr.update(value=output_preview, visible=not direct_disk), archive_path, rows, status
 
 @dataclass(slots=True)
 class VideoTab:
     sources: object
     input_preview: object
+    input_actions: object
+    select_source: object
+    clear_source: object
     neural: list[object]
     model_preset: object
     quality: object
@@ -254,7 +268,7 @@ class VideoTab:
     stop: object
     reset: object
     output_video: object
-    output_files: object
+    zip_download: object
     status: object
     results: object
     input_path: object = None
@@ -289,9 +303,18 @@ def build_video_tab(settings: UISettings) -> VideoTab:
             sources = gr.File(
                 label="Input video(s)", file_count="multiple", file_types=["video"],
                 type="filepath", allow_reordering=True, elem_id="video-upload-list",
+                elem_classes=["media-upload-surface"],
             )
-            input_path, output_path = build_path_controls()
             input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
+            with gr.Row(
+                visible=False, elem_id="video-input-actions",
+                elem_classes=["media-input-actions"],
+            ) as input_actions:
+                select_source = build_media_select_button(
+                    "Choose Videos", ["video"], "video-select-input",
+                )
+                clear_source = build_media_clear_button("video-clear-input")
+            input_path, output_path = build_path_controls()
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):
                 neural = build_neural_controls(settings)
             with gr.Accordion("DLSS 5 Settings", open=True):
@@ -328,11 +351,10 @@ def build_video_tab(settings: UISettings) -> VideoTab:
                 stop = gr.Button("Stop", variant="stop")
                 reset = gr.Button("Reset settings")
         with gr.Column(scale=3):
-            output_video = gr.Video(label="Output video", interactive=False, visible=False)
-            output_files = gr.File(
-                label="Rendered video files", file_count="multiple", interactive=False,
-                elem_id="video-output-list",
+            output_video = gr.Video(
+                label="Output video", interactive=False, visible=True, height=520,
             )
+            zip_download = gr.DownloadButton("Save as ZIP", visible=False)
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
                 headers=BATCH_HEADERS,
@@ -340,9 +362,9 @@ def build_video_tab(settings: UISettings) -> VideoTab:
                 label="Batch results", wrap=True,
             )
     tab = VideoTab(
-        sources, input_preview, neural, model_preset, quality, codec, container, rename_mode,
+        sources, input_preview, input_actions, select_source, clear_source, neural, model_preset, quality, codec, container, rename_mode,
         custom_suffix, hdr_mode, preview_frame, preview, render, stop, reset, output_video,
-        output_files, status, results
+        zip_download, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_video_events(tab)

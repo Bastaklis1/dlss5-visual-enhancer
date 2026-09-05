@@ -6,7 +6,7 @@ from pathlib import Path
 import gradio as gr
 
 from ..settings.models import UISettings, parse_automatic_mask
-from ..video.ui import build_dlss_model_control, build_neural_controls
+from ..neural_rendering.video.ui import build_dlss_model_control, build_neural_controls
 from .models import (LIVE_FPS_CHOICES, LIVE_GUIDE_CHOICES, LIVE_MAX_HEIGHT_CHOICES,
                      LIVE_MAX_HEIGHTS, LIVE_SEGMENT_CHOICES, LIVE_SOURCE_QUALITY_CHOICES)
 from .pipeline import is_live_running, live_status, start_live_session, stop_live_session
@@ -166,7 +166,7 @@ def build_live_tab(settings: UISettings) -> LiveTab:
                 label="Local video", file_count="single", file_types=["video"],
                 type="filepath", interactive=True,
             )
-            gr.Markdown("Live applies DLSS effect changes automatically, including shared edits from other tabs. "
+            gr.Markdown("Live applies DLSS effect changes automatically, including shared edits from Neural Rendering's Image and Video modes. "
                         "Edits are combined for 0.5 seconds; applying them takes a few seconds, "
                         "plus playback buffering.")
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):

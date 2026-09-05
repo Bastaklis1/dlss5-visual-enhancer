@@ -4,6 +4,9 @@ from __future__ import annotations
 import mimetypes
 import os
 import tempfile
+import time
+import uuid
+import zipfile
 from pathlib import Path
 
 from .naming import require_available_output
@@ -33,7 +36,7 @@ def supported_file(path: Path, kind: str) -> bool:
     if kind == "image":
         # Lazy imports avoid coupling the core module's initialization to Image.
         from PIL import Image
-        from ..image.models import RAW_EXTENSIONS
+        from ..neural_rendering.image.models import RAW_EXTENSIONS
         return suffix in (set(Image.registered_extensions()) | RAW_EXTENSIONS | {".svg", ".heic", ".heif"})
     if kind != "video":
         raise ValueError(f"Unknown media type: {kind}")
@@ -116,3 +119,57 @@ class OutputFile:
                     self.destination.unlink()
             except FileNotFoundError:
                 pass
+
+
+def create_media_archive(
+    paths,
+    output_dir,
+    prefix: str,
+    *,
+    controller=None,
+) -> str | None:
+    """Atomically store successful media in an uncompressed, cancellable ZIP."""
+    sources = [Path(path).resolve() for path in paths]
+    if not sources or (controller is not None and controller.cancel.is_set()):
+        return None
+    destination = prepare_output_dir(output_dir)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive_path = destination / f"{prefix}_{stamp}_{uuid.uuid4().hex[:8]}.zip"
+    output_file = OutputFile(archive_path)
+    cancelled = False
+    try:
+        used_names: set[str] = set()
+        with zipfile.ZipFile(
+            output_file.temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True,
+        ) as archive:
+            for source in sources:
+                if controller is not None and controller.cancel.is_set():
+                    cancelled = True
+                    break
+                candidate = source.name
+                index = 2
+                while candidate.casefold() in used_names:
+                    candidate = f"{source.stem}_{index}{source.suffix}"
+                    index += 1
+                used_names.add(candidate.casefold())
+                info = zipfile.ZipInfo.from_file(source, arcname=candidate)
+                info.compress_type = zipfile.ZIP_STORED
+                with source.open("rb") as input_stream, archive.open(
+                    info, "w", force_zip64=True,
+                ) as output_stream:
+                    while True:
+                        if controller is not None and controller.cancel.is_set():
+                            cancelled = True
+                            break
+                        chunk = input_stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output_stream.write(chunk)
+                if cancelled:
+                    break
+        if cancelled or (controller is not None and controller.cancel.is_set()):
+            return None
+        output_file.publish()
+        return str(archive_path)
+    finally:
+        output_file.cleanup()

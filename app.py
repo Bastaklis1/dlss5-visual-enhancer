@@ -19,40 +19,95 @@ except Exception:
 
 import gradio as gr
 
+from src.about.ui import build_about_tab
 from src.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
     CACHE_SWEEP_INTERVAL_SECONDS,
     cleanup_old_caches,
 )
-from src.core.dlss_architecture import apply_dlss_architecture, init_dlssnr_runtime
 from src.core.paths import LIVE_DIR, LOGS, OUTPUTS
 from src.core.runtime import prepare_runtime
 from src.core.terminal import init_console
 from src.frame_interpolation.ui import build_frame_interpolation_tab
-from src.image.decoder import initialize_image_runtime
-from src.image.ui import build_image_tab
 from src.live.ui import build_live_tab
+from src.neural_rendering.image.decoder import initialize_image_runtime
+from src.neural_rendering.ui import build_neural_rendering_tab
 from src.settings.ui import bind_settings_events, build_settings_tab, initialize_settings
-from src.video.ui import build_video_tab
+from src.upscale.ui import build_upscale_tab
 
 APP_CSS = r"""
-/* Keep the header links identical even when one URL has been visited. */
-#app-title a,
-#app-title a:visited,
-#app-title a:hover,
-#app-title a:active {
-    color: #00bfff !important;
-    opacity: 1 !important;
+/* Center the About contents in the space below the app title and tab bar. */
+#about-content {
+    display: grid;
+    place-items: center;
+    min-height: calc(100dvh - 12rem);
+    padding: 2rem 1rem;
+    box-sizing: border-box;
+    text-align: center;
 }
 
-/* Keep large upload batches compact: roughly three file rows, then scroll. */
+#about-content .about-details {
+    max-width: 36rem;
+}
+
+#about-content h2 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+#about-content .about-version {
+    margin: 0.6rem 0 0;
+}
+
+#about-content .about-links {
+    margin-top: 2rem;
+}
+
+#about-content .about-links p {
+    margin: 0 0 1.25rem;
+}
+
+#about-content .about-description {
+    display: block;
+    margin-top: 0.4rem;
+    color: var(--body-text-color-subdued);
+    font-size: 0.875rem;
+}
+
+#about-content .about-copyright {
+    margin: 2rem 0 0;
+}
+
+/* Keep project links the same color after visiting them. */
+#about-content a,
+#about-content a:visited,
+#about-content a:hover,
+#about-content a:active {
+    color: #00bfff !important;
+    opacity: 1 !important;
+    font-weight: 600;
+}
+
+#about-content a:hover {
+    text-decoration: underline;
+}
+
+/* Match every image/video drop zone to the 16:9 input preview surface. */
+.media-upload-surface {
+    aspect-ratio: 16 / 9;
+    height: auto !important;
+    min-height: 0 !important;
+}
+
+/* Keep uploaded batches inside that surface and scroll when needed. */
 #image-upload-list .file-preview-holder,
-#image-output-list .file-preview-holder,
 #video-upload-list .file-preview-holder,
-#video-output-list .file-preview-holder,
-#frame-interpolation-upload-list .file-preview-holder,
-#frame-interpolation-output-list .file-preview-holder {
-    max-height: 210px !important;
+#upscale-image-upload-list .file-preview-holder,
+#upscale-upload-list .file-preview-holder,
+#frame-interpolation-upload-list .file-preview-holder {
+    max-height: 100% !important;
     overflow-x: hidden !important;
     overflow-y: auto !important;
     overscroll-behavior: contain;
@@ -60,17 +115,18 @@ APP_CSS = r"""
 }
 
 #image-upload-list .file-preview,
-#image-output-list .file-preview,
 #video-upload-list .file-preview,
-#video-output-list .file-preview,
-#frame-interpolation-upload-list .file-preview,
-#frame-interpolation-output-list .file-preview {
+#upscale-image-upload-list .file-preview,
+#upscale-upload-list .file-preview,
+#frame-interpolation-upload-list .file-preview {
     max-height: none !important;
 }
 
 /* A single input or output preview is a full 16:9 viewport without scrolling. */
 #image-input-preview:has(.gallery-item:only-child),
-#image-output-preview:has(.gallery-item:only-child) {
+#image-output-preview:has(.gallery-item:only-child),
+#upscale-image-input-preview:has(.gallery-item:only-child),
+#upscale-image-output-preview:has(.gallery-item:only-child) {
     aspect-ratio: 16 / 9;
     height: auto !important;
     min-height: 0 !important;
@@ -85,29 +141,63 @@ APP_CSS = r"""
 #image-output-preview:has(.gallery-item:only-child) .grid-wrap,
 #image-output-preview:has(.gallery-item:only-child) .grid-container,
 #image-output-preview:has(.gallery-item:only-child) .gallery-item,
-#image-output-preview:has(.gallery-item:only-child) .thumbnail-lg {
+#image-output-preview:has(.gallery-item:only-child) .thumbnail-lg,
+#upscale-image-input-preview:has(.gallery-item:only-child) .gallery-container,
+#upscale-image-input-preview:has(.gallery-item:only-child) .grid-wrap,
+#upscale-image-input-preview:has(.gallery-item:only-child) .grid-container,
+#upscale-image-input-preview:has(.gallery-item:only-child) .gallery-item,
+#upscale-image-input-preview:has(.gallery-item:only-child) .thumbnail-lg,
+#upscale-image-output-preview:has(.gallery-item:only-child) .gallery-container,
+#upscale-image-output-preview:has(.gallery-item:only-child) .grid-wrap,
+#upscale-image-output-preview:has(.gallery-item:only-child) .grid-container,
+#upscale-image-output-preview:has(.gallery-item:only-child) .gallery-item,
+#upscale-image-output-preview:has(.gallery-item:only-child) .thumbnail-lg {
     box-sizing: border-box;
     height: 100% !important;
     min-height: 0 !important;
 }
 
 #image-input-preview:has(.gallery-item:only-child) .grid-wrap,
-#image-output-preview:has(.gallery-item:only-child) .grid-wrap {
+#image-output-preview:has(.gallery-item:only-child) .grid-wrap,
+#upscale-image-input-preview:has(.gallery-item:only-child) .grid-wrap,
+#upscale-image-output-preview:has(.gallery-item:only-child) .grid-wrap {
     overflow: hidden !important;
 }
 
 #image-input-preview:has(.gallery-item:only-child) .grid-container,
-#image-output-preview:has(.gallery-item:only-child) .grid-container {
+#image-output-preview:has(.gallery-item:only-child) .grid-container,
+#upscale-image-input-preview:has(.gallery-item:only-child) .grid-container,
+#upscale-image-output-preview:has(.gallery-item:only-child) .grid-container {
     grid-template-rows: minmax(0, 1fr) !important;
     grid-auto-rows: minmax(0, 1fr) !important;
 }
 
 #image-input-preview:has(.gallery-item:only-child) img,
-#image-output-preview:has(.gallery-item:only-child) img {
+#image-output-preview:has(.gallery-item:only-child) img,
+#upscale-image-input-preview:has(.gallery-item:only-child) img,
+#upscale-image-output-preview:has(.gallery-item:only-child) img {
     height: 100% !important;
     width: 100% !important;
     object-fit: contain !important;
 }
+
+/* The replacement and clear actions share the media preview width. */
+.media-input-actions {
+    width: 100% !important;
+    max-width: none !important;
+}
+
+.media-input-actions > .media-select-button,
+.media-input-actions > .media-clear-button {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+}
+
+.media-select-button button,
+.media-clear-button {
+    width: 100% !important;
+}
+
 """
 
 
@@ -116,13 +206,6 @@ def build_app() -> gr.Blocks:
     prepared = prepare_runtime()
     initialize_image_runtime()
     settings, _gpu_warning, ai_gpu_choices, video_gpu_choices = initialize_settings(prepared)
-    # Re-apply the DLSS Architecture NR runtime for the loaded setting
-    # (no-op when the host copy already matches; failures only warn).
-    try:
-        apply_dlss_architecture(settings.dlss_architecture, prepared.gpu)
-    except Exception:
-        pass
-
     with gr.Blocks(
         title="DLSS 5 Visual Enhancer",
         # Official Gradio cache cleanup (see guides/resource-cleanup): every
@@ -132,24 +215,31 @@ def build_app() -> gr.Blocks:
         delete_cache=(CACHE_SWEEP_INTERVAL_SECONDS, CACHE_MAX_AGE_SECONDS),
     ) as demo:
         gr.Markdown(
-            "# DLSS 5 Visual Enhancer\n"
-            "[Support on Patreon](https://www.patreon.com/MM744) | "
-            "[GitHub](https://github.com/Merserk/dlss5-visual-enhancer)",
+            "# DLSS 5 Visual Enhancer",
             elem_id="app-title",
         )
-        with gr.Tabs(selected="image"):
-            with gr.Tab("Image", id="image"):
-                image_tab = build_image_tab(settings)
-            with gr.Tab("Video", id="video"):
-                video_tab = build_video_tab(settings)
+        with gr.Tabs(selected="neural-rendering"):
+            with gr.Tab("Neural Rendering", id="neural-rendering"):
+                neural_rendering_tab = build_neural_rendering_tab(settings)
+            with gr.Tab("Upscale", id="upscale"):
+                upscale_tab = build_upscale_tab(settings)
             with gr.Tab("Frame Interpolation", id="frame-interpolation"):
                 frame_tab = build_frame_interpolation_tab(settings)
             with gr.Tab("Live", id="live"):
                 live_tab = build_live_tab(settings)
             with gr.Tab("Settings", id="settings"):
                 settings_tab = build_settings_tab(settings, ai_gpu_choices, video_gpu_choices)
+            with gr.Tab("About", id="about"):
+                build_about_tab()
 
-        bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab)
+        bind_settings_events(
+            settings_tab,
+            neural_rendering_tab.image,
+            neural_rendering_tab.video,
+            frame_tab,
+            live_tab,
+            upscale_tab,
+        )
     return demo
 
 
@@ -168,13 +258,6 @@ def main() -> None:
     # crashed) runs before serving. Best effort: never blocks startup.
     try:
         cleanup_old_caches()
-    except Exception:
-        pass
-    # Ensure the per-architecture NR runtimes exist and stage the saved
-    # DLSS Architecture build into host/ before prepare_runtime() warms it.
-    # Best effort: never blocks startup.
-    try:
-        init_dlssnr_runtime()
     except Exception:
         pass
     # Reuse early loading UI if it was already rendered at import time (avoids second flash and keeps alt buffer)

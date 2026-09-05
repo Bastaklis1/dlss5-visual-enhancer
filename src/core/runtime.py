@@ -20,7 +20,10 @@ import numpy as np
 from .gpu_detection import detect_gpus
 from .gpu_selection import resolve_runtime_ai_gpu
 from .jobs import BoundedLogBuffer, Cancelled, JobController, drain_bounded_text
-from .paths import ADDON, DLSS_SUPERRES, FFMPEG, FFPROBE, HOST_DIR, HOST_DXGI, LOGS, NEURAL_RUNTIME, RESHADE_LOG, RUNTIME, WORKER
+from .paths import (
+    ADDON, DLSS_SUPERRES, FFMPEG, FFPROBE, HOST_DIR, HOST_DXGI, LOGS,
+    NEURAL_RUNTIME, RESHADE_LOG, RUNTIME, WORKER,
+)
 
 
 
@@ -204,7 +207,7 @@ def inspect_runtime_bundle(
 def validate_gpu_runtime(
     gpu: dict[str, Any], bundle: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Return runtime metadata without generation, version, or hash compatibility locks."""
+    """Return runtime metadata without version or hash compatibility locks."""
     del gpu
     return bundle or inspect_runtime_bundle()
 
@@ -224,22 +227,11 @@ def classify_worker_failure(
         "evaluate raised 0xC0000005" in evidence
         or "feature 18 evaluate raised an exception" in evidence
     )
-    generation = int(gpu.get("generation") or 0)
-    if access_violation and generation == 30:
-        summary = (
-            "DLSS 5 feature 18 hit access violation 0xC0000005 on the experimental "
-            f"RTX 30-series path before frame {frame_index} completed. Ordinary D3D12/NGX "
-            "initialization may still have succeeded; the failure is inside the patched neural "
-            "runtime/add-on evaluation."
-        )
-        summary += (
-            " The native runtime rejected or crashed on this RTX 30-series system. "
-            "Update the NVIDIA driver or try a different compatible runtime build."
-        )
-    elif access_violation:
+    if access_violation:
         summary = (
             f"DLSS 5 feature 18 raised access violation 0xC0000005 before frame {frame_index} "
-            "completed inside the neural runtime/add-on evaluation."
+            "completed inside the universal neural runtime/add-on evaluation. Update the "
+            "NVIDIA driver and verify the bundled DLSSNR runtime is intact."
         )
     else:
         summary = (
@@ -337,9 +329,10 @@ def validate_runtime_files() -> None:
     if leftovers:
         raise RuntimeError(
             "The portable runtime still uses the old flat bin/runtime/ layout. "
-            "Move host files (nvngx.dll, dxgi.dll, renodx-dlss5.addon64, ReShade.ini, "
-            "nvngx_dlssnr.dll) to bin/runtime/host/, nvngx_dlss.dll to "
-            "bin/runtime/dlss/, and frame_interpolation/dlssg/* to bin/runtime/dlssg/.\n"
+            "Move host files (nvngx.dll, dxgi.dll, ReShade.ini) to bin/runtime/host/, "
+            "nvngx_dlss.dll to bin/runtime/dlss/, renodx-dlss5.addon64 and "
+            "nvngx_dlssnr.dll to bin/runtime/dlssnr/, and "
+            "frame_interpolation/dlssg/* to bin/runtime/dlssg/.\n"
             + "\n".join(leftovers)
         )
     # Note: ReShade.ini is not required here. The worker rewrites every NR key

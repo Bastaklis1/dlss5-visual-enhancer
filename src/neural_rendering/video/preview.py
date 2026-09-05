@@ -5,12 +5,12 @@ from pathlib import Path
 
 import gradio as gr
 
-from ..core.ffmpeg.preview import (
+from ...core.ffmpeg.preview import (
     is_browser_playable, make_browser_preview, normalize_preview_encoding,
     resolve_final_preview, resolve_preview_codec, wants_compat_preview,
 )
-from ..settings.models import coerce_hdr_mode, parse_automatic_mask
-from ..settings.storage import current_preview_encoding, processing_gpu_settings
+from ...settings.models import coerce_hdr_mode, parse_automatic_mask
+from ...settings.storage import current_preview_encoding, processing_gpu_settings
 from .models import ConversionOptions
 from .processor import convert_video
 
@@ -148,11 +148,13 @@ def first_video_path(paths: list[str] | str | None) -> str | None:
 
 def update_video_preview_mode(paths: list[str] | str | None):
     normalized = normalize_video_paths(paths)
+    available = bool(normalized)
     single = len(normalized) == 1
-    input_value = normalized[0] if single else None
+    input_value = normalized[0] if available else None
+    input_label = "Input video preview" if len(normalized) <= 1 else f"Input video preview (first of {len(normalized)})"
     return (
-        gr.update(value=input_value, visible=single),
-        gr.update(value=None, visible=single),
+        gr.update(value=input_value, visible=available, label=input_label),
+        gr.update(value=None, visible=True),
         gr.update(visible=single),
         gr.update(visible=single),
     )

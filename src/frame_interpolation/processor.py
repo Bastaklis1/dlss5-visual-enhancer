@@ -17,7 +17,6 @@ import av
 import numpy as np
 
 from ..core import ffmpeg
-from ..core.dlss_architecture import apply_current_dlss_architecture
 from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import Cancelled, active_job
 from ..core.naming import output_filename, validate_rename
@@ -224,12 +223,6 @@ def interpolate_video(
     ai_gpu = resolve_runtime_ai_gpu(
         prepared_runtime.gpus, prepared_runtime.runtime_bundle, options.ai_gpu_uuid
     )
-    # Stage the selected DLSS Architecture NR build before workers spawn
-    # (warn-and-continue: render proceeds with the current DLL).
-    try:
-        apply_current_dlss_architecture(ai_gpu)
-    except Exception:
-        pass
     capabilities = probe_frame_interpolation_capabilities(options.ai_gpu_uuid)
     if not capabilities.available:
         raise RuntimeError(

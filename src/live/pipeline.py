@@ -16,14 +16,13 @@ from pathlib import Path
 import av
 import numpy as np
 
-from ..core.dlss_architecture import apply_current_dlss_architecture
 from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import BoundedLogBuffer, Cancelled, JobController, active_job, drain_bounded_text
 from ..core.paths import FFMPEG, LIVE_DIR, LOGS
 from ..core.runtime import (DLSSFrameSession, prepare_runtime, resolve_native_settings,
                             resolve_output_size, resolve_upscaling_mode, verify_feature_18)
 from ..settings.storage import processing_gpu_settings
-from ..video.guides import TemporalGuideGenerator
+from ..neural_rendering.video.guides import TemporalGuideGenerator
 from .effects import EffectSettings, EffectUpdates, NativeDeadline, EFFECT_REPLACEMENT_TIMEOUT
 from .hls_server import HlsServer
 from .models import (LIVE_FRAME_COUNT, LIVE_FPS_CHOICES, LIVE_GUIDE_CHOICES,
@@ -476,7 +475,6 @@ class LiveSession(threading.Thread):
         prepared_runtime = prepare_runtime()
         ai_uuid, video_uuid = processing_gpu_settings()
         gpu = resolve_runtime_ai_gpu(prepared_runtime.gpus, prepared_runtime.runtime_bundle, ai_uuid)
-        apply_current_dlss_architecture(gpu)
         nvenc, ordinal = self._select_encoder(prepared_runtime.gpus, video_uuid, out_w, out_h)
         self._set(input_size=f"{in_w}x{in_h}", output_size=f"{out_w}x{out_h}",
                   encoder="NVIDIA NVENC" if nvenc else "CPU x264")

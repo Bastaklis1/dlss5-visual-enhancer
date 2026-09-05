@@ -17,15 +17,14 @@ from typing import Callable
 import av
 import numpy as np
 
-from ..core import ffmpeg
-from ..core.dlss_architecture import apply_current_dlss_architecture
-from ..core.gpu_selection import resolve_runtime_ai_gpu
-from ..core.jobs import Cancelled, active_job
-from ..core.naming import output_filename, validate_rename
-from ..core.disk_paths import OutputFile, prepare_output_dir
-from ..core.render_metadata import prepare_render_note
-from ..core.paths import JOBS, LOGS, OUTPUTS
-from ..core.runtime import (
+from ...core import ffmpeg
+from ...core.gpu_selection import resolve_runtime_ai_gpu
+from ...core.jobs import Cancelled, active_job
+from ...core.naming import output_filename, validate_rename
+from ...core.disk_paths import OutputFile, prepare_output_dir
+from ...core.render_metadata import prepare_render_note
+from ...core.paths import JOBS, LOGS, OUTPUTS
+from ...core.runtime import (
     DLSSFrameSession, prepare_runtime, resize_fit, rotate_frame, verify_feature_18,
     write_failure_report,
 )
@@ -126,12 +125,6 @@ def convert_video(
         gpu: dict | None = resolve_runtime_ai_gpu(
             prepared_runtime.gpus, prepared_runtime.runtime_bundle, options.ai_gpu_uuid
         )
-        # Stage the selected DLSS Architecture NR build before the worker
-        # spawns (warn-and-continue: render proceeds with the current DLL).
-        try:
-            apply_current_dlss_architecture(gpu)
-        except Exception:
-            pass
         video_gpu: dict | None = None
         runtime_bundle: dict | None = prepared_runtime.runtime_bundle
         encoder = None
@@ -650,12 +643,13 @@ def convert_video(
                 "carrier_create_result": carrier_create_result,
                 "successful_neural_rendering_frames": nr_count,
                 "addon_release": runtime_bundle["addon"]["release"],
+                "dlssnr_runtime": runtime_bundle["neural_runtime"],
                 "loaded_module_inventory": [
                     "host/nvngx.dll (standalone worker image)",
                     "host/dxgi.dll (ReShade carrier)",
-                    "host/renodx-dlss5.addon64",
+                    "dlssnr/renodx-dlss5.addon64",
                     "dlss/nvngx_dlss.dll",
-                    "host/nvngx_dlssnr.dll",
+                    "dlssnr/nvngx_dlssnr.dll",
                     "system D3D12/DXGI/NGX core",
                 ],
                 "native_settings": native,

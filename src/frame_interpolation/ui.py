@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gradio as gr
-from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
+from ..core.batch_ui import (
+    BATCH_HEADERS, bind_batch_ui, build_media_clear_button, build_media_select_button,
+    build_path_controls,
+)
+from ..core.disk_paths import create_media_archive
 
 from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
@@ -67,7 +71,7 @@ def render_frame_interpolation_batch(
         traceback.print_exc()
         if on_item_update is not None:
             raise
-        return gr.update(value=None, visible=len(paths) == 1), [], [], f"Failed: {exc}"
+        return gr.update(value=None, visible=not direct_disk), None, [], f"Failed: {exc}"
     ordered: list[tuple[int, list[str]]] = []
     for item in result.successes:
         value = item.result
@@ -105,12 +109,20 @@ def render_frame_interpolation_batch(
         status += f"\nFirst error: {result.failures[0].error}"
     if used_derivative:
         status += "\nBrowser preview transcoded to H.264; the original file is unchanged."
-    return gr.update(value=preview, visible=not direct_disk and len(paths) == 1), ([] if direct_disk else files), rows, status
+    archive_path = None
+    if not direct_disk and not result.cancelled:
+        archive_path = create_media_archive(
+            files, output_dir, "DLSSFG_VIDEO_BATCH", controller=controller,
+        )
+    return gr.update(value=preview, visible=not direct_disk), archive_path, rows, status
 
 @dataclass(slots=True)
 class FrameInterpolationTab:
     sources: object
     input_preview: object
+    input_actions: object
+    select_source: object
+    clear_source: object
     target_fps: object
     engine: object
     quality: object
@@ -124,7 +136,7 @@ class FrameInterpolationTab:
     stop: object
     reset: object
     output_video: object
-    output_files: object
+    zip_download: object
     status: object
     results: object
     input_path: object = None
@@ -156,9 +168,18 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
             sources = gr.File(
                 label="Input video(s)", file_count="multiple", file_types=["video"],
                 type="filepath", allow_reordering=True, elem_id="frame-interpolation-upload-list",
+                elem_classes=["media-upload-surface"],
             )
-            input_path, output_path = build_path_controls()
             input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
+            with gr.Row(
+                visible=False, elem_id="frame-interpolation-input-actions",
+                elem_classes=["media-input-actions"],
+            ) as input_actions:
+                select_source = build_media_select_button(
+                    "Choose Videos", ["video"], "frame-interpolation-select-input",
+                )
+                clear_source = build_media_clear_button("frame-interpolation-clear-input")
+            input_path, output_path = build_path_controls()
             with gr.Accordion("DLSS Frame Generation Settings", open=True):
                 with gr.Row():
                     target_fps = gr.Dropdown(
@@ -202,11 +223,10 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 stop = gr.Button("Stop", variant="stop")
                 reset = gr.Button("Reset settings")
         with gr.Column(scale=3):
-            output_video = gr.Video(label="Interpolated output", interactive=False, visible=False)
-            output_files = gr.File(
-                label="Interpolated video files", file_count="multiple", interactive=False,
-                elem_id="frame-interpolation-output-list",
+            output_video = gr.Video(
+                label="Interpolated output", interactive=False, visible=True, height=520,
             )
+            zip_download = gr.DownloadButton("Save as ZIP", visible=False)
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
                 headers=BATCH_HEADERS,
@@ -214,8 +234,8 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 label="Batch results", wrap=True,
             )
     tab = FrameInterpolationTab(
-        sources, input_preview, target_fps, engine, quality, codec, container, rename_mode,
-        custom_suffix, hdr_mode, preview, render, stop, reset, output_video, output_files, status, results
+        sources, input_preview, input_actions, select_source, clear_source, target_fps, engine, quality, codec, container, rename_mode,
+        custom_suffix, hdr_mode, preview, render, stop, reset, output_video, zip_download, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_frame_interpolation_events(tab)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from ..core import ffmpeg
-from ..core.runtime import (
+from ...core import ffmpeg
+from ...core.runtime import (
     UPSCALING_MODES,
     resolve_native_settings, resolve_output_size, resolve_upscaling_mode,
 )

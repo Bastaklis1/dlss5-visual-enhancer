@@ -4,19 +4,19 @@ from dataclasses import dataclass, replace
 
 import gradio as gr
 
-from ..core.dlss_architecture import apply_dlss_architecture
 from ..core.ffmpeg import hdr_mode_supported, probe_nvenc_codecs
 from ..core.gpu_selection import gpu_choice_label
 from ..core.paths import CONFIG_PATH
 from ..core.runtime import UPSCALING_MODES, prepare_runtime
 from ..core.ffmpeg.preview import normalize_preview_encoding
 from .models import (
-    DEFAULT_SETTINGS, DLSS_ARCHITECTURE_CHOICES,
-    PREVIEW_ENCODING_CHOICES, UISettings,
+    DEFAULT_SETTINGS, PREVIEW_ENCODING_CHOICES, UPSCALE_MODE_CHOICES, UISettings,
     automatic_mask_choice, coerce_hdr_mode, parse_automatic_mask,
 )
 from .presets import export_settings_preset, import_settings_preset, preset_filename
 from .storage import SETTINGS_STATE, load_settings, save_settings
+from ..upscale.video.models import SETTING_FIELDS, UpscaleOptions
+from ..upscale.image.models import SETTING_FIELDS as IMAGE_UPSCALE_FIELDS, ImageUpscaleOptions
 
 _CONFIG_LOCK = SETTINGS_STATE.lock
 UPSCALING_CHOICES = tuple((mode["label"], factor) for factor, mode in UPSCALING_MODES.items())
@@ -43,7 +43,7 @@ def _shared_dlss_values(
 
 
 def _mirrored_dlss_values(settings: UISettings) -> tuple:
-    """Shared 9-tuple twice: feeds two sibling tabs' neural controls."""
+    """Shared 9-tuple twice: feeds the Image and Video mode controls."""
     shared = _shared_dlss_values(settings)
     return (*shared, *shared)
 
@@ -202,6 +202,52 @@ def persist_frame_interpolation_settings(
         SETTINGS_STATE.current = settings
 
 
+def persist_upscale_settings(*values) -> None:
+    chosen = dict(zip(SETTING_FIELDS, values))
+    if not hdr_mode_supported(chosen["codec"]):
+        chosen["hdr_enabled"] = False
+    options = UpscaleOptions(**chosen)
+    options.validate(for_render=False)
+    defaults = UpscaleOptions()
+    for name in SETTING_FIELDS:
+        if type(getattr(defaults, name)) is int:
+            chosen[name] = int(chosen[name])
+    chosen["scale_factor"] = float(chosen["scale_factor"])
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, **{"upscale_" + name: value for name, value in chosen.items()})
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+
+
+def persist_image_upscale_settings(*values) -> None:
+    chosen = dict(zip(IMAGE_UPSCALE_FIELDS, values))
+    ImageUpscaleOptions(**chosen).validate()
+    defaults = ImageUpscaleOptions()
+    for name in IMAGE_UPSCALE_FIELDS:
+        if type(getattr(defaults, name)) is int:
+            chosen[name] = int(chosen[name])
+    chosen["scale_factor"] = float(chosen["scale_factor"])
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, **{"upscale_image_" + n: v for n, v in chosen.items()})
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+
+
+def persist_upscale_mode(mode: str) -> None:
+    if mode not in UPSCALE_MODE_CHOICES:
+        raise gr.Error(f"Upscale mode must be one of: {', '.join(UPSCALE_MODE_CHOICES)}.")
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, upscale_mode=mode)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+
+
 def _settings_component_values(settings: UISettings) -> tuple:
     shared = _shared_dlss_values(settings)
     return (
@@ -237,8 +283,10 @@ def _settings_component_values(settings: UISettings) -> tuple:
         settings.ai_gpu_uuid,
         settings.video_gpu_uuid,
         settings.preview_encoding,
-        settings.dlss_architecture,
         *shared,
+        settings.upscale_mode,
+        *(getattr(settings, "upscale_" + name) for name in SETTING_FIELDS),
+        *(getattr(settings, "upscale_image_" + name) for name in IMAGE_UPSCALE_FIELDS),
     )
 
 
@@ -288,31 +336,6 @@ def persist_preview_encoding(preview_encoding: str) -> None:
         SETTINGS_STATE.current = settings
 
 
-def persist_dlss_architecture(dlss_architecture: str) -> None:
-    if not isinstance(dlss_architecture, str) or dlss_architecture not in DLSS_ARCHITECTURE_CHOICES:
-        raise gr.Error(
-            f"DLSS Architecture must be one of: {', '.join(DLSS_ARCHITECTURE_CHOICES)}."
-        )
-    with _CONFIG_LOCK:
-        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
-        settings = replace(current, dlss_architecture=dlss_architecture)
-        if settings != current:
-            save_settings(CONFIG_PATH, settings)
-        SETTINGS_STATE.current = settings
-    # A Live worker may be between replacements. Pin its runtime for the
-    # entire session, including that brief interval with no DLL loaded.
-    from ..live.pipeline import is_live_running
-    if is_live_running():
-        return
-    # Swap the host NR runtime immediately so the next render uses it.
-    # Failures only warn (logged); the saved setting still applies later.
-    try:
-        prepared = prepare_runtime()
-        apply_dlss_architecture(settings.dlss_architecture, prepared.gpu)
-    except Exception:
-        pass
-
-
 def persist_gpu_settings(ai_gpu_uuid: str, video_gpu_uuid: str) -> str:
     prepared = prepare_runtime()
     ai_choices, video_choices = _gpu_choices(prepared)
@@ -342,9 +365,11 @@ def reset_saved_settings() -> tuple:
         save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
         SETTINGS_STATE.current = DEFAULT_SETTINGS
         _notify_live_effects(DEFAULT_SETTINGS)
-    message = "All Image, Video, and Frame Interpolation settings were reset to defaults."
+    message = "All Neural Rendering, Upscale, and Frame Interpolation settings were reset to defaults."
     return (
         *_settings_component_values(DEFAULT_SETTINGS),
+        message,
+        message,
         message,
         message,
         message,
@@ -395,7 +420,7 @@ def apply_settings_preset(
     return (
         name,
         *_settings_component_values(imported),
-        f"Imported preset {name!r}; all tabs and saved startup settings were updated."
+        f"Imported preset {name!r}; all modes, tabs, and saved startup settings were updated."
         + (f" {gpu_warning}" if gpu_warning else ""),
     )
 
@@ -404,7 +429,6 @@ class SettingsTab:
     ai_gpu_selector: object
     video_gpu_selector: object
     preview_encoding_selector: object
-    architecture_selector: object
     preset_name: object
     preset_export: object
     preset_import: object
@@ -433,7 +457,7 @@ def build_settings_tab(
 ) -> SettingsTab:
     gr.Markdown(
         "## GPU Selection\n"
-        "AI Processing controls DLSS and Frame Generation. Video Processing "
+        "AI Processing controls DLSS, RTX Video, and Frame Generation. Video Processing "
         "controls only codecs suffixed (NVIDIA NVENC); plain H.264/H.265/AV1 and ProRes remain CPU-based."
     )
     with gr.Row():
@@ -441,7 +465,7 @@ def build_settings_tab(
             choices=ai_gpu_choices,
             value=settings.ai_gpu_uuid,
             label="AI Processing GPU",
-            info="Used for every DLSS Neural Rendering and Frame Generation operation.",
+            info="Used for DLSS Neural Rendering, RTX Video, and Frame Generation.",
         )
         video_gpu_selector = gr.Dropdown(
             choices=video_gpu_choices,
@@ -451,8 +475,8 @@ def build_settings_tab(
         )
     gr.Markdown(
         "## Preview Encoding\n"
-        "Controls how in-app video previews are produced for the Video and Frame "
-        "Interpolation tabs (preview buttons and final-render player)."
+        "Controls how in-app video previews are produced for Neural Rendering's Video mode, "
+        "Upscale, and Frame Interpolation (preview buttons and final-render player)."
     )
     preview_encoding_selector = gr.Radio(
         choices=list(PREVIEW_ENCODING_CHOICES),
@@ -467,22 +491,9 @@ def build_settings_tab(
         ),
     )
     gr.Markdown(
-        "## DLSS 5 Architecture\n"
-        "Selects which Neural Rendering runtime build is used for Image, Video, "
-        "and Frame Interpolation. Auto picks from the AI Processing GPU: "
-        "RTX 20/30 uses Turing+, RTX 40 uses Ada Lovelace+, RTX 50 uses Blackwell+. "
-        "Takes effect on the next render."
-    )
-    architecture_selector = gr.Dropdown(
-        choices=list(DLSS_ARCHITECTURE_CHOICES),
-        value=settings.dlss_architecture,
-        label="DLSS 5 Architecture",
-        info="Auto, Turing and higher, Ada Lovelace and higher, or Blackwell and higher.",
-    )
-    gr.Markdown(
         "## Settings Presets\n"
-        "Export every adjustable option from the Image, Video, and Frame "
-        "Interpolation tabs, or import a preset to apply it everywhere."
+        "Export every adjustable option from Neural Rendering's Image and Video modes, "
+        "Upscale, and Frame Interpolation, or import a preset to apply it everywhere."
     )
     preset_name = gr.Textbox(
         label="Preset name",
@@ -508,13 +519,12 @@ def build_settings_tab(
     preset_status = gr.Markdown("", elem_id="preset-status")
     return SettingsTab(
         ai_gpu_selector, video_gpu_selector, preview_encoding_selector,
-        architecture_selector,
         preset_name, preset_export, preset_import, preset_status
     )
 
 
 
-def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab) -> list[object]:
+def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab, upscale_tab) -> list[object]:
     return [
         *image_tab.neural,
         image_tab.model_preset,
@@ -541,13 +551,15 @@ def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, li
         settings_tab.ai_gpu_selector,
         settings_tab.video_gpu_selector,
         settings_tab.preview_encoding_selector,
-        settings_tab.architecture_selector,
         *live_tab.neural,
         live_tab.model_preset,
+        upscale_tab.mode,
+        *upscale_tab.video.settings_inputs,
+        *upscale_tab.image.settings_inputs,
     ]
 
 
-def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab) -> None:
+def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab, upscale_tab) -> None:
     video_mirror = [*video_tab.neural, video_tab.model_preset]
     image_mirror = [*image_tab.neural, image_tab.model_preset]
     live_mirror = [*live_tab.neural, live_tab.model_preset]
@@ -579,7 +591,17 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab
             queue=False,
         )
 
-    outputs = settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab)
+    for component in upscale_tab.video.settings_inputs:
+        component.change(persist_upscale_settings, inputs=upscale_tab.video.settings_inputs, queue=False, show_progress="hidden")
+    for component in upscale_tab.image.settings_inputs:
+        component.change(persist_image_upscale_settings, inputs=upscale_tab.image.settings_inputs, queue=False, show_progress="hidden")
+    upscale_tab.mode.input(
+        persist_upscale_mode,
+        inputs=upscale_tab.mode,
+        queue=False,
+        show_progress="hidden",
+    )
+    outputs = settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab, upscale_tab)
     settings_tab.preset_export.click(
         settings_preset_export_status,
         inputs=settings_tab.preset_name,
@@ -603,13 +625,9 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab
         inputs=settings_tab.preview_encoding_selector,
         queue=False,
     )
-    settings_tab.architecture_selector.input(
-        persist_dlss_architecture,
-        inputs=settings_tab.architecture_selector,
-        queue=False,
-    )
-
-    reset_outputs = [*outputs, image_tab.status, video_tab.status, frame_tab.status]
+    reset_outputs = [*outputs, image_tab.status, video_tab.status, frame_tab.status, upscale_tab.video.status, upscale_tab.image.status]
     image_tab.reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)
     video_tab.reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)
     frame_tab.reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)
+    upscale_tab.video.reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)
+    upscale_tab.image.reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)

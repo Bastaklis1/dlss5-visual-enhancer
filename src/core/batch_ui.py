@@ -15,11 +15,53 @@ BATCH_HEADERS = ["File", "State", "Progress", "Elapsed", "Output path", "Details
 
 
 def build_path_controls():
-    source = gr.Textbox(label="Input path", placeholder=r"C:\Users\You\Downloads\Videos",
-                        info="Absolute file or folder path. Overrides uploads; folder contents only, sorted by filename.")
-    destination = gr.Textbox(label="Output path", placeholder=r"D:\Rendered outputs",
-                             info="Output folder; blank uses the app's outputs folder. Either path disables previews and downloads.")
+    source = gr.Textbox(
+        label="Input path (Optional)", placeholder=r"D:\Render\inputs",
+        info="Absolute file or folder path. Overrides uploads; folder contents only, sorted by filename.",
+    )
+    destination = gr.Textbox(
+        label="Output path (Optional)", placeholder=r"D:\Render\outputs",
+        info="Output folder; blank uses the app's outputs folder. Either path disables previews and downloads.",
+    )
     return source, destination
+
+
+def build_media_select_button(label: str, file_types: list[str], elem_id: str):
+    """Build the replacement picker shown below an input preview."""
+    return gr.UploadButton(
+        label,
+        file_count="multiple",
+        file_types=file_types,
+        type="filepath",
+        visible=True,
+        size="lg",
+        scale=1,
+        min_width=0,
+        elem_id=elem_id,
+        elem_classes=["media-select-button"],
+    )
+
+
+def build_media_clear_button(elem_id: str):
+    """Build the clear action displayed to the right of a replacement picker."""
+    return gr.Button(
+        "Clear",
+        visible=True,
+        size="lg",
+        scale=1,
+        min_width=0,
+        elem_id=elem_id,
+        elem_classes=["media-clear-button"],
+    )
+
+
+def input_surface_updates(show_preview: bool, input_path: str | None = None):
+    """Swap the drop zone for its preview while uploads are the active input mode."""
+    upload_enabled = not bool(str(input_path or "").strip())
+    return (
+        gr.update(visible=not show_preview, interactive=upload_enabled),
+        gr.update(visible=show_preview and upload_enabled),
+    )
 
 
 class BatchRun:
@@ -81,19 +123,41 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
     tab.job_state = gr.State(value=lambda: uuid.uuid4().hex, delete_callback=release_view)
     is_image = kind == "image"
     input_media = tab.input_gallery if is_image else tab.input_preview
-    media = ([tab.output_gallery, tab.output_files, tab.zip_download] if is_image else
-             [tab.output_video, tab.output_files])
+    media = [tab.output_gallery] if is_image else [tab.output_video]
+    archive_download = getattr(tab, "zip_download", None)
+    if archive_download is not None:
+        media.append(tab.zip_download)
     preview_buttons = [button for button, _fn in preview_actions]
-    controls = [tab.sources, tab.input_path, tab.output_path, tab.render, tab.reset, *preview_buttons]
+    controls = [
+        tab.sources, tab.select_source, tab.clear_source, tab.input_path, tab.output_path,
+        tab.render, tab.reset, *preview_buttons,
+    ]
     outputs = [*media, tab.results, tab.status, *controls]
     path_inputs = [tab.job_state, tab.input_path, tab.output_path]
 
     def empty_media(disk):
-        return [gr.update(value=None, visible=not disk) for _ in media]
+        values = [gr.update(value=None, visible=not disk)]
+        if archive_download is not None:
+            values.append(gr.update(value=None, visible=False))
+        return values
+
+    def completed_media(result, disk):
+        if result is None or disk:
+            return empty_media(disk)
+        values = list(result[:len(media)])
+        if archive_download is not None:
+            archive_path = values[-1]
+            values[-1] = gr.update(value=archive_path, visible=bool(archive_path))
+        return values
 
     def control_updates(busy, input_path):
-        return [gr.update(interactive=not busy and not bool(str(input_path or "").strip())),
-                *[gr.update(interactive=not busy) for _ in controls[1:]]]
+        upload_enabled = not busy and not bool(str(input_path or "").strip())
+        return [
+            gr.update(interactive=upload_enabled),
+            gr.update(interactive=upload_enabled),
+            gr.update(interactive=upload_enabled),
+            *[gr.update(interactive=not busy) for _ in controls[3:]],
+        ]
 
     def refresh(key, input_path, output_path, *args):
         view = _view(key)
@@ -106,29 +170,54 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
         if busy and disk and view.job is not None and view.job.is_preview:
             view.job.controller.stop()
         if busy and not disk:
-            return [gr.skip()] * (1 + len(media) + len(preview_buttons) + 1)
+            return [gr.skip()] * (1 + len(media) + len(preview_buttons) + 2)
+        show_input_media = False
         if disk:
             values = [gr.update(value=None, visible=False), *empty_media(True),
                       *[gr.update(visible=False) for _ in preview_buttons]]
         elif is_image:
             previews = preview_mode(args[0])
-            values = [gr.update(value=previews, visible=bool(previews)), *empty_media(False)]
+            show_input_media = bool(previews)
+            values = [gr.update(value=previews, visible=show_input_media), *empty_media(False)]
         else:
             input_update, output_update, *buttons = preview_mode(*args)
-            values = [input_update, output_update, gr.update(value=None, visible=True), *buttons]
+            sources = args[0]
+            show_input_media = bool([sources] if isinstance(sources, str) else list(sources or []))
+            values = [input_update, output_update, *empty_media(False)[1:], *buttons]
         with view.lock:
             if revision != view.revision:
-                return [gr.skip()] * (1 + len(media) + len(preview_buttons) + 1)
-        return [*values, gr.update(interactive=not bool(str(input_path or "").strip()))]
+                return [gr.skip()] * (1 + len(media) + len(preview_buttons) + 2)
+        source_update, actions_update = input_surface_updates(show_input_media, input_path)
+        return [
+            *values,
+            source_update,
+            actions_update,
+        ]
 
     source_args = [tab.sources]
     if hasattr(tab, "target_fps"):
         source_args += [tab.target_fps, tab.engine]
-    refresh_outputs = [input_media, *media, *preview_buttons, tab.sources]
+    refresh_outputs = [
+        input_media, *media, *preview_buttons,
+        tab.sources, tab.input_actions,
+    ]
+    tab.select_source.upload(
+        lambda selected: gr.update(value=selected),
+        inputs=tab.select_source,
+        outputs=tab.sources,
+        queue=False,
+        show_progress="hidden",
+    )
+    tab.clear_source.click(
+        lambda: gr.update(value=None),
+        outputs=tab.sources,
+        queue=False,
+        show_progress="hidden",
+    )
     for component in (tab.sources, tab.input_path, tab.output_path):
-        event = component.change if component is tab.sources else component.input
-        event(refresh, inputs=[*path_inputs, *source_args], outputs=refresh_outputs,
-              queue=False, show_progress="hidden")
+        # Textbox changes also cover pasted paths and programmatic value updates.
+        component.change(refresh, inputs=[*path_inputs, *source_args], outputs=refresh_outputs,
+                         queue=False, show_progress="hidden")
 
     def stream(key, input_path, output_path, *args):
         view = _view(key)
@@ -168,9 +257,7 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
                        *[gr.skip() for _ in controls])
             job.close()
             row_values, status = job.progress.display(destination)
-            final_media = empty_media(disk)
-            if job.result is not None and not disk:
-                final_media = list(job.result[:len(media)])
+            final_media = completed_media(job.result, disk)
             if job.error and job.error not in status:
                 status += f"\n{job.error}"
             with view.lock:
@@ -203,9 +290,14 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
 
     def guarded_preview(function):
         def preview(key, input_path, output_path, *args, progress=gr.Progress(track_tqdm=False)):
+            def empty_preview(video, status):
+                values = (video, status)
+                if archive_download is not None:
+                    values += (gr.update(value=None, visible=False),)
+                return values
             view = _view(key)
             if direct_disk_mode(input_path, output_path):
-                return gr.update(value=None, visible=False), "Previews are disabled when a path is supplied."
+                return empty_preview(gr.update(value=None, visible=False), "Previews are disabled when a path is supplied.")
             with view.lock:
                 if view.job is not None:
                     raise gr.Error("A job is already running in this tab.")
@@ -217,10 +309,12 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
                 with use_job_controller(job.controller):
                     result = function(*args, progress=progress)
                 if job.controller.cancel.is_set():
-                    return gr.update(value=None, visible=False), "Preview cancelled."
+                    return empty_preview(gr.update(value=None, visible=False), "Preview cancelled.")
                 with view.lock:
                     if view.revision != revision or view.disk:
-                        return gr.skip(), gr.skip()
+                        return (gr.skip(),) * (2 + int(archive_download is not None))
+                if archive_download is not None:
+                    return (*result, gr.update(value=None, visible=False))
                 return result
             finally:
                 job.done.set()
@@ -230,4 +324,5 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
         return preview
     for button, function in preview_actions:
         button.click(guarded_preview(function), inputs=[*path_inputs, *tab.preview_inputs],
-                     outputs=[tab.output_video, tab.status], concurrency_limit=None, show_progress="hidden")
+                     outputs=[tab.output_video, tab.status, *([archive_download] if archive_download is not None else [])],
+                     concurrency_limit=None, show_progress="hidden")

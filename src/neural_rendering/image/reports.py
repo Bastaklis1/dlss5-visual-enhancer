@@ -7,10 +7,10 @@ from pathlib import Path
 
 from PIL import TiffImagePlugin
 
-from ..core.paths import LOGS, OUTPUTS
-from ..core.disk_paths import OutputFile
-from ..core.jobs import Cancelled
-from ..core.runtime import DLSSFrameSession, DLSS_MODEL_PRESETS
+from ...core.paths import LOGS, OUTPUTS
+from ...core.disk_paths import OutputFile
+from ...core.jobs import Cancelled
+from ...core.runtime import DLSSFrameSession, DLSS_MODEL_PRESETS
 from .decoder import _DecodedImage
 from .models import ImageConversionFailure, ImageConversionOptions, ImageConversionResult
 
@@ -90,6 +90,7 @@ def _write_report(
         "carrier_create_result": evidence["carrier_create_result"],
         "native_settings": session.native_settings,
         "addon_release": session.runtime_bundle["addon"]["release"],
+        "dlssnr_runtime": session.runtime_bundle["neural_runtime"],
         "worker_log": session.worker_logs,
         "worker_log_dropped_lines": session.worker_log_dropped_lines,
         "dlssnr_evidence": evidence["evidence"],

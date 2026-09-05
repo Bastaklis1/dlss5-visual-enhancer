@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from ..core.dlss_architecture import DLSS_ARCHITECTURE_CHOICES
 from ..core.ffmpeg import CODEC_CHOICES as FFMPEG_CODEC_CHOICES, ENCODING_QUALITIES, HDR_ALLOWED_CODECS, hdr_mode_supported
 from ..core.naming import validate_rename
 from ..core.runtime import resolve_native_settings, resolve_upscaling_mode
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
 from .migration import _migrate_codec
+from ..upscale.video.models import options_from_settings
+from ..upscale.image.models import options_from_settings as image_upscale_options
 
 QUALITY_CHOICES = ENCODING_QUALITIES
 CODEC_CHOICES = FFMPEG_CODEC_CHOICES
@@ -21,6 +22,7 @@ MAX_PRESET_BYTES = 1024 * 1024
 AUTOMATIC_MASK_CHOICES = ("Off", "On")
 
 PREVIEW_ENCODING_CHOICES = ("Auto", "Always H.264", "Disabled")
+UPSCALE_MODE_CHOICES = ("Image", "Video")
 
 
 def coerce_hdr_mode(codec: str, enabled: bool) -> bool:
@@ -69,7 +71,36 @@ class UISettings:
     frame_interpolation_rename_mode: str = "Auto"
     frame_interpolation_custom_suffix: str = "_DLSSFG"
     preview_encoding: str = "Auto"
-    dlss_architecture: str = "Auto"
+    upscale_mode: str = "Image"
+    upscale_image_vsr_quality: int = 4
+    upscale_image_size_mode: str = "Scale factor"
+    upscale_image_scale_factor: float = 2.0
+    upscale_image_width: int = 3840
+    upscale_image_height: int = 2160
+    upscale_image_aspect_lock: bool = True
+    upscale_image_output_format: str = "PNG"
+    upscale_image_quality: int = 95
+    upscale_image_preserve_metadata: bool = True
+    upscale_image_rename_mode: str = "Auto"
+    upscale_image_custom_suffix: str = "_RTXIMAGE"
+    upscale_vsr_enabled: bool = True
+    upscale_vsr_quality: int = 4
+    upscale_size_mode: str = "Scale factor"
+    upscale_scale_factor: float = 2.0
+    upscale_width: int = 3840
+    upscale_height: int = 2160
+    upscale_aspect_lock: bool = True
+    upscale_hdr_enabled: bool = False
+    upscale_hdr_contrast: int = 100
+    upscale_hdr_saturation: int = 100
+    upscale_hdr_middle_gray: int = 50
+    upscale_hdr_peak_luminance: int = 1000
+    upscale_hdr_precision: str = "Packed 10-bit"
+    upscale_codec: str = "H.265 (NVIDIA NVENC)"
+    upscale_container: str = "MP4"
+    upscale_quality: str = "Auto (Default)"
+    upscale_rename_mode: str = "Auto"
+    upscale_custom_suffix: str = "_RTXVIDEO"
 
     def component_values(
         self,
@@ -94,6 +125,8 @@ DEFAULT_SETTINGS = UISettings()
 
 
 def _validate(settings: UISettings) -> UISettings:
+    options_from_settings(settings).validate(for_render=False)
+    image_upscale_options(settings).validate(for_render=False)
     for label, value in (
         ("AI Processing GPU", settings.ai_gpu_uuid),
         ("Video Processing GPU", settings.video_gpu_uuid),
@@ -154,9 +187,9 @@ def _validate(settings: UISettings) -> UISettings:
             settings.preview_encoding,
             PREVIEW_ENCODING_CHOICES,
         ),
-        "DLSS Architecture": (
-            settings.dlss_architecture,
-            DLSS_ARCHITECTURE_CHOICES,
+        "Upscale mode": (
+            settings.upscale_mode,
+            UPSCALE_MODE_CHOICES,
         ),
     }
     for label, (value, choices) in allowed.items():

@@ -5,13 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gradio as gr
-from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
+from ...core.batch_ui import (
+    BATCH_HEADERS, bind_batch_ui, build_media_clear_button, build_media_select_button,
+    build_path_controls,
+)
 from PIL import Image
 
-from ..core.naming import RENAME_MODES
-from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
-from ..settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
-from ..settings.storage import processing_gpu_settings
+from ...core.naming import RENAME_MODES
+from ...core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
+from ...settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
+from ...settings.storage import processing_gpu_settings
 from .decoder import decode_image
 from .encoder import take_image_preview
 from .batch import convert_images
@@ -150,7 +153,7 @@ def render_image_batch(
         traceback.print_exc()
         if on_item_update is not None:
             raise
-        return [], [], None, [], f"Failed: {exc}"
+        return [], None, [], f"Failed: {exc}"
 
     gallery = []
     for item in ([] if direct_disk else result.successes):
@@ -161,7 +164,6 @@ def render_image_batch(
                 preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
                 preview = preview.copy()
         gallery.append((preview, Path(item.output_path).name))
-    files = [] if direct_disk else [item.output_path for item in result.successes]
     rows = [
         [Path(item.input_path).name, "Complete", Path(item.output_path).name, "; ".join(item.warnings)]
         for item in result.successes
@@ -176,12 +178,15 @@ def render_image_batch(
     )
     if result.failures:
         status += f"\nFirst error: {result.failures[0].error}"
-    return gallery, files, result.zip_path, rows, status
+    return gallery, result.zip_path, rows, status
 
 @dataclass(slots=True)
 class ImageTab:
     sources: object
     input_gallery: object
+    input_actions: object
+    select_source: object
+    clear_source: object
     neural: list[object]
     model_preset: object
     output_format: object
@@ -192,7 +197,6 @@ class ImageTab:
     stop: object
     reset: object
     output_gallery: object
-    output_files: object
     zip_download: object
     status: object
     results: object
@@ -216,12 +220,21 @@ def build_image_tab(settings: UISettings) -> ImageTab:
             sources = gr.File(
                 label="Input image(s)", file_count="multiple", file_types=upload_types,
                 type="filepath", allow_reordering=True, elem_id="image-upload-list",
+                elem_classes=["media-upload-surface"],
             )
-            input_path, output_path = build_path_controls()
             input_gallery = gr.Gallery(
                 label="Input preview", columns=3, height=520, object_fit="contain",
                 interactive=False, visible=False, buttons=["fullscreen"], elem_id="image-input-preview",
             )
+            with gr.Row(
+                visible=False, elem_id="image-input-actions",
+                elem_classes=["media-input-actions"],
+            ) as input_actions:
+                select_source = build_media_select_button(
+                    "Choose Images", upload_types, "image-select-input",
+                )
+                clear_source = build_media_clear_button("image-clear-input")
+            input_path, output_path = build_path_controls()
             with gr.Accordion("DLSS 5 Neural Rendering Settings", open=True):
                 neural = build_neural_controls(settings)
             with gr.Accordion("DLSS 5 Settings", open=True):
@@ -254,11 +267,7 @@ def build_image_tab(settings: UISettings) -> ImageTab:
                 interactive=False, buttons=["download", "download_all", "fullscreen"],
                 elem_id="image-output-preview",
             )
-            output_files = gr.File(
-                label="Rendered image files", file_count="multiple", interactive=False,
-                elem_id="image-output-list",
-            )
-            zip_download = gr.DownloadButton("Download successful images as ZIP")
+            zip_download = gr.DownloadButton("Save as ZIP", visible=False)
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
                 headers=BATCH_HEADERS,
@@ -266,8 +275,8 @@ def build_image_tab(settings: UISettings) -> ImageTab:
                 label="Batch results", wrap=True,
             )
     tab = ImageTab(
-        sources, input_gallery, neural, model_preset, output_format, quality, rename_mode,
-        custom_suffix, render, stop, reset, output_gallery, output_files, zip_download, status, results
+        sources, input_gallery, input_actions, select_source, clear_source, neural, model_preset, output_format, quality, rename_mode,
+        custom_suffix, render, stop, reset, output_gallery, zip_download, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_image_events(tab)

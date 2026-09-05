@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
-    MAX_PRESET_BYTES, PRESET_FORMAT, PRESET_SCHEMA_VERSION, UISettings, _validate,
+    DEFAULT_SETTINGS, MAX_PRESET_BYTES, PRESET_FORMAT, PRESET_SCHEMA_VERSION, UISettings, _validate,
 )
 
 _WINDOWS_RESERVED_NAMES = {
@@ -137,5 +137,12 @@ def import_settings_preset(
         for key, value in imported.items()
         if key in known_names
     }
+    # Presets created before the Upscale tab get its defaults independently of
+    # whichever RTX settings happen to be selected when the preset is imported.
+    for key in known_names:
+        if key.startswith("upscale_") and key not in changes:
+            changes[key] = getattr(DEFAULT_SETTINGS, key)
+    if changes.get("upscale_vsr_quality") == 0:
+        changes["upscale_vsr_quality"] = DEFAULT_SETTINGS.upscale_vsr_quality
     merged = replace(current, **changes)
     return name, _validate(merged)

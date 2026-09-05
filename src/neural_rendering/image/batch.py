@@ -11,15 +11,14 @@ from typing import Callable, Iterable
 import cv2
 import numpy as np
 
-from ..core.batch_progress import BatchItemUpdate, BatchProgress
-from ..core.disk_paths import OutputFile, prepare_output_dir
-from ..core.dlss_architecture import apply_current_dlss_architecture
-from ..core.gpu_selection import resolve_runtime_ai_gpu
-from ..core.jobs import Cancelled, JobController, active_job
-from ..core.render_metadata import prepare_render_note
-from ..core.naming import output_filename, validate_rename
-from ..core.paths import LOGS, OUTPUTS
-from ..core.runtime import (
+from ...core.batch_progress import BatchItemUpdate, BatchProgress
+from ...core.disk_paths import OutputFile, prepare_output_dir
+from ...core.gpu_selection import resolve_runtime_ai_gpu
+from ...core.jobs import Cancelled, JobController, active_job
+from ...core.render_metadata import prepare_render_note
+from ...core.naming import output_filename, validate_rename
+from ...core.paths import LOGS, OUTPUTS
+from ...core.runtime import (
     DLSSFrameSession, prepare_runtime, resize_fit, resolve_native_settings,
     resolve_output_size, resolve_upscaling_mode, verify_feature_18, write_failure_report,
 )
@@ -80,10 +79,6 @@ def convert_images(
                 raise Cancelled("Stopped before rendering.")
             prepared = prepare_runtime()
             gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, options.ai_gpu_uuid)
-            try:
-                apply_current_dlss_architecture(gpu)
-            except Exception:
-                pass
             factor, mode = resolve_upscaling_mode(options.upscaling_factor)
             native = resolve_native_settings(options)
             next_decode = None

@@ -11,8 +11,8 @@ import numpy as np
 from PIL import Image
 
 from .models import ImageConversionOptions
-from ..core.jobs import Cancelled
-from ..core.render_metadata import (
+from ...core.jobs import Cancelled
+from ...core.render_metadata import (
     IMAGE_NOTE_FORMATS, MetadataNoteError, check_cancelled, embedding_warning,
     merge_render_note, record_embedding,
 )

@@ -84,6 +84,7 @@ def make_browser_preview(
     source: str | Path,
     dest_dir: str | Path | None = None,
     controller=None,
+    *, sdr_filter: str | None = None,
 ) -> str:
     """Transcode an existing result file to a browser-playable H.264 MP4.
 
@@ -118,6 +119,7 @@ def make_browser_preview(
         "0:v:0",
         "-map",
         "0:a?",
+        *(["-vf", sdr_filter, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"] if sdr_filter else []),
         "-c:v",
         "libx264",
         "-preset",

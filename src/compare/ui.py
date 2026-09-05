@@ -68,12 +68,15 @@ def swap_selection(reference_label: str, candidate_label: str):
 
 
 PREFERRED_CANDIDATE_LABELS = ("Grid: Full grid",)
+PREFERRED_REFERENCE_LABELS = ("Grid: Input grid",)
 
 
 def receive_items(new_items: list[ComparisonItem]):
     labels = [item.label for item in new_items]
-    default_reference = next((label for label in labels if label.startswith("Input: ")), None) or (
-        labels[0] if labels else NO_SELECTION
+    default_reference = (
+        next((label for label in PREFERRED_REFERENCE_LABELS if label in labels), None)
+        or next((label for label in labels if label.startswith("Input: ")), None)
+        or (labels[0] if labels else NO_SELECTION)
     )
     default_candidate = (
         next((label for label in labels if label.startswith("Output: ")), None)

@@ -87,6 +87,10 @@ def compose_grid(
     row_heights = [max(scaled[r][c][1][1] for c in range(n_cols)) for r in range(n_rows)]
 
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    if show_col_labels:
+        for c in range(n_cols):
+            label_w = dummy_draw.textbbox((0, 0), col_labels[c], font=font)[2] + LABEL_PADDING * 2
+            col_widths[c] = max(col_widths[c], label_w)
     row_label_w = 0
     if show_row_labels:
         widest = max((dummy_draw.textbbox((0, 0), label, font=font)[2] for label in row_labels), default=0)

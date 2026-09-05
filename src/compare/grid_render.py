@@ -20,6 +20,7 @@ from .processor import compute_diff_from_images, load_rgb
 
 DIFF_BASELINE_CHOICES = ("First rendered cell", "Input image")
 GRID_OUTPUT_DIR = OUTPUTS / "grids"
+GRID_CELLS_DIR = GRID_OUTPUT_DIR / "cells"
 
 
 def _identity(value: str):
@@ -152,18 +153,21 @@ def render_grid(
         output_format="PNG", quality=100, rename_mode="Auto", custom_suffix="_grid",
     )
 
+    x_axis_label = GRID_AXES[x_axis_key].label
+    y_axis_label = GRID_AXES[y_axis_key].label if y_axis_key != "none" else None
+    col_labels = [f"{x_axis_label}: {caption}" for caption, _option in x_values]
+    row_labels = [f"{y_axis_label}: {caption}" for caption, _option in y_values] if y_axis_label else [""]
+
     total_cells = len(y_values) * len(x_values)
     done = 0
     grid_cells: list[list[GridCell]] = []
-    row_labels: list[str] = []
     comparison_items: list[ComparisonItem] = [
         ComparisonItem(f"Input: {Path(input_path).name}", input_path)
     ]
 
-    for y_caption, y_option in y_values:
+    for row_index, (y_caption, y_option) in enumerate(y_values):
         row: list[GridCell] = []
-        row_labels.append(y_caption)
-        for x_caption, x_option in x_values:
+        for col_index, (x_caption, x_option) in enumerate(x_values):
             if progress is not None:
                 desc = " / ".join(part for part in (x_caption, y_caption) if part)
                 progress(done / max(total_cells, 1), desc=f"Rendering {desc}")
@@ -172,10 +176,13 @@ def render_grid(
                 kwargs[GRID_AXES[x_axis_key].field_name] = x_option
             if y_axis_key != "none":
                 kwargs[GRID_AXES[y_axis_key].field_name] = y_option
-            label = x_caption if y_axis_key == "none" else f"{x_caption} / {y_caption}"
+            label = col_labels[col_index] if y_axis_key == "none" else f"{col_labels[col_index]} / {row_labels[row_index]}"
             try:
                 options = ImageConversionOptions(**kwargs)
-                result = convert_images([input_path], options)
+                result = convert_images(
+                    [input_path], options, output_dir=GRID_CELLS_DIR,
+                    generate_previews=False, create_zip=False,
+                )
                 if result.successes:
                     output_path = result.successes[0].output_path
                     with Image.open(output_path) as handle:
@@ -190,7 +197,6 @@ def render_grid(
             done += 1
         grid_cells.append(row)
 
-    col_labels = [caption for caption, _option in x_values]
     target_long_edge = None if resolution_choice == "Full res" else int(resolution_choice)
     show_row_labels = y_axis_key != "none"
     composed = compose_grid(
@@ -200,10 +206,23 @@ def render_grid(
     grid_path = _save_composite(composed, "grid")
     comparison_items.append(ComparisonItem("Grid: Full grid", grid_path))
 
+    # A single input image is useless as a Comparison reference against a whole tiled
+    # grid — wrong shape entirely, so the slider comparison told you nothing. Build a
+    # same-shape grid of the (unmodified) input repeated in every cell instead, so
+    # sliding actually reveals "all inputs" vs. "all rendered variants" side by side.
+    input_image_full = load_rgb(input_path)
+    input_grid_cells = [[GridCell(cell.label, input_image_full) for cell in row] for row in grid_cells]
+    input_grid_composed = compose_grid(
+        input_grid_cells, row_labels, col_labels, target_long_edge=target_long_edge,
+        show_row_labels=show_row_labels, show_col_labels=True,
+    )
+    input_grid_path = _save_composite(input_grid_composed, "input")
+    comparison_items.append(ComparisonItem("Grid: Input grid", input_grid_path))
+
     diff_composed: Image.Image | None = None
     if show_diff_grid:
         if diff_baseline_source == "Input image":
-            baseline_image = load_rgb(input_path)
+            baseline_image = input_image_full
             baseline_error = None
         else:
             first_cell = grid_cells[0][0]

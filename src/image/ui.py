@@ -9,6 +9,7 @@ from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
 from PIL import Image
 
 from ..core.naming import RENAME_MODES
+from ..core.paths import OUTPUTS
 from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
 from ..settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
 from ..settings.storage import processing_gpu_settings
@@ -143,9 +144,12 @@ def render_image_batch(
         progress(value, desc=message)
 
     try:
-        result = convert_images(input_paths, options, progress=report, output_dir=output_dir,
-                                controller=controller, on_item_update=on_item_update,
-                                generate_previews=not direct_disk, create_zip=not direct_disk)
+        result = convert_images(
+            input_paths, options, progress=report,
+            output_dir=output_dir if direct_disk else (output_dir or (OUTPUTS / "images")),
+            controller=controller, on_item_update=on_item_update,
+            generate_previews=not direct_disk, create_zip=not direct_disk and len(input_paths) > 1,
+        )
     except Exception as exc:
         traceback.print_exc()
         if on_item_update is not None:

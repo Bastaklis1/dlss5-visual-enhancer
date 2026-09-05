@@ -10,6 +10,7 @@ from ..core.batch_ui import BATCH_HEADERS, bind_batch_ui, build_path_controls
 from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
 from ..core.naming import RENAME_MODES
+from ..core.paths import OUTPUTS
 from ..settings.models import CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings, coerce_hdr_mode
 from ..settings.storage import current_preview_encoding, processing_gpu_settings
 from .batch import interpolate_videos
@@ -61,8 +62,11 @@ def render_frame_interpolation_batch(
         progress(value, desc=message)
 
     try:
-        result = interpolate_videos(paths, options, report, output_dir=output_dir,
-                                    controller=controller, on_item_update=on_item_update)
+        result = interpolate_videos(
+            paths, options, report,
+            output_dir=output_dir if direct_disk else (output_dir or (OUTPUTS / "frame_interpolation")),
+            controller=controller, on_item_update=on_item_update,
+        )
     except Exception as exc:
         traceback.print_exc()
         if on_item_update is not None:

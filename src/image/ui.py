@@ -192,6 +192,7 @@ class ImageTab:
     stop: object
     reset: object
     output_gallery: object
+    send_to_compare: object
     output_files: object
     zip_download: object
     status: object
@@ -211,13 +212,16 @@ class ImageTab:
 
 def build_image_tab(settings: UISettings) -> ImageTab:
     upload_types = ["image", ".svg", ".heic", ".heif", *sorted(RAW_EXTENSIONS)]
+    # The uploader lives in its own full-width row, above the input/output columns,
+    # so both preview panes are the first element in their column and line up
+    # vertically regardless of how many files are queued in the uploader.
+    sources = gr.File(
+        label="Input image(s)", file_count="multiple", file_types=upload_types,
+        type="filepath", allow_reordering=True, elem_id="image-upload-list",
+    )
+    input_path, output_path = build_path_controls()
     with gr.Row():
         with gr.Column(scale=3):
-            sources = gr.File(
-                label="Input image(s)", file_count="multiple", file_types=upload_types,
-                type="filepath", allow_reordering=True, elem_id="image-upload-list",
-            )
-            input_path, output_path = build_path_controls()
             input_gallery = gr.Gallery(
                 label="Input preview", columns=3, height=520, object_fit="contain",
                 interactive=False, visible=False, buttons=["fullscreen"], elem_id="image-input-preview",
@@ -254,6 +258,9 @@ def build_image_tab(settings: UISettings) -> ImageTab:
                 interactive=False, buttons=["download", "download_all", "fullscreen"],
                 elem_id="image-output-preview",
             )
+            # "Send to Comparison" reads sources/output_files live at click time (see
+            # src/compare/ui.py: send_paths_to_compare) rather than needing its own state here.
+            send_to_compare = gr.Button("Send to Comparison")
             output_files = gr.File(
                 label="Rendered image files", file_count="multiple", interactive=False,
                 elem_id="image-output-list",
@@ -267,7 +274,8 @@ def build_image_tab(settings: UISettings) -> ImageTab:
             )
     tab = ImageTab(
         sources, input_gallery, neural, model_preset, output_format, quality, rename_mode,
-        custom_suffix, render, stop, reset, output_gallery, output_files, zip_download, status, results
+        custom_suffix, render, stop, reset, output_gallery, send_to_compare,
+        output_files, zip_download, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_image_events(tab)
@@ -279,3 +287,5 @@ def bind_image_events(tab: ImageTab) -> None:
     tab.rename_mode.change(
         rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False,
     )
+
+

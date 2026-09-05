@@ -19,6 +19,8 @@ except Exception:
 
 import gradio as gr
 
+from src.compare.grid_ui import bind_grid_events, build_grid_tab
+from src.compare.ui import bind_comparison_events, build_compare_tab
 from src.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
     CACHE_SWEEP_INTERVAL_SECONDS,
@@ -137,7 +139,7 @@ def build_app() -> gr.Blocks:
             "[GitHub](https://github.com/Merserk/dlss5-visual-enhancer)",
             elem_id="app-title",
         )
-        with gr.Tabs(selected="image"):
+        with gr.Tabs(selected="image") as tabs:
             with gr.Tab("Image", id="image"):
                 image_tab = build_image_tab(settings)
             with gr.Tab("Video", id="video"):
@@ -146,10 +148,18 @@ def build_app() -> gr.Blocks:
                 frame_tab = build_frame_interpolation_tab(settings)
             with gr.Tab("Live", id="live"):
                 live_tab = build_live_tab(settings)
+            with gr.Tab("Comparison", id="compare"):
+                compare_tab = build_compare_tab()
+            with gr.Tab("Grid", id="grid"):
+                grid_tab = build_grid_tab(settings)
             with gr.Tab("Settings", id="settings"):
                 settings_tab = build_settings_tab(settings, ai_gpu_choices, video_gpu_choices)
 
         bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab)
+        # Video, Frame Interpolation, and Live aren't wired into Comparison yet (they need a
+        # synced player, not the image before/after slider) — that's a later phase.
+        bind_comparison_events(compare_tab, tabs, image_tab=image_tab, grid_tab=grid_tab)
+        bind_grid_events(grid_tab, image_tab)
     return demo
 
 

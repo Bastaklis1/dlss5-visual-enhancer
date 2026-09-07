@@ -6,6 +6,7 @@ import gradio as gr
 
 from .models import ComparisonItem, DiffMetrics, build_comparison_items_from_batch_results
 from .processor import compute_diff
+from .video_ui import VideoCompareTab, bind_video_compare_events, build_video_compare_panel, receive_video_items
 
 NO_SELECTION = "(none yet — send an image here from another tab)"
 
@@ -98,8 +99,17 @@ def send_batch_results_to_compare(input_paths, rows):
     return receive_items(build_comparison_items_from_batch_results(input_paths, rows))
 
 
+def send_batch_results_to_video_compare(input_paths, rows):
+    """Same idea as send_batch_results_to_compare, but for Video/Frame
+    Interpolation — both already carry real output paths in their results
+    table via the same bind_batch_ui/BatchProgress mechanism as Image, so this
+    is the exact same helper feeding the video pool + mode switch instead."""
+    return receive_video_items(build_comparison_items_from_batch_results(input_paths, rows))
+
+
 @dataclass(slots=True)
 class CompareTab:
+    mode: object
     pool: object
     reference: object
     candidate: object
@@ -108,38 +118,50 @@ class CompareTab:
     slider: object
     metrics: object
     diff_image: object
+    video: VideoCompareTab
 
 
 def build_compare_tab() -> CompareTab:
-    gr.Markdown(
-        "Send an image here with the **Send to Comparison** button under a render's output "
-        "(Image tab for now). Pick any two of the images that came along with it — an input, "
-        "or any rendered output — to diff them against each other."
+    mode = gr.Radio(["Image", "Video"], value="Image", label="Mode")
+    with gr.Column(visible=True) as image_panel:
+        gr.Markdown(
+            "Send an image here with the **Send to Comparison** button under a render's output "
+            "(Image or Grid tab). Pick any two of the images that came along with it — an input, "
+            "or any rendered output — to diff them against each other."
+        )
+        pool = gr.State([])
+        with gr.Row():
+            reference = gr.Dropdown(choices=[NO_SELECTION], value=NO_SELECTION, label="Reference (baseline)")
+            candidate = gr.Dropdown(choices=[NO_SELECTION], value=NO_SELECTION, label="Candidate")
+            swap = gr.Button("⇄ Swap", scale=0)
+        slider = gr.ImageSlider(type="filepath", label="Before / after", height=520)
+        with gr.Row():
+            with gr.Column(scale=1):
+                metrics = gr.Dataframe(
+                    headers=["Metric", "Value"], datatype=["str", "str"], interactive=False,
+                    label="Comparison metrics", wrap=True,
+                )
+            with gr.Column(scale=1):
+                diff_amplify = gr.Slider(
+                    1, 16, value=4, step=1, label="Diff visualization amplify",
+                    info="Brightens the difference view below so subtle changes are easier to see. Doesn't affect the metrics.",
+                )
+                diff_image = gr.Image(
+                    type="pil", interactive=False, label="Difference (amplified, grayscale)", height=360,
+                )
+    with gr.Column(visible=False) as video_panel:
+        video = build_video_compare_panel()
+
+    mode.change(
+        lambda selected: (gr.update(visible=selected == "Image"), gr.update(visible=selected == "Video")),
+        inputs=mode, outputs=[image_panel, video_panel], queue=False,
     )
-    pool = gr.State([])
-    with gr.Row():
-        reference = gr.Dropdown(choices=[NO_SELECTION], value=NO_SELECTION, label="Reference (baseline)")
-        candidate = gr.Dropdown(choices=[NO_SELECTION], value=NO_SELECTION, label="Candidate")
-        swap = gr.Button("⇄ Swap", scale=0)
-    slider = gr.ImageSlider(type="filepath", label="Before / after", height=520)
-    with gr.Row():
-        with gr.Column(scale=1):
-            metrics = gr.Dataframe(
-                headers=["Metric", "Value"], datatype=["str", "str"], interactive=False,
-                label="Comparison metrics", wrap=True,
-            )
-        with gr.Column(scale=1):
-            diff_amplify = gr.Slider(
-                1, 16, value=4, step=1, label="Diff visualization amplify",
-                info="Brightens the difference view below so subtle changes are easier to see. Doesn't affect the metrics.",
-            )
-            diff_image = gr.Image(
-                type="pil", interactive=False, label="Difference (amplified, grayscale)", height=360,
-            )
-    return CompareTab(pool, reference, candidate, swap, diff_amplify, slider, metrics, diff_image)
+    return CompareTab(mode, pool, reference, candidate, swap, diff_amplify, slider, metrics, diff_image, video)
 
 
-def bind_comparison_events(compare_tab: CompareTab, tabs, image_tab=None, grid_tab=None) -> None:
+def bind_comparison_events(
+    compare_tab: CompareTab, tabs, image_tab=None, grid_tab=None, video_tab=None, frame_tab=None
+) -> None:
     refresh_inputs = [compare_tab.pool, compare_tab.reference, compare_tab.candidate, compare_tab.diff_amplify]
     refresh_outputs = [compare_tab.slider, compare_tab.metrics, compare_tab.diff_image]
     # Decoding + diffing a large or RAW image takes real time, so these stay on the
@@ -162,4 +184,19 @@ def bind_comparison_events(compare_tab: CompareTab, tabs, image_tab=None, grid_t
     if grid_tab is not None:
         grid_tab.send_to_compare.click(
             receive_items, inputs=grid_tab.comparison_items, outputs=receive_outputs, queue=False,
+        )
+
+    bind_video_compare_events(compare_tab.video)
+    video_receive_outputs = [
+        compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate, tabs, compare_tab.mode,
+    ]
+    if video_tab is not None:
+        video_tab.send_to_compare.click(
+            send_batch_results_to_video_compare, inputs=[video_tab.sources, video_tab.results],
+            outputs=video_receive_outputs, queue=False,
+        )
+    if frame_tab is not None:
+        frame_tab.send_to_compare.click(
+            send_batch_results_to_video_compare, inputs=[frame_tab.sources, frame_tab.results],
+            outputs=video_receive_outputs, queue=False,
         )

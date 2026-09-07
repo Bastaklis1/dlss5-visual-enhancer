@@ -22,6 +22,7 @@ import gradio as gr
 from src.about.ui import build_about_tab
 from src.compare.grid_ui import bind_grid_events, build_grid_tab
 from src.compare.ui import bind_comparison_events, build_compare_tab
+from src.compare.video_ui import SYNC_PLAYER_HEAD_SCRIPT
 from src.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
     CACHE_SWEEP_INTERVAL_SECONDS,
@@ -249,7 +250,10 @@ def build_app() -> gr.Blocks:
         # Video, Frame Interpolation, Live, and Upscale aren't wired into Comparison yet
         # (each needs a synced player or a different flow, not the image before/after
         # slider) — that's a later phase.
-        bind_comparison_events(compare_tab, tabs, image_tab=neural_rendering_tab.image, grid_tab=grid_tab)
+        bind_comparison_events(
+            compare_tab, tabs, image_tab=neural_rendering_tab.image, grid_tab=grid_tab,
+            video_tab=neural_rendering_tab.video, frame_tab=frame_tab,
+        )
         bind_grid_events(grid_tab, neural_rendering_tab.image)
     return demo
 
@@ -314,6 +318,7 @@ def main() -> None:
             allowed_paths=[str(OUTPUTS.resolve())],
             show_error=True,
             quiet=True,
+            head=SYNC_PLAYER_HEAD_SCRIPT,
         )
     except KeyboardInterrupt:
         pass

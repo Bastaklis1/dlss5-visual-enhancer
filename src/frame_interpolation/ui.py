@@ -140,6 +140,7 @@ class FrameInterpolationTab:
     stop: object
     reset: object
     output_video: object
+    send_to_compare: object
     zip_download: object
     status: object
     results: object
@@ -234,6 +235,7 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
             output_video = gr.Video(
                 label="Interpolated output", interactive=False, visible=True, height=520,
             )
+            send_to_compare = gr.Button("Send to Comparison")
             zip_download = gr.DownloadButton("Save as ZIP", visible=False)
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
@@ -243,7 +245,7 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
             )
     tab = FrameInterpolationTab(
         sources, input_preview, input_actions, select_source, clear_source, target_fps, engine, quality, codec, container, rename_mode,
-        custom_suffix, hdr_mode, preview, render, stop, reset, output_video, zip_download, status, results
+        custom_suffix, hdr_mode, preview, render, stop, reset, output_video, send_to_compare, zip_download, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_frame_interpolation_events(tab)

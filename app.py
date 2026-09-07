@@ -253,6 +253,7 @@ def build_app() -> gr.Blocks:
         bind_comparison_events(
             compare_tab, tabs, image_tab=neural_rendering_tab.image, grid_tab=grid_tab,
             video_tab=neural_rendering_tab.video, frame_tab=frame_tab,
+            upscale_image_tab=upscale_tab.image, upscale_video_tab=upscale_tab.video,
         )
         bind_grid_events(grid_tab, neural_rendering_tab.image)
     return demo

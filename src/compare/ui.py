@@ -89,6 +89,9 @@ def receive_items(new_items: list[ComparisonItem]):
         gr.update(choices=labels or [NO_SELECTION], value=default_reference),
         gr.update(choices=labels or [NO_SELECTION], value=default_candidate),
         gr.Tabs(selected="compare"),
+        gr.update(value="Image"),
+        gr.update(visible=True),  # image panel
+        gr.update(visible=False),  # video panel
     )
 
 
@@ -110,6 +113,8 @@ def send_batch_results_to_video_compare(input_paths, rows):
 @dataclass(slots=True)
 class CompareTab:
     mode: object
+    image_panel: object
+    video_panel: object
     pool: object
     reference: object
     candidate: object
@@ -156,11 +161,15 @@ def build_compare_tab() -> CompareTab:
         lambda selected: (gr.update(visible=selected == "Image"), gr.update(visible=selected == "Video")),
         inputs=mode, outputs=[image_panel, video_panel], queue=False,
     )
-    return CompareTab(mode, pool, reference, candidate, swap, diff_amplify, slider, metrics, diff_image, video)
+    return CompareTab(
+        mode, image_panel, video_panel, pool, reference, candidate, swap, diff_amplify, slider,
+        metrics, diff_image, video,
+    )
 
 
 def bind_comparison_events(
-    compare_tab: CompareTab, tabs, image_tab=None, grid_tab=None, video_tab=None, frame_tab=None
+    compare_tab: CompareTab, tabs, image_tab=None, grid_tab=None, video_tab=None, frame_tab=None,
+    upscale_image_tab=None, upscale_video_tab=None,
 ) -> None:
     refresh_inputs = [compare_tab.pool, compare_tab.reference, compare_tab.candidate, compare_tab.diff_amplify]
     refresh_outputs = [compare_tab.slider, compare_tab.metrics, compare_tab.diff_image]
@@ -175,12 +184,21 @@ def bind_comparison_events(
         swap_selection, inputs=[compare_tab.reference, compare_tab.candidate],
         outputs=[compare_tab.reference, compare_tab.candidate], queue=False,
     )
-    receive_outputs = [compare_tab.pool, compare_tab.reference, compare_tab.candidate, tabs]
-    if image_tab is not None:
-        image_tab.send_to_compare.click(
-            send_batch_results_to_compare, inputs=[image_tab.sources, image_tab.results],
-            outputs=receive_outputs, queue=False,
-        )
+    # Every "send" action forces mode + both panels' visibility directly, rather than
+    # relying on compare_tab.mode's own .change() event to cascade the panel toggle —
+    # a programmatic update to a value Gradio already holds doesn't reliably re-fire
+    # .change(), which was leaving the wrong panel showing until the user manually
+    # toggled the radio themselves.
+    receive_outputs = [
+        compare_tab.pool, compare_tab.reference, compare_tab.candidate, tabs,
+        compare_tab.mode, compare_tab.image_panel, compare_tab.video_panel,
+    ]
+    for tab in (image_tab, upscale_image_tab):
+        if tab is not None:
+            tab.send_to_compare.click(
+                send_batch_results_to_compare, inputs=[tab.sources, tab.results],
+                outputs=receive_outputs, queue=False,
+            )
     if grid_tab is not None:
         grid_tab.send_to_compare.click(
             receive_items, inputs=grid_tab.comparison_items, outputs=receive_outputs, queue=False,
@@ -188,15 +206,12 @@ def bind_comparison_events(
 
     bind_video_compare_events(compare_tab.video)
     video_receive_outputs = [
-        compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate, tabs, compare_tab.mode,
+        compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate, tabs,
+        compare_tab.mode, compare_tab.image_panel, compare_tab.video_panel,
     ]
-    if video_tab is not None:
-        video_tab.send_to_compare.click(
-            send_batch_results_to_video_compare, inputs=[video_tab.sources, video_tab.results],
-            outputs=video_receive_outputs, queue=False,
-        )
-    if frame_tab is not None:
-        frame_tab.send_to_compare.click(
-            send_batch_results_to_video_compare, inputs=[frame_tab.sources, frame_tab.results],
-            outputs=video_receive_outputs, queue=False,
-        )
+    for tab in (video_tab, frame_tab, upscale_video_tab):
+        if tab is not None:
+            tab.send_to_compare.click(
+                send_batch_results_to_video_compare, inputs=[tab.sources, tab.results],
+                outputs=video_receive_outputs, queue=False,
+            )

@@ -196,6 +196,8 @@ def receive_video_items(new_items: list[ComparisonItem]):
         gr.update(choices=labels or [NO_SELECTION], value=default_candidate),
         gr.Tabs(selected="compare"),
         gr.update(value="Video"),
+        gr.update(visible=False),  # image panel
+        gr.update(visible=True),  # video panel
     )
 
 

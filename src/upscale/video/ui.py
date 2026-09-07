@@ -84,6 +84,7 @@ class UpscaleTab:
     stop: object
     reset: object
     output_video: object
+    send_to_compare: object
     zip_download: object
     status: object
     results: object
@@ -168,10 +169,11 @@ def build_upscale_tab(settings):
                 label="Output video", interactive=False, visible=True, height=520,
             )
             zip_download = gr.DownloadButton("Save as ZIP", visible=False)
+            send_to_compare = gr.Button("Send to Comparison")
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(headers=BATCH_HEADERS, datatype=["str"]*len(BATCH_HEADERS), interactive=False, label="Batch results", wrap=True)
     tab = UpscaleTab(sources, input_preview, input_actions, select_source, clear_source, c, preview_frame_button, preview_button, render, stop, reset,
-                     output_video, zip_download, status, results, input_path, output_path)
+                     output_video, send_to_compare, zip_download, status, results, input_path, output_path)
     bind_batch_ui(tab, render_upscale_batch, kind="video", preview_mode=preview_mode,
                   preview_actions=[(tab.preview_frame, preview_frame), (tab.preview, preview_clip)])
     c["hdr_enabled"].change(lambda enabled: gr.update(visible=enabled), inputs=c["hdr_enabled"], outputs=hdr_controls, queue=False)

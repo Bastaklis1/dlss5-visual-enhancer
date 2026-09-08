@@ -121,7 +121,10 @@ def send_frame_interpolation_results_to_video_compare(input_paths, rows, target_
     items = build_comparison_items_from_batch_results(input_paths, rows)
     try:
         target_rate = FrameInterpolationOptions(target_fps=target_fps).target_rate
-        frame_step_seconds = 1.0 / float(target_rate) if target_rate else None
+        # Round for display -- an unrounded float (e.g. 0.016666666666666666)
+        # was overflowing the frame-step box, which only made the missing
+        # spinner-arrow room look worse than it already was.
+        frame_step_seconds = round(1.0 / float(target_rate), 6) if target_rate else None
     except Exception:
         # An unparseable/unexpected target_fps value shouldn't block the send
         # itself -- just fall back to leaving the frame-step field as-is.

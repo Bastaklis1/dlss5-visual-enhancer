@@ -27,12 +27,49 @@ VIDEO_B_ELEM_ID = "dlss5-cmp-video-b"
 SUGGESTED_STEP_ELEM_ID = "dlss5-cmp-suggested-frame-step"
 DEFAULT_FRAME_STEP_SECONDS = 0.033  # ~30fps guess, matches the control bar's own default below
 
-HIDDEN_ELEM_CSS = """
-<style>.dlss5-visually-hidden { display: none !important; }</style>
+CONTROL_BAR_CSS = """
+<style>
+.dlss5-visually-hidden { display: none !important; }
+
+/* This control bar is raw HTML, not Gradio components, so none of it
+   inherits the app's theme automatically -- left alone, the <select> and
+   <input type="number"> render with the browser's own white/native chrome
+   regardless of light or dark mode. Pull from Gradio's own theme variables
+   so they track whatever theme (and mode) the rest of the app is using. */
+#dlss5-sync-controls button,
+#dlss5-sync-controls select,
+#dlss5-sync-controls input[type="number"] {
+  background: var(--button-secondary-background-fill);
+  color: var(--button-secondary-text-color, var(--body-text-color));
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--radius-sm, 6px);
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 0.9em;
+}
+#dlss5-sync-controls button:hover,
+#dlss5-sync-controls select:hover {
+  cursor: pointer;
+  background: var(--button-secondary-background-fill-hover, var(--button-secondary-background-fill));
+}
+#dlss5-sync-controls input[type="range"] {
+  accent-color: var(--body-text-color);
+}
+/* The frame-step box only ever holds a typed-in or auto-suggested value --
+   increment/decrement arrows don't earn the width they were eating into. */
+#dlss5-sync-frame-step::-webkit-inner-spin-button,
+#dlss5-sync-frame-step::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+#dlss5-sync-frame-step {
+  -moz-appearance: textfield;
+}
+</style>
 """
 
 CONTROL_BAR_HTML = f"""
-{HIDDEN_ELEM_CSS}
+{CONTROL_BAR_CSS}
 <div id="dlss5-sync-controls" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0;">
   <button type="button" id="dlss5-sync-playpause">▶ Play</button>
   <button type="button" id="dlss5-sync-reset" title="Pause both and jump to 0:00">⏮ Reset to 0</button>
@@ -48,7 +85,7 @@ CONTROL_BAR_HTML = f"""
   <button type="button" id="dlss5-sync-prev-frame" title="Step back — pauses first">⏪ Frame</button>
   <button type="button" id="dlss5-sync-next-frame" title="Step forward — pauses first">Frame ⏩</button>
   <input type="number" id="dlss5-sync-frame-step" value="0.033" step="0.001" min="0.001"
-         style="width:70px;" title="Frame step size, in seconds (1/fps — default assumes ~30fps; auto-filled from Frame Interpolation's target FPS when sent from there)">
+         style="width:84px;" title="Frame step size, in seconds (1/fps — default assumes ~30fps; auto-filled from Frame Interpolation's target FPS when sent from there)">
 </div>
 """
 
@@ -177,10 +214,15 @@ SYNC_PLAYER_HEAD_SCRIPT = f"""
   // Frame Interpolation) is sent here. We poll rather than listen for a
   // 'change'/'input' event because a Python-driven value update on a Gradio
   // component doesn't reliably dispatch one — same reasoning as trySetup
-  // above. lastSuggestedStep starts as null so the very first reading (the
-  // component's initial default value on page load) just gets captured
-  // without touching the visible field; only an actual *change* thereafter
-  // is copied over, so this never clobbers a value the user typed in by hand.
+  // above. We apply the value whenever it differs from what we last saw,
+  // including the very first reading: the hidden field's own default
+  // (0.033) already matches the visible field's hardcoded default, so
+  // applying it is a harmless no-op, and skipping that first reading (an
+  // earlier version of this did) meant a real suggestion could get silently
+  // swallowed if it was the first one this page load ever observed -- e.g.
+  // right after a refresh. Only a later value that's genuinely unchanged
+  // from what we already applied leaves the visible field alone, so a
+  // manual edit still survives until the next real suggestion.
   var lastSuggestedStep = null;
   function pollSuggestedStep() {{
     var suggested = document.querySelector('#{SUGGESTED_STEP_ELEM_ID} input');
@@ -188,7 +230,6 @@ SYNC_PLAYER_HEAD_SCRIPT = f"""
     if (!suggested || !frameStepInput) return;
     var value = parseFloat(suggested.value);
     if (!isFinite(value) || value <= 0) return;
-    if (lastSuggestedStep === null) {{ lastSuggestedStep = value; return; }}
     if (value !== lastSuggestedStep) {{
       lastSuggestedStep = value;
       frameStepInput.value = value;

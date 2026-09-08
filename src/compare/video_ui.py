@@ -18,8 +18,21 @@ NO_SELECTION = "(none yet — send a video here from another tab)"
 # parsed as real page markup, so its <script> tag runs normally.
 VIDEO_A_ELEM_ID = "dlss5-cmp-video-a"
 VIDEO_B_ELEM_ID = "dlss5-cmp-video-b"
+# A gr.Number that's never shown to the user -- it exists purely so Python can
+# hand the JS below a suggested frame-step value (in seconds) when a video
+# arrives with a frame rate we actually know, e.g. from Frame Interpolation's
+# own target-FPS setting. Hidden with our own CSS class (display:none) rather
+# than Gradio's visible=False, since visible=False unmounts the element
+# entirely and the polling script below needs it to stay in the DOM.
+SUGGESTED_STEP_ELEM_ID = "dlss5-cmp-suggested-frame-step"
+DEFAULT_FRAME_STEP_SECONDS = 0.033  # ~30fps guess, matches the control bar's own default below
+
+HIDDEN_ELEM_CSS = """
+<style>.dlss5-visually-hidden { display: none !important; }</style>
+"""
 
 CONTROL_BAR_HTML = f"""
+{HIDDEN_ELEM_CSS}
 <div id="dlss5-sync-controls" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0;">
   <button type="button" id="dlss5-sync-playpause">▶ Play</button>
   <button type="button" id="dlss5-sync-reset" title="Pause both and jump to 0:00">⏮ Reset to 0</button>
@@ -35,7 +48,7 @@ CONTROL_BAR_HTML = f"""
   <button type="button" id="dlss5-sync-prev-frame" title="Step back — pauses first">⏪ Frame</button>
   <button type="button" id="dlss5-sync-next-frame" title="Step forward — pauses first">Frame ⏩</button>
   <input type="number" id="dlss5-sync-frame-step" value="0.033" step="0.001" min="0.001"
-         style="width:70px;" title="Frame step size, in seconds (1/fps — default assumes ~30fps)">
+         style="width:70px;" title="Frame step size, in seconds (1/fps — default assumes ~30fps; auto-filled from Frame Interpolation's target FPS when sent from there)">
 </div>
 """
 
@@ -158,6 +171,30 @@ SYNC_PLAYER_HEAD_SCRIPT = f"""
   // selection change still gets wired up even if the original pair got
   // replaced outright rather than just having their src swapped.
   setInterval(function() {{ trySetup(1); }}, 3000);
+
+  // Frame-step suggestion bridge: {SUGGESTED_STEP_ELEM_ID} is a hidden Gradio
+  // Number Python updates when a video with a known frame rate (e.g. from
+  // Frame Interpolation) is sent here. We poll rather than listen for a
+  // 'change'/'input' event because a Python-driven value update on a Gradio
+  // component doesn't reliably dispatch one — same reasoning as trySetup
+  // above. lastSuggestedStep starts as null so the very first reading (the
+  // component's initial default value on page load) just gets captured
+  // without touching the visible field; only an actual *change* thereafter
+  // is copied over, so this never clobbers a value the user typed in by hand.
+  var lastSuggestedStep = null;
+  function pollSuggestedStep() {{
+    var suggested = document.querySelector('#{SUGGESTED_STEP_ELEM_ID} input');
+    var frameStepInput = document.getElementById('dlss5-sync-frame-step');
+    if (!suggested || !frameStepInput) return;
+    var value = parseFloat(suggested.value);
+    if (!isFinite(value) || value <= 0) return;
+    if (lastSuggestedStep === null) {{ lastSuggestedStep = value; return; }}
+    if (value !== lastSuggestedStep) {{
+      lastSuggestedStep = value;
+      frameStepInput.value = value;
+    }}
+  }}
+  setInterval(pollSuggestedStep, 500);
 }})();
 </script>
 """
@@ -182,7 +219,7 @@ def swap_video_selection(reference_label: str, candidate_label: str):
     return candidate_label, reference_label
 
 
-def receive_video_items(new_items: list[ComparisonItem]):
+def receive_video_items(new_items: list[ComparisonItem], frame_step_seconds: float | None = None):
     labels = [item.label for item in new_items]
     default_reference = next((label for label in labels if label.startswith("Input: ")), None) or (
         labels[0] if labels else NO_SELECTION
@@ -198,6 +235,7 @@ def receive_video_items(new_items: list[ComparisonItem]):
         gr.update(value="Video"),
         gr.update(visible=False),  # image panel
         gr.update(visible=True),  # video panel
+        gr.update(value=frame_step_seconds) if frame_step_seconds is not None else gr.skip(),
     )
 
 
@@ -209,6 +247,7 @@ class VideoCompareTab:
     swap: object
     reference_video: object
     candidate_video: object
+    suggested_frame_step: object
 
 
 def build_video_compare_panel() -> VideoCompareTab:
@@ -216,7 +255,8 @@ def build_video_compare_panel() -> VideoCompareTab:
         "Send a video here with **Send to Comparison** (Video or Frame Interpolation tab). "
         "One play button and one seek bar drive both videos together; dragging either video's "
         "own progress bar also keeps them in sync. Frame step is in seconds — adjust it to "
-        "match your video's actual frame rate for accurate single-frame stepping."
+        "match your video's actual frame rate for accurate single-frame stepping. Sending a "
+        "video from Frame Interpolation fills this in automatically from its target FPS."
     )
     pool = gr.State([])
     with gr.Row():
@@ -224,10 +264,14 @@ def build_video_compare_panel() -> VideoCompareTab:
         candidate = gr.Dropdown(choices=[NO_SELECTION], value=NO_SELECTION, label="Candidate")
         swap = gr.Button("⇄ Swap", scale=0)
     gr.HTML(CONTROL_BAR_HTML)
+    suggested_frame_step = gr.Number(
+        value=DEFAULT_FRAME_STEP_SECONDS, elem_id=SUGGESTED_STEP_ELEM_ID,
+        elem_classes=["dlss5-visually-hidden"], label="suggested frame step (hidden)",
+    )
     with gr.Row():
         reference_video = gr.Video(label="Reference", interactive=False, elem_id=VIDEO_A_ELEM_ID)
         candidate_video = gr.Video(label="Candidate", interactive=False, elem_id=VIDEO_B_ELEM_ID)
-    return VideoCompareTab(pool, reference, candidate, swap, reference_video, candidate_video)
+    return VideoCompareTab(pool, reference, candidate, swap, reference_video, candidate_video, suggested_frame_step)
 
 
 def bind_video_compare_events(video_tab: VideoCompareTab) -> None:

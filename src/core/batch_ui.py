@@ -118,8 +118,13 @@ def release_view(key):
         view.job.controller.stop()
 
 
-def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=()):
-    """Media values are only returned in upload mode, once a batch is finished."""
+def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(), preview_controls=()):
+    """Media values are only returned in upload mode, once a batch is finished.
+
+    `preview_controls` are non-button preview components (e.g. the shared
+    duration dropdown from `core.preview_duration`) that should show/hide and
+    enable/disable in lockstep with the preview buttons, without themselves
+    having a `.click()` handler wired up."""
     tab.job_state = gr.State(value=lambda: uuid.uuid4().hex, delete_callback=release_view)
     is_image = kind == "image"
     input_media = tab.input_gallery if is_image else tab.input_preview
@@ -128,9 +133,10 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
     if archive_download is not None:
         media.append(tab.zip_download)
     preview_buttons = [button for button, _fn in preview_actions]
+    preview_visibility = [*preview_buttons, *preview_controls]
     controls = [
         tab.sources, tab.select_source, tab.clear_source, tab.input_path, tab.output_path,
-        tab.render, tab.reset, *preview_buttons,
+        tab.render, tab.reset, *preview_visibility,
     ]
     outputs = [*media, tab.results, tab.status, *controls]
     path_inputs = [tab.job_state, tab.input_path, tab.output_path]
@@ -170,11 +176,11 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
         if busy and disk and view.job is not None and view.job.is_preview:
             view.job.controller.stop()
         if busy and not disk:
-            return [gr.skip()] * (1 + len(media) + len(preview_buttons) + 2)
+            return [gr.skip()] * (1 + len(media) + len(preview_visibility) + 2)
         show_input_media = False
         if disk:
             values = [gr.update(value=None, visible=False), *empty_media(True),
-                      *[gr.update(visible=False) for _ in preview_buttons]]
+                      *[gr.update(visible=False) for _ in preview_visibility]]
         elif is_image:
             previews = preview_mode(args[0])
             show_input_media = bool(previews)
@@ -186,7 +192,7 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
             values = [input_update, output_update, *empty_media(False)[1:], *buttons]
         with view.lock:
             if revision != view.revision:
-                return [gr.skip()] * (1 + len(media) + len(preview_buttons) + 2)
+                return [gr.skip()] * (1 + len(media) + len(preview_visibility) + 2)
         source_update, actions_update = input_surface_updates(show_input_media, input_path)
         return [
             *values,
@@ -198,7 +204,7 @@ def bind_batch_ui(tab, render_function, *, kind, preview_mode, preview_actions=(
     if hasattr(tab, "target_fps"):
         source_args += [tab.target_fps, tab.engine]
     refresh_outputs = [
-        input_media, *media, *preview_buttons,
+        input_media, *media, *preview_visibility,
         tab.sources, tab.input_actions,
     ]
     tab.select_source.upload(

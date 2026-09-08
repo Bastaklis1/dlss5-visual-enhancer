@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import gradio as gr
 
+from ..frame_interpolation.models import FrameInterpolationOptions
 from .models import ComparisonItem, DiffMetrics, build_comparison_items_from_batch_results
 from .processor import compute_diff
 from .video_ui import VideoCompareTab, bind_video_compare_events, build_video_compare_panel, receive_video_items
@@ -103,11 +104,29 @@ def send_batch_results_to_compare(input_paths, rows):
 
 
 def send_batch_results_to_video_compare(input_paths, rows):
-    """Same idea as send_batch_results_to_compare, but for Video/Frame
-    Interpolation — both already carry real output paths in their results
-    table via the same bind_batch_ui/BatchProgress mechanism as Image, so this
-    is the exact same helper feeding the video pool + mode switch instead."""
+    """Same idea as send_batch_results_to_compare, but for Video/Upscale Video —
+    both already carry real output paths in their results table via the same
+    bind_batch_ui/BatchProgress mechanism as Image, so this is the exact same
+    helper feeding the video pool + mode switch instead."""
     return receive_video_items(build_comparison_items_from_batch_results(input_paths, rows))
+
+
+def send_frame_interpolation_results_to_video_compare(input_paths, rows, target_fps):
+    """Frame Interpolation's own "Send to Comparison" handler. Everything else
+    about this is identical to send_batch_results_to_video_compare above, but
+    Frame Interpolation is the one tab that already knows its output's exact
+    frame rate (the target_fps the user picked) -- so unlike Video/Upscale,
+    which leave the sync player's frame-step guess alone, this defaults it to
+    1/target_fps instead of the generic ~30fps guess."""
+    items = build_comparison_items_from_batch_results(input_paths, rows)
+    try:
+        target_rate = FrameInterpolationOptions(target_fps=target_fps).target_rate
+        frame_step_seconds = 1.0 / float(target_rate) if target_rate else None
+    except Exception:
+        # An unparseable/unexpected target_fps value shouldn't block the send
+        # itself -- just fall back to leaving the frame-step field as-is.
+        frame_step_seconds = None
+    return receive_video_items(items, frame_step_seconds=frame_step_seconds)
 
 
 @dataclass(slots=True)
@@ -208,10 +227,17 @@ def bind_comparison_events(
     video_receive_outputs = [
         compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate, tabs,
         compare_tab.mode, compare_tab.image_panel, compare_tab.video_panel,
+        compare_tab.video.suggested_frame_step,
     ]
-    for tab in (video_tab, frame_tab, upscale_video_tab):
+    for tab in (video_tab, upscale_video_tab):
         if tab is not None:
             tab.send_to_compare.click(
                 send_batch_results_to_video_compare, inputs=[tab.sources, tab.results],
                 outputs=video_receive_outputs, queue=False,
             )
+    if frame_tab is not None:
+        frame_tab.send_to_compare.click(
+            send_frame_interpolation_results_to_video_compare,
+            inputs=[frame_tab.sources, frame_tab.results, frame_tab.target_fps],
+            outputs=video_receive_outputs, queue=False,
+        )

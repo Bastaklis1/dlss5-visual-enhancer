@@ -73,6 +73,16 @@ PREFERRED_CANDIDATE_LABELS = ("Grid: Full grid",)
 PREFERRED_REFERENCE_LABELS = ("Grid: Input grid",)
 
 
+def switch_to_compare_tab():
+    """Selects the Comparison tab, as its own event -- deliberately NOT bundled
+    into the same click as the mode/panel-visibility updates below. See the
+    long comment on bind_comparison_events for why: a Tabs selection change
+    and a Column visibility change landing in the *same* output batch race
+    against the target TabItem's (re)mount, and the panel-visibility half of
+    that race is not reliably won on every send."""
+    return gr.Tabs(selected="compare")
+
+
 def receive_items(new_items: list[ComparisonItem]):
     labels = [item.label for item in new_items]
     default_reference = (
@@ -89,7 +99,6 @@ def receive_items(new_items: list[ComparisonItem]):
         new_items,
         gr.update(choices=labels or [NO_SELECTION], value=default_reference),
         gr.update(choices=labels or [NO_SELECTION], value=default_candidate),
-        gr.Tabs(selected="compare"),
         gr.update(value="Image"),
         gr.update(visible=True),  # image panel
         gr.update(visible=False),  # video panel
@@ -216,24 +225,46 @@ def bind_comparison_events(
     # a programmatic update to a value Gradio already holds doesn't reliably re-fire
     # .change(), which was leaving the wrong panel showing until the user manually
     # toggled the radio themselves.
+    #
+    # **The tab switch itself is deliberately a separate, chained event (`.then()`),
+    # not bundled into this same click's outputs.** Root-caused by reproducing it
+    # directly (real Gradio 6.26.0 + a real headless browser, not just code review):
+    # a `gr.Tabs(selected=...)` switch and a sibling-Column `visible=` change landing
+    # in the *same* output batch race against the target TabItem (re)mounting, since
+    # Send-to-Comparison always switches INTO the Comparison tab from a different one.
+    # The very first send after a fresh page load wins that race (nothing has
+    # mounted/unmounted yet), which is exactly why this looked intermittent in
+    # testing — but every subsequent send, after the tab has been left and
+    # re-entered even once, reliably loses it: the newly (re)mounted image panel's
+    # `visible=False` doesn't stick, while the video panel's `visible=True` does —
+    # confirmed with a minimal repro isolating just a Tabs+two-Columns page, with
+    # no other app code involved. Selecting the tab as its own event first, and only
+    # setting mode/panel-visibility/dropdowns in a `.then()` afterward, means those
+    # updates always land on an already-settled, already-mounted tab rather than
+    # racing its remount. Don't recombine these into one event without re-verifying
+    # against a real browser first.
     receive_outputs = [
-        compare_tab.pool, compare_tab.reference, compare_tab.candidate, tabs,
+        compare_tab.pool, compare_tab.reference, compare_tab.candidate,
         compare_tab.mode, compare_tab.image_panel, compare_tab.video_panel,
     ]
     for tab in (image_tab, upscale_image_tab):
         if tab is not None:
             tab.send_to_compare.click(
+                switch_to_compare_tab, outputs=[tabs], queue=False,
+            ).then(
                 send_batch_results_to_compare, inputs=[tab.sources, tab.results],
                 outputs=receive_outputs, queue=False,
             )
     if grid_tab is not None:
         grid_tab.send_to_compare.click(
+            switch_to_compare_tab, outputs=[tabs], queue=False,
+        ).then(
             receive_items, inputs=grid_tab.comparison_items, outputs=receive_outputs, queue=False,
         )
 
     bind_video_compare_events(compare_tab.video)
     video_receive_outputs = [
-        compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate, tabs,
+        compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate,
         compare_tab.mode, compare_tab.image_panel, compare_tab.video_panel,
         compare_tab.video.suggested_frame_step,
         compare_tab.video.reference_video, compare_tab.video.candidate_video,
@@ -241,12 +272,16 @@ def bind_comparison_events(
     for tab in (video_tab, upscale_video_tab):
         if tab is not None:
             tab.send_to_compare.click(
+                switch_to_compare_tab, outputs=[tabs], queue=False,
+            ).then(
                 send_batch_results_to_video_compare,
                 inputs=[tab.sources, tab.results, tab.last_preview_path],
                 outputs=video_receive_outputs, queue=False,
             )
     if frame_tab is not None:
         frame_tab.send_to_compare.click(
+            switch_to_compare_tab, outputs=[tabs], queue=False,
+        ).then(
             send_frame_interpolation_results_to_video_compare,
             inputs=[frame_tab.sources, frame_tab.results, frame_tab.target_fps, frame_tab.last_preview_path],
             outputs=video_receive_outputs, queue=False,

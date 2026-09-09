@@ -275,6 +275,12 @@ def swap_video_selection(reference_label: str, candidate_label: str):
 
 
 def receive_video_items(new_items: list[ComparisonItem], frame_step_seconds: float | None = None):
+    """NOTE: this deliberately does NOT return a `gr.Tabs(selected=...)` update.
+    That's handled by a separate, preceding `.then()`-chained event in
+    bind_comparison_events -- see the long comment there. Bundling a tab switch
+    into the same output batch as these panel-visibility updates is exactly what
+    caused the "works once, then the Image panel comes back on every later send"
+    bug, root-caused against a real browser rather than guessed at."""
     labels = [item.label for item in new_items]
     default_reference = next((label for label in labels if label.startswith("Input: ")), None) or (
         labels[0] if labels else NO_SELECTION
@@ -300,7 +306,6 @@ def receive_video_items(new_items: list[ComparisonItem], frame_step_seconds: flo
         new_items,
         gr.update(choices=labels or [NO_SELECTION], value=default_reference),
         gr.update(choices=labels or [NO_SELECTION], value=default_candidate),
-        gr.Tabs(selected="compare"),
         gr.update(value="Video"),
         gr.update(visible=False),  # image panel
         gr.update(visible=True),  # video panel

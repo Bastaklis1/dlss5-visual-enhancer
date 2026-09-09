@@ -149,6 +149,7 @@ class FrameInterpolationTab:
     input_path: object = None
     output_path: object = None
     job_state: object = None
+    last_preview_path: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -255,9 +256,11 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
 
 
 def bind_frame_interpolation_events(tab: FrameInterpolationTab) -> None:
+    tab.last_preview_path = gr.State(None)
     bind_batch_ui(tab, render_frame_interpolation_batch, kind="video",
                   preview_mode=update_frame_interpolation_preview_mode,
                   preview_actions=[(tab.preview, preview_frame_interpolation)],
-                  preview_controls=[tab.preview_duration])
+                  preview_controls=[tab.preview_duration],
+                  preview_result_state=tab.last_preview_path)
     tab.codec.change(hdr_mode_update, inputs=tab.codec, outputs=tab.hdr_mode, queue=False)
     tab.rename_mode.change(rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False)

@@ -20,7 +20,7 @@ class ComparisonItem:
 
 
 def build_comparison_items_from_batch_results(
-    input_paths: list[str] | str | None, rows: list[list[str]] | None
+    input_paths: list[str] | str | None, rows: list[list[str]] | None, preview_path: str | None = None
 ) -> list[ComparisonItem]:
     """Turn a tab's current input list + live batch-results table into ComparisonItems.
 
@@ -30,7 +30,10 @@ def build_comparison_items_from_batch_results(
     component — that component (output_files) doesn't exist on every tab and was
     removed from the Image tab entirely, since the gallery's own download buttons
     already cover browsing/downloading outputs.
-    """
+
+    `preview_path`, if given, is the tab's most recent rendered preview clip --
+    included so a preview can be sent to Comparison even when no full batch
+    render has completed yet (previews never populate `rows`, by design)."""
     state_col = BATCH_HEADERS.index("State")
     path_col = BATCH_HEADERS.index("Output path")
 
@@ -51,6 +54,8 @@ def build_comparison_items_from_batch_results(
         if len(row) > path_col and row[state_col] == "Complete" and row[path_col]:
             output_path = row[path_col]
             items.append(ComparisonItem(f"Output: {Path(output_path).name}", output_path))
+    if preview_path:
+        items.append(ComparisonItem(f"Preview: {Path(preview_path).name}", preview_path))
     return items
 
 

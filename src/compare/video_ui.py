@@ -223,9 +223,23 @@ SYNC_PLAYER_HEAD_SCRIPT = f"""
   // right after a refresh. Only a later value that's genuinely unchanged
   // from what we already applied leaves the visible field alone, so a
   // manual edit still survives until the next real suggestion.
+  //
+  // findSuggestedStepInput() is deliberately defensive about DOM shape: which
+  // element elem_id lands on for a gr.Number (the wrapper block vs. the
+  // <input> itself) isn't something that's been confirmed against a real
+  // Gradio build here, unlike the video elements above (that pattern was
+  // already proven working before this feature existed). Handling both
+  // shapes means this doesn't silently do nothing forever if the assumption
+  // was wrong in either direction.
+  function findSuggestedStepInput() {{
+    var el = document.getElementById('{SUGGESTED_STEP_ELEM_ID}');
+    if (!el) return null;
+    if (el.tagName === 'INPUT') return el;
+    return el.querySelector('input');
+  }}
   var lastSuggestedStep = null;
   function pollSuggestedStep() {{
-    var suggested = document.querySelector('#{SUGGESTED_STEP_ELEM_ID} input');
+    var suggested = findSuggestedStepInput();
     var frameStepInput = document.getElementById('dlss5-sync-frame-step');
     if (!suggested || !frameStepInput) return;
     var value = parseFloat(suggested.value);
@@ -265,9 +279,23 @@ def receive_video_items(new_items: list[ComparisonItem], frame_step_seconds: flo
     default_reference = next((label for label in labels if label.startswith("Input: ")), None) or (
         labels[0] if labels else NO_SELECTION
     )
-    default_candidate = next((label for label in labels if label.startswith("Output: ")), None) or (
-        labels[-1] if labels else NO_SELECTION
+    default_candidate = (
+        next((label for label in labels if label.startswith("Output: ")), None)
+        or next((label for label in labels if label.startswith("Preview: ")), None)
+        or (labels[-1] if labels else NO_SELECTION)
     )
+    # Set reference_video/candidate_video directly here rather than relying on
+    # reference.change()/candidate.change() (bind_video_compare_events) to
+    # cascade from the value updates below -- same reasoning as the panel
+    # visibility a few lines down: a value pushed programmatically alongside
+    # everything else in this same click doesn't reliably re-fire .change(),
+    # which was leaving both video players either empty or showing whatever
+    # they last held until the user manually re-toggled something. The
+    # .change() bindings stay in place for when the user picks a *different*
+    # item from the dropdown afterward -- that's a real user interaction, not
+    # a programmatic one, and fires normally.
+    reference_path = _path_for(new_items, default_reference)
+    candidate_path = _path_for(new_items, default_candidate)
     return (
         new_items,
         gr.update(choices=labels or [NO_SELECTION], value=default_reference),
@@ -277,6 +305,8 @@ def receive_video_items(new_items: list[ComparisonItem], frame_step_seconds: flo
         gr.update(visible=False),  # image panel
         gr.update(visible=True),  # video panel
         gr.update(value=frame_step_seconds) if frame_step_seconds is not None else gr.skip(),
+        reference_path,
+        candidate_path,
     )
 
 

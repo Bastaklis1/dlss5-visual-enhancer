@@ -280,6 +280,7 @@ class VideoTab:
     input_path: object = None
     output_path: object = None
     job_state: object = None
+    last_preview_path: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -379,8 +380,10 @@ def build_video_tab(settings: UISettings) -> VideoTab:
 
 
 def bind_video_events(tab: VideoTab) -> None:
+    tab.last_preview_path = gr.State(None)
     bind_batch_ui(tab, render_video_batch, kind="video", preview_mode=update_video_preview_mode,
                   preview_actions=[(tab.preview, preview_with_duration)],
-                  preview_controls=[tab.preview_duration])
+                  preview_controls=[tab.preview_duration],
+                  preview_result_state=tab.last_preview_path)
     tab.rename_mode.change(rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False)
     tab.codec.change(hdr_mode_update, inputs=tab.codec, outputs=tab.hdr_mode, queue=False)

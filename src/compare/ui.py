@@ -103,22 +103,27 @@ def send_batch_results_to_compare(input_paths, rows):
     return receive_items(build_comparison_items_from_batch_results(input_paths, rows))
 
 
-def send_batch_results_to_video_compare(input_paths, rows):
+def send_batch_results_to_video_compare(input_paths, rows, preview_path):
     """Same idea as send_batch_results_to_compare, but for Video/Upscale Video —
     both already carry real output paths in their results table via the same
     bind_batch_ui/BatchProgress mechanism as Image, so this is the exact same
-    helper feeding the video pool + mode switch instead."""
-    return receive_video_items(build_comparison_items_from_batch_results(input_paths, rows))
+    helper feeding the video pool + mode switch instead.
+
+    preview_path is the tab's most recent rendered preview (tracked via
+    bind_batch_ui's preview_result_state) -- included so a preview can be sent
+    even when no full batch render has completed yet, since previews never
+    populate `rows`."""
+    return receive_video_items(build_comparison_items_from_batch_results(input_paths, rows, preview_path))
 
 
-def send_frame_interpolation_results_to_video_compare(input_paths, rows, target_fps):
+def send_frame_interpolation_results_to_video_compare(input_paths, rows, target_fps, preview_path):
     """Frame Interpolation's own "Send to Comparison" handler. Everything else
     about this is identical to send_batch_results_to_video_compare above, but
     Frame Interpolation is the one tab that already knows its output's exact
     frame rate (the target_fps the user picked) -- so unlike Video/Upscale,
     which leave the sync player's frame-step guess alone, this defaults it to
     1/target_fps instead of the generic ~30fps guess."""
-    items = build_comparison_items_from_batch_results(input_paths, rows)
+    items = build_comparison_items_from_batch_results(input_paths, rows, preview_path)
     try:
         target_rate = FrameInterpolationOptions(target_fps=target_fps).target_rate
         # Round for display -- an unrounded float (e.g. 0.016666666666666666)
@@ -231,16 +236,18 @@ def bind_comparison_events(
         compare_tab.video.pool, compare_tab.video.reference, compare_tab.video.candidate, tabs,
         compare_tab.mode, compare_tab.image_panel, compare_tab.video_panel,
         compare_tab.video.suggested_frame_step,
+        compare_tab.video.reference_video, compare_tab.video.candidate_video,
     ]
     for tab in (video_tab, upscale_video_tab):
         if tab is not None:
             tab.send_to_compare.click(
-                send_batch_results_to_video_compare, inputs=[tab.sources, tab.results],
+                send_batch_results_to_video_compare,
+                inputs=[tab.sources, tab.results, tab.last_preview_path],
                 outputs=video_receive_outputs, queue=False,
             )
     if frame_tab is not None:
         frame_tab.send_to_compare.click(
             send_frame_interpolation_results_to_video_compare,
-            inputs=[frame_tab.sources, frame_tab.results, frame_tab.target_fps],
+            inputs=[frame_tab.sources, frame_tab.results, frame_tab.target_fps, frame_tab.last_preview_path],
             outputs=video_receive_outputs, queue=False,
         )

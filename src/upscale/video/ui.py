@@ -92,6 +92,7 @@ class UpscaleTab:
     input_path: object
     output_path: object
     job_state: object = None
+    last_preview_path: object = None
 
     @property
     def settings_inputs(self):
@@ -175,9 +176,11 @@ def build_upscale_tab(settings):
             results = gr.Dataframe(headers=BATCH_HEADERS, datatype=["str"]*len(BATCH_HEADERS), interactive=False, label="Batch results", wrap=True)
     tab = UpscaleTab(sources, input_preview, input_actions, select_source, clear_source, c, preview_duration, preview_button, render, stop, reset,
                      output_video, send_to_compare, zip_download, status, results, input_path, output_path)
+    tab.last_preview_path = gr.State(None)
     bind_batch_ui(tab, render_upscale_batch, kind="video", preview_mode=preview_mode,
                   preview_actions=[(tab.preview, preview_with_duration)],
-                  preview_controls=[tab.preview_duration])
+                  preview_controls=[tab.preview_duration],
+                  preview_result_state=tab.last_preview_path)
     c["hdr_enabled"].change(lambda enabled: gr.update(visible=enabled), inputs=c["hdr_enabled"], outputs=hdr_controls, queue=False)
     c["codec"].change(lambda codec: gr.update(interactive=True) if hdr_mode_supported(codec) else gr.update(value=False, interactive=False),
                         inputs=c["codec"], outputs=c["hdr_enabled"], queue=False)

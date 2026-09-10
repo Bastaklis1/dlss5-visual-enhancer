@@ -286,3 +286,26 @@ def bind_comparison_events(
             inputs=[frame_tab.sources, frame_tab.results, frame_tab.target_fps, frame_tab.last_preview_path],
             outputs=video_receive_outputs, queue=False,
         )
+
+    # This is the deeper bug behind "leaving the Comparison tab and coming back shows
+    # both panels stacked, even with nothing ever sent." Root-caused the same way as
+    # the send-race above (real Gradio 6.26.0 + a real headless browser): simply
+    # deselecting and reselecting a TabItem -- via the user clicking a *different* tab
+    # and back, nothing to do with any of our own click handlers -- corrupts a nested
+    # Column's `visible` state on remount. Specifically, whichever Column is supposed
+    # to stay hidden reappears, while the one that's supposed to stay visible does.
+    # This reproduces in a 30-line repro with nothing but Tabs + two Columns, with NO
+    # send button, NO app.py wiring at all involved -- so no ordering/race fix on our
+    # own events could ever prevent it; it isn't caused by anything we do.
+    # Fix: re-assert the correct panel visibility every time ANY tab is (re)selected,
+    # not just when Mode itself changes or a send happens. This "heals" the corrupted
+    # state the instant the user lands back on Comparison, from whatever value Mode
+    # currently holds -- regardless of whether they got there by clicking the tab
+    # directly or via Send-to-Comparison.
+    def reassert_panel_visibility(selected_mode):
+        return gr.update(visible=selected_mode == "Image"), gr.update(visible=selected_mode == "Video")
+
+    tabs.select(
+        reassert_panel_visibility, inputs=compare_tab.mode,
+        outputs=[compare_tab.image_panel, compare_tab.video_panel], queue=False,
+    )

@@ -4,6 +4,7 @@ import math
 import subprocess
 from pathlib import Path
 
+from .. import app_log
 from ..jobs import Cancelled, JobController
 from ..render_metadata import (
     VIDEO_NOTE_FORMATS, MetadataNoteError, check_cancelled, embedding_warning,
@@ -45,6 +46,50 @@ def _probe_rendered_duration(path: Path, controller: JobController | None = None
     )
 
 
+
+def prepare_mux_comment(
+    source: Path, container: str, render_note: str | None,
+    metadata_diagnostics: dict | None = None,
+    controller: JobController | None = None,
+) -> str | None:
+    """Prepare the optional merged comment before a direct encode/mux pass."""
+    check_cancelled(controller)
+    if render_note is None or container not in VIDEO_NOTE_FORMATS:
+        if render_note is not None:
+            record_embedding(metadata_diagnostics, "skipped", reason="unsupported_format")
+        elif metadata_diagnostics is not None and not metadata_diagnostics:
+            record_embedding(metadata_diagnostics, "not_requested")
+        return None
+    try:
+        comment = merge_render_note(_read_comment(source, controller), render_note)
+        if len(comment.encode("utf-16-le")) > 16000:
+            raise MetadataNoteError("Existing comment is too large to safely extend")
+        return comment
+    except Cancelled:
+        raise
+    except (ValueError, TypeError, RuntimeError) as exc:
+        embedding_warning(metadata_diagnostics, exc)
+        return None
+
+
+def verify_mux_comment(
+    output: Path, comment: str | None, metadata_diagnostics: dict | None = None,
+    controller: JobController | None = None,
+) -> None:
+    """Verify optional direct-mux metadata without ever remuxing the video."""
+    if comment is None:
+        return
+    try:
+        if _read_comment(output, controller) != comment:
+            raise MetadataNoteError("Saved video did not retain the settings note")
+    except Cancelled:
+        raise
+    except (ValueError, RuntimeError) as exc:
+        embedding_warning(metadata_diagnostics, exc)
+        return
+    record_embedding(metadata_diagnostics, "embedded", field="format.comment")
+
+
 def final_mux(
     temp_video: Path,
     source: Path,
@@ -80,16 +125,28 @@ def final_mux(
     try:
         _final_mux_once(temp_video, source, output, container, controller,
                         preserve_supported_subtitles, comment=comment, source_time_origin=source_time_origin)
-        if _read_comment(output, controller) != comment:
-            raise MetadataNoteError("Saved video did not retain the settings note")
     except Cancelled:
         raise
     except (ValueError, RuntimeError) as exc:
         check_cancelled(controller)
         if isinstance(exc, _MuxFailure) and exc.filesystem_error:
             raise
+        # A mux failure caused by optional metadata should not destroy the render.
+        # Retry once without the note because there is not yet a valid output.
         embedding_warning(metadata_diagnostics, exc)
         _final_mux_once(temp_video, source, output, container, controller, preserve_supported_subtitles, source_time_origin=source_time_origin)
+        return
+
+    # Verification is deliberately read-only.  If the optional settings note did
+    # not survive, keep the already-valid mux instead of copying the complete
+    # video through a second remux solely to remove metadata.
+    try:
+        if _read_comment(output, controller) != comment:
+            raise MetadataNoteError("Saved video did not retain the settings note")
+    except Cancelled:
+        raise
+    except (ValueError, RuntimeError) as exc:
+        embedding_warning(metadata_diagnostics, exc)
         return
     record_embedding(metadata_diagnostics, "embedded", field="format.comment")
 
@@ -218,4 +275,5 @@ def _final_mux_once(
         if controller is not None:
             controller.unregister(process)
     if process.returncode:
+        app_log.error("ffmpeg-mux", "final audio/metadata mux failed", stderr[-500:])
         raise _MuxFailure(stderr)

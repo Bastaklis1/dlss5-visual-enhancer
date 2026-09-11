@@ -65,7 +65,6 @@ class VideoFrame:
     pts: int
     duration: int
     rgba: np.ndarray
-    motion: np.ndarray | None = None
     reset: bool = False
 
 
@@ -116,7 +115,7 @@ class AdaptiveRate:
                 self.changes.append({"after_frames": self.observed, "fps": self.fps_unlocked()})
 
     def reset_measurements(self) -> None:
-        """Discard startup costs after a worker change, keeping the cadence."""
+        """Discard startup costs after a bridge-session change, keeping cadence."""
         with self._lock:
             self.samples.clear()
             self._warmup_left = 6

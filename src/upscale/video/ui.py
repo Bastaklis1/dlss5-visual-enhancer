@@ -7,9 +7,9 @@ import gradio as gr
 
 from ...core.batch_ui import (
     BATCH_HEADERS, bind_batch_ui, build_media_clear_button, build_media_select_button,
-    build_path_controls,
+    build_path_controls, build_save_controls,
 )
-from ...core.disk_paths import create_media_archive, resolve_inputs
+from ...core.disk_paths import resolve_inputs
 from ...core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, hdr_mode_supported
 from ...core.naming import RENAME_MODES
 from ...settings.storage import processing_gpu_settings
@@ -36,12 +36,7 @@ def render_upscale_batch(paths, *values, progress=None, output_dir=None, control
     status = f"{'Cancelled' if result.cancelled else 'Complete'}: {len(files)} completed; {len(result.failures)} failed/skipped.\n{detail}\nReport: {result.manifest_path}"
     if result.failures:
         status += "\n" + result.failures[0].error
-    archive_path = None
-    if not direct_disk and not result.cancelled:
-        archive_path = create_media_archive(
-            files, output_dir, "RTXVIDEO_VIDEO_BATCH", controller=controller,
-        )
-    return gr.update(value=output, visible=not direct_disk, label="SDR tone-mapped preview (download original for HDR)" if options.hdr_enabled and detail.startswith("SDR") else "Output video"), archive_path, [], status
+    return gr.update(value=output, visible=not direct_disk, label="SDR tone-mapped preview (download original for HDR)" if options.hdr_enabled and detail.startswith("SDR") else "Output video"), files, [], status
 
 
 def preview_frame(paths, *values, progress=gr.Progress(track_tqdm=False)):
@@ -84,6 +79,8 @@ class UpscaleTab:
     stop: object
     reset: object
     output_video: object
+    save_download: object
+    zip_button: object
     zip_download: object
     status: object
     results: object
@@ -112,7 +109,7 @@ def build_upscale_tab(settings):
             sources = gr.File(label="Input video(s)", file_count="multiple", file_types=["video"], type="filepath",
                               allow_reordering=True, elem_id="upscale-upload-list",
                               elem_classes=["media-upload-surface"])
-            input_preview = ManagedVideo(label="Input video preview", interactive=False, visible=False)
+            input_preview = ManagedVideo(label="Input video preview", interactive=False, visible="hidden")
             with gr.Row(
                 visible=False, elem_id="upscale-input-actions",
                 elem_classes=["media-input-actions"],
@@ -121,14 +118,18 @@ def build_upscale_tab(settings):
                     "Choose Videos", ["video"], "upscale-select-input",
                 )
                 clear_source = build_media_clear_button("upscale-clear-input")
-            input_path, output_path = build_path_controls()
-            with gr.Accordion("RTX Video Super Resolution", open=True):
-                c["vsr_enabled"] = gr.Checkbox(value=opts.vsr_enabled, label="RTX Video Super Resolution")
-                c["vsr_quality"] = gr.Dropdown(VSR_QUALITIES, value=opts.vsr_quality, label="VSR quality", info="Ultra gives the highest quality.")
+            with gr.Row():
+                render = gr.Button("Upscale video(s)", variant="primary")
+                stop = gr.Button("Stop", variant="stop")
+                preview_frame_button = gr.Button("Preview 1 frame", visible=False)
+                preview_button = gr.Button("Preview 3 sec", visible=False)
+                reset = gr.Button("Reset settings")
+            with gr.Column():
+                c["vsr_enabled"] = gr.Checkbox(value=opts.vsr_enabled, label="Enable")
+                c["vsr_quality"] = gr.Dropdown(VSR_QUALITIES, value=opts.vsr_quality, label="VSR quality")
                 c["size_mode"] = gr.Radio(SIZE_MODES, value=opts.size_mode, label="Output sizing")
                 c["scale_factor"] = gr.Dropdown(
                     SCALE_FACTORS, value=opts.scale_factor, label="Scale factor",
-                    info="1× enhances at original resolution. Other factors increase width and height.",
                 )
                 with gr.Row(
                     visible=opts.size_mode == "Custom dimensions",
@@ -136,11 +137,11 @@ def build_upscale_tab(settings):
                 ) as custom_dimensions_row:
                     c["width"] = gr.Number(value=opts.width, minimum=2, maximum=16384, precision=0, label="Output width")
                     c["height"] = gr.Number(value=opts.height, minimum=2, maximum=16384, precision=0, label="Output height")
-                c["aspect_lock"] = gr.Checkbox(value=opts.aspect_lock, label="Lock aspect ratio", info="Custom width determines height for each source.")
+                c["aspect_lock"] = gr.Checkbox(value=opts.aspect_lock, label="Lock aspect ratio")
                 dimensions = gr.Markdown(visible=False, elem_id="upscale-video-dimensions")
+            input_path, output_path = build_path_controls()
             with gr.Accordion("RTX Video HDR", open=True):
-                c["hdr_enabled"] = gr.Checkbox(value=opts.hdr_enabled, label="Convert SDR to HDR", interactive=hdr_mode_supported(opts.codec),
-                                              info="Creates HDR highlights and colors. Requires H.265, AV1, or ProRes output.")
+                c["hdr_enabled"] = gr.Checkbox(value=opts.hdr_enabled, label="Convert SDR to HDR", interactive=hdr_mode_supported(opts.codec))
                 with gr.Column(visible=opts.hdr_enabled) as hdr_controls:
                     with gr.Row():
                         c["hdr_contrast"] = gr.Slider(0, 200, value=opts.hdr_contrast, step=1, precision=0, label="HDR contrast")
@@ -148,32 +149,28 @@ def build_upscale_tab(settings):
                     with gr.Row():
                         c["hdr_middle_gray"] = gr.Slider(10, 100, value=opts.hdr_middle_gray, step=1, precision=0, label="HDR middle gray")
                         c["hdr_peak_luminance"] = gr.Slider(400, 2000, value=opts.hdr_peak_luminance, step=1, precision=0, label="HDR peak luminance (nits)")
-                    c["hdr_precision"] = gr.Radio(HDR_PRECISION_CHOICES, value=opts.hdr_precision, label="HDR processing precision",
-                                                  info="FP16 uses more memory. HDR video exports use 10-bit color in both modes.")
+                    c["hdr_precision"] = gr.Radio(HDR_PRECISION_CHOICES, value=opts.hdr_precision, label="HDR processing precision")
             c["quality"] = gr.Radio(ENCODING_QUALITIES, value=opts.quality, label="Encoding quality")
             with gr.Row():
-                c["codec"] = gr.Dropdown(CODEC_CHOICES, value=opts.codec, label="Video codec", info="Plain = CPU; NVIDIA NVENC = GPU. ProRes requires MOV or MKV.")
+                c["codec"] = gr.Dropdown(CODEC_CHOICES, value=opts.codec, label="Video codec")
                 c["container"] = gr.Dropdown(("MP4", "MKV", "MOV"), value=opts.container, label="Container")
             with gr.Row():
                 c["rename_mode"] = gr.Radio(RENAME_MODES, value=opts.rename_mode, label="Rename")
                 c["custom_suffix"] = gr.Textbox(value=opts.custom_suffix, label="Custom suffix", interactive=opts.rename_mode == "Custom")
-            with gr.Row():
-                preview_frame_button = gr.Button("Preview 1 frame", visible=False)
-                preview_button = gr.Button("Preview 3 sec", visible=False)
-                render = gr.Button("Upscale video(s)", variant="primary")
-                stop = gr.Button("Stop", variant="stop")
-                reset = gr.Button("Reset settings")
         with gr.Column(scale=3):
             output_video = ManagedVideo(
                 label="Output video", interactive=False, visible=True, height=520,
             )
-            zip_download = gr.DownloadButton("Save as ZIP", visible=False)
+            save_download, zip_button, zip_download = build_save_controls("video", "upscale-video")
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(headers=BATCH_HEADERS, datatype=["str"]*len(BATCH_HEADERS), interactive=False, label="Batch results", wrap=True)
     tab = UpscaleTab(sources, input_preview, input_actions, select_source, clear_source, c, preview_frame_button, preview_button, render, stop, reset,
-                     output_video, zip_download, status, results, input_path, output_path)
-    bind_batch_ui(tab, render_upscale_batch, kind="video", preview_mode=preview_mode,
-                  preview_actions=[(tab.preview_frame, preview_frame), (tab.preview, preview_clip)])
+                     output_video, save_download, zip_button, zip_download, status, results, input_path, output_path)
+    bind_batch_ui(
+        tab, render_upscale_batch, kind="video", preview_mode=preview_mode,
+        archive_prefix="RTXVIDEO_VIDEO_BATCH",
+        preview_actions=[(tab.preview_frame, preview_frame), (tab.preview, preview_clip)],
+    )
     c["hdr_enabled"].change(lambda enabled: gr.update(visible=enabled), inputs=c["hdr_enabled"], outputs=hdr_controls, queue=False)
     c["codec"].change(lambda codec: gr.update(interactive=True) if hdr_mode_supported(codec) else gr.update(value=False, interactive=False),
                         inputs=c["codec"], outputs=c["hdr_enabled"], queue=False)

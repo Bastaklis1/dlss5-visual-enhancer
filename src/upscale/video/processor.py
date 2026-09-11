@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import json
 import math
 import tempfile
 import time
 import uuid
 from contextlib import ExitStack, nullcontext, suppress
-from dataclasses import asdict, replace
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
 import av
 
-from ...core import ffmpeg
+from ...core import app_log, ffmpeg
 from ...core.disk_paths import OutputFile, prepare_output_dir
 from ...core.gpu_detection import detect_gpus
 from ...core.jobs import Cancelled, active_job
 from ...core.naming import output_filename
-from ...core.paths import JOBS, LOGS
+from ...core.paths import JOBS
 from .media import PipeReader, PipeWriter, close_process, finish_process, inspect_video, output_filter, packed_bytes, result_frame, start_decoder
 from .models import UpscaleOptions, UpscaleResult, output_size
 from .native import RTXVideoSession, probe_capabilities
@@ -38,9 +37,9 @@ def upscale_video(input_path, options: UpscaleOptions | None = None, progress=No
 def _process(source, options, progress, output_dir, controller, capabilities):
     started = time.monotonic()
     stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
-    LOGS.mkdir(exist_ok=True); JOBS.mkdir(exist_ok=True)
-    report_path = LOGS / f"upscale-{stamp}.json"
-    report = {"input": str(source), "options": asdict(options), "status": "running", "pipeline": "RTX Video SDK / D3D11"}
+    JOBS.mkdir(exist_ok=True)
+    report_path = app_log.session_path()
+    app_log.info("upscale", f"start src={source.name}")
     processes = []
     destination_file = None
     session = None
@@ -59,8 +58,6 @@ def _process(source, options, progress, output_dir, controller, capabilities):
         ow, oh, rounding = output_size(width, height, options)
         caps = capabilities or probe_capabilities(options.ai_gpu_uuid, controller=controller)
         video_gpu = ffmpeg.resolve_video_gpu(detect_gpus(), options.video_gpu_uuid, options.codec, ow, oh)
-        report.update(capabilities=asdict(caps), video_gpu=video_gpu, input_metadata=meta,
-                      output_dimensions=[ow, oh], rounding=rounding)
         destination = prepare_output_dir(output_dir)
         extension = {"MP4": ".mp4", "MKV": ".mkv", "MOV": ".mov"}[options.container]
         preview = options.preview_frames is not None or options.preview_seconds is not None
@@ -89,16 +86,6 @@ def _process(source, options, progress, output_dir, controller, capabilities):
             decoder, dec_thread, dec_logs, assumptions = start_decoder(source, meta, controller)
             processes.append(decoder)
             stack.callback(close_process, decoder, controller, dec_thread)
-            report.update(encoder=selected, encoding_quality=quality, warnings=assumptions,
-                          input_format=input_format, output_format=session.output_format, color=colors,
-                          applied_settings={"vsr_enabled": options.vsr_enabled,
-                                            "vsr_quality": options.vsr_quality if options.vsr_enabled else None,
-                                            "hdr_enabled": options.hdr_enabled,
-                                            "hdr": {name: getattr(options, name) for name in
-                                                    ("hdr_contrast", "hdr_saturation", "hdr_middle_gray",
-                                                     "hdr_peak_luminance", "hdr_precision")} if options.hdr_enabled else None,
-                                            "input_dimensions": [width, height], "output_dimensions": [ow, oh],
-                                            "input_color": "Full-range BT.709 RGB, gamma 2.2", "full_frame": True})
             decoded = stack.enter_context(av.open(PipeReader(decoder.stdout), mode="r", format="nut"))
             source_stream = decoded.streams.video[0]
             tb = source_stream.time_base
@@ -179,20 +166,27 @@ def _process(source, options, progress, output_dir, controller, capabilities):
             if not options.hdr_enabled and saved["hdr"]:
                 raise RuntimeError("SDR output unexpectedly contains HDR signaling.")
             check_cancel()
-            report.update(status="success", output=str(output), frames=delivered, verified_output=saved,
-                          sdk_evaluations=delivered, last_ngx_results=session.last_results,
-                          timestamp_fallback_frames=timestamps_fallback,
-                          timings={"total_seconds": time.monotonic()-started, "ngx_evaluation_seconds": eval_seconds},
-                          worker_log=list(session.logs), decoder_log=dec_logs.snapshot(), encoder_log=enc_logs.snapshot())
-            report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+            elapsed = time.monotonic() - started
+            app_log.info(
+                "upscale",
+                f"done src={source.name} out={output.name} frames={delivered} "
+                f"elapsed={elapsed:.0f}s",
+            )
             destination_file.publish()
-        return UpscaleResult(str(output), str(report_path), delivered, ow, oh, options.hdr_enabled, time.monotonic()-started)
+        return UpscaleResult(str(output), report_path, delivered, ow, oh, options.hdr_enabled, time.monotonic()-started)
     except BaseException as exc:
-        report.update(status="cancelled" if controller.cancel.is_set() or isinstance(exc, Cancelled) else "failed",
-                      error=str(exc), frames=delivered, elapsed_seconds=time.monotonic()-started,
-                      worker_log=list(session.logs) if session else [])
-        with suppress(OSError):
-            report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        cancelled = controller.cancel.is_set() or isinstance(exc, Cancelled)
+        if not cancelled:
+            tails: dict[str, object] = {}
+            if session is not None:
+                tails["worker"] = list(session.logs)[-40:]
+            with suppress(Exception):
+                tails["decoder"] = dec_logs.snapshot()[-40:]
+            with suppress(Exception):
+                tails["encoder"] = enc_logs.snapshot()[-40:]
+            report_path = str(app_log.fail("upscale", f"upscale-{source.stem}", exc, tails))
+        else:
+            app_log.info("upscale", f"cancelled src={source.name}")
         if controller.cancel.is_set() and not isinstance(exc, Cancelled):
             raise Cancelled("Upscale stopped by user.") from exc
         raise

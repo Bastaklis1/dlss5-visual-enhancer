@@ -1,6 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+
+# Resolve the portable Gradio cache without importing the ``src.core`` package:
+# importing that package executes its __init__ and may load heavy/media modules.
+# Gradio reads GRADIO_TEMP_DIR during import in some modules, so this must be
+# the first application setup performed.
+_APP_ROOT = Path(__file__).resolve().parent
+_APP_GRADIO_TEMP = _APP_ROOT / "temp" / "gradio"
+_APP_GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+os.environ["GRADIO_TEMP_DIR"] = str(_APP_GRADIO_TEMP)
 
 # Show LOADING immediately before heavy imports (gradio etc.) to avoid black screen after start.bat
 import time as _early_time
@@ -20,6 +30,7 @@ except Exception:
 import gradio as gr
 
 from src.about.ui import build_about_tab
+from src.core.batch_ui import bind_input_surface_reactivation
 from src.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
     CACHE_SWEEP_INTERVAL_SECONDS,
@@ -32,15 +43,114 @@ from src.frame_interpolation.ui import build_frame_interpolation_tab
 from src.live.ui import build_live_tab
 from src.neural_rendering.image.decoder import initialize_image_runtime
 from src.neural_rendering.ui import build_neural_rendering_tab
+from src.neural_rendering.composition_ui import bind_composition_mask_events
 from src.settings.ui import bind_settings_events, build_settings_tab, initialize_settings
 from src.upscale.ui import build_upscale_tab
 
 APP_CSS = r"""
-/* Center the About contents in the space below the app title and tab bar. */
+/* Internal lazy-ZIP download targets must always remain in the DOM for the
+   one-click browser download trigger, but must never appear as UI controls. */
+.internal-zip-download {
+    display: none !important;
+}
+
+/* Stateful mode trees stay mounted. The radio's client guard stores the latest
+   requested mode on <html>; these selectors remain authoritative even if an
+   older backend visibility response arrives later. The correct panel can be
+   briefly blank while loading, but the wrong panel can never be exposed. */
+html[data-neural-rendering-mode="Video"] #neural-rendering-image,
+html[data-neural-rendering-mode="Image"] #neural-rendering-video,
+html[data-upscale-mode="Video"] #upscale-image,
+html[data-upscale-mode="Image"] #upscale-video {
+    display: none !important;
+}
+
+/* First paint has no dataset yet (the guards only run on mode.change), so the
+   rules above match nothing and both panels would stack. Hide the Video panel
+   by default; the load-time JS below immediately corrects this when the saved
+   Upscale mode is Video, and the change-guards take over afterwards. */
+html:not([data-neural-rendering-mode]) #neural-rendering-video,
+html:not([data-upscale-mode]) #upscale-video {
+    display: none !important;
+}
+
+/* Keep the app brand and native top-level tabs on one horizontal header line.
+   Gradio measures a visually-hidden copy of the tab buttons for overflow, so
+   shift that measurement surface by the same fixed brand width as the visible
+   tab list to preserve the built-in overflow menu calculation. */
+#main-tabs {
+    --main-brand-width: 8.75rem;
+}
+
+#main-tabs > .tab-wrapper {
+    justify-content: flex-start;
+    min-width: 0;
+}
+
+#main-tabs > .tab-wrapper::before {
+    content: "DLSS 5 VE";
+    display: flex;
+    flex: 0 0 var(--main-brand-width);
+    align-self: stretch;
+    align-items: center;
+    box-sizing: border-box;
+    padding-right: var(--size-3);
+    color: var(--body-text-color);
+    font-size: var(--text-lg);
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+#main-tabs > .tab-wrapper > .tab-container[role="tablist"] {
+    flex: 1 1 auto;
+    width: auto !important;
+    min-width: 0;
+}
+
+#main-tabs > .tab-wrapper > .tab-container.visually-hidden {
+    left: var(--main-brand-width);
+}
+
+/* Image / Video is a compact second navigation line in workflows that support
+   both modes. Keep the native Gradio radio buttons and their behavior, but
+   remove the surrounding form/label and prevent the two choices from wrapping. */
+#neural-rendering-mode,
+#upscale-mode {
+    flex: 0 0 auto !important;
+    width: max-content !important;
+    max-width: 100%;
+    min-width: 0 !important;
+}
+
+#neural-rendering-mode .wrap,
+#upscale-mode .wrap {
+    flex-wrap: nowrap !important;
+}
+
+/* On Windows Chromium, hovering a compact radio choice can briefly make the
+   max-content radio surface report horizontal overflow and expose a native
+   scrollbar. These two-choice selectors never need scrolling, so keep the
+   overflow paintable without creating a scroll container. */
+#neural-rendering-mode,
+#upscale-mode,
+#neural-rendering-mode .wrap,
+#upscale-mode .wrap {
+    overflow: visible !important;
+    scrollbar-width: none;
+}
+
+#neural-rendering-mode::-webkit-scrollbar,
+#upscale-mode::-webkit-scrollbar,
+#neural-rendering-mode .wrap::-webkit-scrollbar,
+#upscale-mode .wrap::-webkit-scrollbar {
+    display: none;
+}
+
+/* Center the About contents in the space below the compact one-row header. */
 #about-content {
     display: grid;
     place-items: center;
-    min-height: calc(100dvh - 12rem);
+    min-height: calc(100dvh - 8rem);
     padding: 2rem 1rem;
     box-sizing: border-box;
     text-align: center;
@@ -198,6 +308,34 @@ APP_CSS = r"""
     width: 100% !important;
 }
 
+/* Neural Rendering is structurally split into several Gradio Forms by its
+   two slider Rows. Visually merge only those Forms into one native-looking
+   block without changing any child component sizing, spacing, or controls. */
+.neural-controls-unified {
+    background: var(--block-background-fill);
+    border-radius: var(--block-radius);
+    box-shadow: var(--block-shadow);
+    overflow: hidden;
+}
+
+.neural-controls-unified::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    box-sizing: border-box;
+    border: var(--block-border-width) solid var(--block-border-color);
+    border-radius: inherit;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.neural-controls-unified .form {
+    background: transparent !important;
+    border-color: transparent !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+}
+
 """
 
 
@@ -214,23 +352,54 @@ def build_app() -> gr.Blocks:
         # are covered by cleanup_old_caches() at startup in main().
         delete_cache=(CACHE_SWEEP_INTERVAL_SECONDS, CACHE_MAX_AGE_SECONDS),
     ) as demo:
-        gr.Markdown(
-            "# DLSS 5 Visual Enhancer",
-            elem_id="app-title",
-        )
-        with gr.Tabs(selected="neural-rendering"):
-            with gr.Tab("Neural Rendering", id="neural-rendering"):
-                neural_rendering_tab = build_neural_rendering_tab(settings)
-            with gr.Tab("Upscale", id="upscale"):
+        # One runtime source of truth for the global Neural Rendering processing
+        # path.  The visible control lives in Settings, while render/start events
+        # consume this State so each queued operation snapshots the selected mode.
+        processing_engine_state = gr.State(value=settings.nr_gpu_mode)
+        nr_mask_state = gr.State(value=None)
+        with gr.Tabs(selected="neural-rendering", elem_id="main-tabs"):
+            # Keep every tab tree mounted from first paint. Stateful File/Gallery/Video
+            # components otherwise get lazily mounted when a tab is first selected,
+            # which can briefly restore their construction-time visibility/value state.
+            with gr.Tab("Neural Rendering", id="neural-rendering", render_children=True) as neural_root_tab:
+                neural_rendering_tab = build_neural_rendering_tab(settings, processing_engine_state, nr_mask_state)
+            with gr.Tab("Upscale", id="upscale", render_children=True) as upscale_root_tab:
                 upscale_tab = build_upscale_tab(settings)
-            with gr.Tab("Frame Interpolation", id="frame-interpolation"):
+            with gr.Tab("Frame Interpolation", id="frame-interpolation", render_children=True) as frame_root_tab:
                 frame_tab = build_frame_interpolation_tab(settings)
-            with gr.Tab("Live", id="live"):
-                live_tab = build_live_tab(settings)
-            with gr.Tab("Settings", id="settings"):
-                settings_tab = build_settings_tab(settings, ai_gpu_choices, video_gpu_choices)
-            with gr.Tab("About", id="about"):
+            with gr.Tab("Live", id="live", render_children=True) as live_root_tab:
+                live_tab = build_live_tab(settings, processing_engine_state, nr_mask_state)
+            with gr.Tab("Settings", id="settings", render_children=True) as settings_root_tab:
+                settings_tab = build_settings_tab(
+                    settings, ai_gpu_choices, video_gpu_choices, processing_engine_state
+                )
+            with gr.Tab("About", id="about", render_children=True) as about_root_tab:
                 build_about_tab()
+
+        # Mounted video elements can otherwise keep decoding/playing while their
+        # workflow is hidden. Pause media whenever the user changes top-level tabs.
+        pause_media_js = """() => {
+            document.querySelectorAll('video').forEach((video) => {
+                try { video.pause(); } catch (_) {}
+            });
+        }"""
+        for root_tab in (
+            neural_root_tab, upscale_root_tab, frame_root_tab,
+            live_root_tab, settings_root_tab, about_root_tab,
+        ):
+            root_tab.select(
+                None, js=pause_media_js, queue=False, show_progress="hidden",
+                trigger_mode="always_last",
+            )
+
+        # Gradio can restore construction-time child visibility when a mounted
+        # top-level tab is shown again. Reconcile only the input surface state;
+        # rendered outputs, save controls, and thumbnails are left untouched.
+        bind_input_surface_reactivation(neural_root_tab, neural_rendering_tab.image, kind="image", event_name="select")
+        bind_input_surface_reactivation(neural_root_tab, neural_rendering_tab.video, kind="video", event_name="select")
+        bind_input_surface_reactivation(upscale_root_tab, upscale_tab.image, kind="image", event_name="select")
+        bind_input_surface_reactivation(upscale_root_tab, upscale_tab.video, kind="video", event_name="select")
+        bind_input_surface_reactivation(frame_root_tab, frame_tab, kind="video", event_name="select")
 
         bind_settings_events(
             settings_tab,
@@ -239,6 +408,54 @@ def build_app() -> gr.Blocks:
             frame_tab,
             live_tab,
             upscale_tab,
+        )
+        bind_composition_mask_events(
+            nr_mask_state,
+            neural_rendering_tab.image.composition,
+            neural_rendering_tab.video.composition,
+            live_tab.composition,
+        )
+
+        # First paint has no dataset for the CSS guards above (they only run on
+        # mode.change), so both Image and Video panels would stack until the
+        # first toggle. Seed both attributes on load from the construction-time
+        # radio values; Neural Rendering always starts on Image, Upscale honors
+        # the persisted setting. Existing change-guards remain authoritative
+        # afterwards. Trees stay mounted; this only affects CSS visibility.
+        initial_upscale_mode = settings.upscale_mode if settings.upscale_mode in ("Image", "Video") else "Image"
+        init_mode_js = (
+            "() => {"
+            " try {"
+            "  var html = document.documentElement;"
+            "  if (!html.hasAttribute('data-neural-rendering-mode')) {"
+            "   html.setAttribute('data-neural-rendering-mode', 'Image');"
+            "  }"
+            f"  if (!html.hasAttribute('data-upscale-mode')) {{"
+            f"   html.setAttribute('data-upscale-mode', '{initial_upscale_mode}');"
+            "  }"
+            "  var hiddenIds = [];"
+            "  if (html.getAttribute('data-neural-rendering-mode') === 'Video') {"
+            "   hiddenIds.push('neural-rendering-image');"
+            "  } else {"
+            "   hiddenIds.push('neural-rendering-video');"
+            "  }"
+            "  if (html.getAttribute('data-upscale-mode') === 'Video') {"
+            "   hiddenIds.push('upscale-image');"
+            "  } else {"
+            "   hiddenIds.push('upscale-video');"
+            "  }"
+            "  hiddenIds.forEach(function (id) {"
+            "   var panel = document.getElementById(id);"
+            "   if (panel) { panel.querySelectorAll('video').forEach(function (node) {"
+            "    try { node.pause(); } catch (_) {}"
+            "   }); }"
+            "  });"
+            " } catch (_) {}"
+            "}"
+        )
+        demo.load(
+            None, js=init_mode_js, queue=False, show_progress="hidden",
+            trigger_mode="always_last",
         )
     return demo
 
@@ -282,11 +499,21 @@ def main() -> None:
     else:
         ui = init_console(LOGS)
     try:
-        prepare_runtime()
+        prepared = prepare_runtime()
     except Exception as exc:
-        with open(LOGS / "startup_error.log", "a", encoding="utf-8") as f:
-            f.write(f"Startup preparation failed: {exc}\n")
+        try:
+            from src.core import app_log
+
+            app_log.error("startup", f"preparation failed: {exc}")
+        except Exception:
+            pass
         raise SystemExit(1) from exc
+    try:
+        from src.core import app_log
+
+        app_log.info("startup", f"ready gpu={prepared.gpu.get('display_name', 'GPU')}")
+    except Exception:
+        pass
 
     demo = build_app()
     # Replace loading screen with final DLSS 5 Visual Enhancer splash
@@ -307,6 +534,13 @@ def main() -> None:
         )
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            from src.core import app_log
+
+            app_log.info("app", "stop")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

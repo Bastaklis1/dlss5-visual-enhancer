@@ -10,6 +10,7 @@ import time
 from contextlib import nullcontext, suppress
 from functools import lru_cache
 
+from ...core import app_log
 from ...core.gpu_detection import detect_gpus
 from ...core.gpu_selection import resolve_ai_gpu
 from ...core.jobs import Cancelled, JobController, current_job_controller, use_job_controller
@@ -147,6 +148,7 @@ class RTXVideoSession:
             raise Cancelled("Upscale stopped by user.")
         self._reader.join(timeout=.2)
         detail = "timed out" if self.timed_out else "closed unexpectedly"
+        app_log.error("rtx-worker", f"RTX Video worker {detail}", "\n".join(self.logs)[-500:])
         raise RuntimeError(f"RTX Video worker {detail}.\n" + "\n".join(self.logs)[-4000:])
 
     def _write(self, data):
@@ -185,6 +187,7 @@ class RTXVideoSession:
             if (magic, index) != (FRAME, self.completed_frames):
                 raise RuntimeError("RTX Video frame identity mismatch.")
             if status:
+                app_log.error("rtx-worker", f"RTX Video evaluation failed: VSR=0x{vsr:08X}, HDR=0x{hdr:08X}")
                 raise RuntimeError(f"RTX Video evaluation failed: VSR=0x{vsr:08X}, HDR=0x{hdr:08X}.")
             if size != self.output_bytes:
                 raise RuntimeError("RTX Video output frame byte count mismatch.")
@@ -216,6 +219,7 @@ class RTXVideoSession:
             for stream in (self.process.stdout, self.process.stderr):
                 stream.close()
         if not abort and self.process.returncode:
+            app_log.error("rtx-worker", "RTX Video worker failed during shutdown", "\n".join(self.logs)[-500:])
             raise RuntimeError("RTX Video worker failed during shutdown.\n" + "\n".join(self.logs)[-3000:])
 
     def __enter__(self):

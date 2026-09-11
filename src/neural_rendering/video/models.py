@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ...core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, UPSCALING_MODES
+from ...core.runtime import NR_STYLES, UPSCALING_MODES
 
 
 @dataclass(slots=True)
@@ -11,22 +11,29 @@ class ConversionOptions:
     video_gpu_uuid: str = "auto"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
+    nr_passes: int = 1
     local_tone_strength: float = 1.0
     local_structure_strength: float = 1.0
     skin_structure_strength: float = -1.0
+    nr_color_strength: float = 1.0
+    tone_preservation: float = 0.0
+    face_skin_protection: float = 0.0
+    grain_preservation: float = 0.0
+    shimmer_suppression: float = 0.70
+    mask_feather: int = 0
+    nr_mask: object | None = None
     upscaling_factor: float = 1.0
-    codec: str = "H.264"
+    codec: str = "H.264 (NVIDIA NVENC)"
     container: str = "MP4"
     quality: str = "Auto (Default)"
     preserve_hdr: bool = False
     warmup_frames: int = 0
     preview_seconds: float | None = None
     preview_frames: int | None = None
-    nr_preset: str = "Default"
     automatic_mask: bool = False
+    nr_gpu_mode: bool = True
     rename_mode: str = "Auto"
-    custom_suffix: str = "_DLSS5"
-    dlss_model_preset: str = "Default"
+    custom_suffix: str = "_Neural_Rendering"
     # True = truncated preview uses the forced H.264 SDR path (current behavior).
     # False = truncated preview uses the user's codec/container (HDR preserved).
     preview_compat: bool = True
@@ -46,9 +53,10 @@ class ConversionResult:
     output_width: int
     output_height: int
     upscaling_factor: float
-    dlss_mode: str
-    dlss_model_preset: str = "Default"
-    applied_dlss_model_preset: int = 0
+    neural_dimensions: dict[str, int] | None = None
+    resize_method: str = "none"
+    memory_path: str = "host_staging"
+    bridge_status: dict | None = None
 
 
 @dataclass(slots=True)
@@ -72,3 +80,5 @@ class VideoBatchResult:
     failures: list[VideoConversionFailure]
     cancelled: bool
     manifest_path: str
+    archive_path: str | None = None
+    archive_error: str = ""

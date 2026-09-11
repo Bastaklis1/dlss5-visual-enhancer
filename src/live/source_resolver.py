@@ -7,6 +7,7 @@ from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlparse
 
+from ..core import app_log
 from ..core.jobs import Cancelled, JobController
 from ..core.paths import FFPROBE, YTDLP
 from .models import LIVE_SOURCE_QUALITY_CHOICES, ResolvedSource
@@ -97,7 +98,9 @@ def resolve_source(raw: str, max_height: int,
     if result.returncode:
         detail = "\n".join(result.stderr.strip().splitlines()[-4:])
         if "offline" in detail.lower() or "not currently live" in detail.lower():
+            app_log.error("live-yt-dlp", "channel offline", detail)
             raise RuntimeError("This channel is currently offline. Try again when the broadcast is live.")
+        app_log.error("live-yt-dlp", "could not resolve video", detail)
         raise RuntimeError(f"Could not resolve this video: {detail}")
     return _resolved_metadata(kind, json.loads(result.stdout))
 
@@ -123,6 +126,7 @@ def probe_source(source: ResolvedSource, controller: JobController, timeout: flo
         "-analyzeduration", "2000000", "-probesize", "5000000", "-show_streams", "-show_format",
         "-of", "json", source.video_url], controller, timeout + 10)
     if result.returncode:
+        app_log.error("live-ffprobe", "source probe failed", result.stderr.strip()[-500:])
         raise RuntimeError(f"Source probe failed: {result.stderr.strip()[-2000:]}")
     data = json.loads(result.stdout)
     video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
@@ -148,5 +152,11 @@ def probe_source(source: ResolvedSource, controller: JobController, timeout: flo
     duration = float((data.get("format") or {}).get("duration") or video.get("duration") or 0)
     if source.kind == "direct" and duration > 0:
         source.is_live = False
-    return {"width": width, "height": height, "rate": fps, "duration": duration,
+    return {"width": width, "height": height, "coded_width": int(video["width"]),
+            "coded_height": int(video["height"]), "rotation": rotation % 360,
+            "rate": fps, "duration": duration,
+            "color_space": video.get("color_space") or "unknown",
+            "color_range": video.get("color_range") or "unknown",
+            "color_primaries": video.get("color_primaries") or "unknown",
+            "color_transfer": video.get("color_transfer") or "unknown",
             "has_audio": bool(source.audio_url) or any(s.get("codec_type") == "audio" for s in data.get("streams", []))}

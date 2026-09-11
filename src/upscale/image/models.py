@@ -20,7 +20,7 @@ class ImageUpscaleOptions:
     quality: int = 95
     preserve_metadata: bool = True
     rename_mode: str = "Auto"
-    custom_suffix: str = "_RTXIMAGE"
+    custom_suffix: str = "_Upscale"
     ai_gpu_uuid: str = "auto"
 
     def validate(self, *, for_render: bool = True):

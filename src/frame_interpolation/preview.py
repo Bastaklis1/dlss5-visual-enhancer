@@ -94,7 +94,7 @@ def update_frame_interpolation_preview_mode(
     single = len(normalized) == 1
     label = "Input video preview" if len(normalized) <= 1 else f"Input video preview (first of {len(normalized)})"
     return (
-        gr.update(value=normalized[0] if available else None, visible=available, label=label),
+        gr.update(value=normalized[0] if available else None, visible=True if available else "hidden", label=label),
         gr.update(value=None, visible=True),
         gr.update(visible=single),
     )

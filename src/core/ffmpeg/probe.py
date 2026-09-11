@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -11,6 +12,7 @@ import av
 
 from ..paths import FFPROBE
 from ..jobs import Cancelled, JobController
+from .. import app_log
 
 def _run_json(
     command: list[str], *, strict_decode: bool = False,
@@ -42,8 +44,10 @@ def _run_json(
             errors.seek(max(0, size - 8000))
             details = errors.read().decode("utf-8", "replace").strip()
             if strict_decode and size:
+                app_log.error("ffprobe", "source decoding failed", details[-500:])
                 raise RuntimeError("Source decoding failed during frame-count verification:\n" + details)
             if process.returncode:
+                app_log.error("ffprobe", "media probe failed", details[-500:])
                 raise RuntimeError(details or "Media probe failed")
             return json.loads(stdout)
         finally:
@@ -59,6 +63,14 @@ def _run_json(
             if controller is not None:
                 controller.unregister(process)
 
+
+
+def _positive_float(value: object) -> float:
+    try:
+        number = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
 
 def _positive_count(value: object) -> int:
     try:
@@ -96,7 +108,7 @@ def probe_video(
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,time_base,duration,nb_frames,nb_read_frames,nb_read_packets,color_primaries,color_transfer,color_space:stream_tags=rotate:stream_side_data=rotation",
+            "stream=index,codec_name,width,height,avg_frame_rate,r_frame_rate,time_base,duration,nb_frames,nb_read_frames,nb_read_packets,color_range,color_primaries,color_transfer,color_space:stream_tags=rotate:stream_side_data=rotation",
             "-show_entries",
             "format=duration,format_name",
             "-of",
@@ -144,6 +156,9 @@ def probe_video(
     transfer = stream.get("color_transfer") or "unknown"
     primaries = stream.get("color_primaries") or "unknown"
     color_space = stream.get("color_space") or "unknown"
+    color_range = stream.get("color_range") or "unknown"
+    format_duration = _positive_float((data.get("format") or {}).get("duration"))
+    stream_duration = _positive_float(stream.get("duration"))
     return {
         "width": width,
         "height": height,
@@ -157,14 +172,15 @@ def probe_video(
         "nominal_rate": nominal_rate,
         "cfr": rate == nominal_rate,
         "time_base": Fraction(stream.get("time_base") or "1/1000"),
-        "duration": float(
-            (data.get("format") or {}).get("duration") or stream.get("duration") or 0
-        ),
+        "duration": format_duration or stream_duration,
+        "video_duration": stream_duration or format_duration,
+        "video_stream_duration": stream_duration,
         "codec": stream.get("codec_name") or "unknown",
         "format": (data.get("format") or {}).get("format_name") or "unknown",
         "color_transfer": transfer,
         "color_primaries": primaries,
         "color_space": color_space,
+        "color_range": color_range,
         "hdr": transfer in {"smpte2084", "arib-std-b67"},
     }
 

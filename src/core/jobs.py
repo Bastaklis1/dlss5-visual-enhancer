@@ -107,9 +107,8 @@ class BoundedLogBuffer:
 
     _IMPORTANT = (
         "profile applied",
-        "model preset",
-        "DLSS 5 add-on",
-        "carrier ready",
+        "bridge",
+        "ngx",
         "stream source",
         "optimal settings",
         "complete:",

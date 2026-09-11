@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from .. import app_log
 from ..paths import FFMPEG
 from .codecs import _base_codec
 
@@ -85,6 +86,8 @@ def make_browser_preview(
     dest_dir: str | Path | None = None,
     controller=None,
     *, sdr_filter: str | None = None,
+    max_seconds: float | None = None,
+    max_width: int | None = None,
 ) -> str:
     """Transcode an existing result file to a browser-playable H.264 MP4.
 
@@ -107,6 +110,11 @@ def make_browser_preview(
         counter += 1
         dest = out_dir / f"{src.stem}_BROWSERPREVIEW_{counter}.mp4"
     output_file = OutputFile(dest)
+    filters: list[str] = []
+    if sdr_filter:
+        filters.append(sdr_filter)
+    if max_width is not None and max_width > 0:
+        filters.append(f"scale=if(gt(iw\\,{int(max_width)})\\,{int(max_width)}\\,iw):-2")
     command = [
         str(FFMPEG),
         "-hide_banner",
@@ -115,11 +123,13 @@ def make_browser_preview(
         "-y",
         "-i",
         str(src),
+        *(["-t", f"{float(max_seconds):.6f}"] if max_seconds is not None and max_seconds > 0 else []),
         "-map",
         "0:v:0",
         "-map",
         "0:a?",
-        *(["-vf", sdr_filter, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"] if sdr_filter else []),
+        *(["-vf", ",".join(filters)] if filters else []),
+        *(["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv"] if sdr_filter else []),
         "-c:v",
         "libx264",
         "-preset",
@@ -146,6 +156,7 @@ def make_browser_preview(
             controller.register(process)
         _stdout, stderr = process.communicate()
         if process.returncode:
+            app_log.error("ffmpeg-preview", "browser preview transcode failed", (stderr or "")[-500:])
             raise RuntimeError("Browser preview transcode failed:\n" + (stderr or "")[-4000:])
         if not is_browser_playable(output_file.temporary):
             raise RuntimeError("Browser preview transcode produced an unplayable file.")
@@ -168,6 +179,7 @@ def resolve_final_preview(
     result_path: str | Path | None,
     mode: object,
     controller=None,
+    *, bounded_proxy: bool = False,
 ) -> tuple[str | None, bool]:
     """Decide which file the final-render in-app player should show.
 
@@ -194,7 +206,11 @@ def resolve_final_preview(
     except Exception:
         pass
     try:
-        derived = make_browser_preview(candidate, controller=controller)
+        derived = make_browser_preview(
+            candidate, controller=controller,
+            max_seconds=12.0 if bounded_proxy else None,
+            max_width=1280 if bounded_proxy else None,
+        )
     except Exception:
         # Never break the render status path: fall back to no in-app preview
         # (the real file is still in the download list).

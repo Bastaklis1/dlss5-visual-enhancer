@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from functools import lru_cache
 from pathlib import Path
 
 from ..jobs import BoundedLogBuffer, JobController, drain_bounded_text, drain_text
@@ -12,6 +13,7 @@ from .codecs import (
     resolve_encoding_quality,
 )
 
+@lru_cache(maxsize=128)
 def _encoder_probe(
     codec: str, width: int, height: int, gpu_ordinal: int | None = None
 ) -> bool:
@@ -41,6 +43,12 @@ def _encoder_probe(
         ).returncode
         == 0
     )
+
+
+@lru_cache(maxsize=16)
+def _cpu_encoder_available(codec: str) -> bool:
+    """Probe CPU encoder initialization once at a tiny resolution."""
+    return _encoder_probe(codec, 64, 64, None)
 
 
 # Legacy mapping kept for external callers; new display names use _NVENC_ENCODERS.
@@ -132,6 +140,8 @@ def _codec_command(
     require_nvenc: bool = False,
     hdr_mode: bool = False,
     hdr_metadata: dict | None = None,
+    *,
+    speed_profile: str = "default",
 ) -> tuple[list[str], str, dict]:
     """Return FFmpeg codec args for an explicit user-facing codec choice.
 
@@ -142,6 +152,10 @@ def _codec_command(
     When ``hdr_mode`` is True, output is 10-bit (yuv420p10le/p010le) and input
     colorspace is copied via ``hdr_metadata`` for HDR_ALLOWED_CODECS.
     """
+    if speed_profile not in {"default", "neural", "preview"}:
+        raise ValueError(f"Unknown encoder speed profile: {speed_profile!r}.")
+    software_preset = {"default": "slow", "neural": "medium", "preview": "veryfast"}[speed_profile]
+
     norm = _normalize_codec(codec)
     if hdr_mode and not _is_hdr_allowed_codec(norm):
         raise ValueError(
@@ -153,8 +167,16 @@ def _codec_command(
     # ProRes Proxy is always 10-bit; HDR just copies colorspace
     if norm == "ProRes Proxy":
         hdr_extra = _hdr_color_args(hdr_metadata) if hdr_mode and hdr_metadata else []
+        prores_quality = (
+            ["-bits_per_mb", str(int(quality["bits_per_mb"]))]
+            if quality.get("bits_per_mb") is not None
+            else []
+        )
         return (
-            ["-c:v", "prores_ks", "-profile:v", "0", "-pix_fmt", "yuv422p10le", *hdr_extra],
+            [
+                "-c:v", "prores_ks", "-profile:v", "0",
+                *prores_quality, "-pix_fmt", "yuv422p10le", *hdr_extra,
+            ],
             "prores_ks (Proxy)",
             quality,
         )
@@ -179,7 +201,7 @@ def _codec_command(
         if hdr_mode:
             raise ValueError("HDR Mode is not available for H.264; choose H.265/AV1/ProRes.")
         return (
-            ["-c:v", "libx264", "-preset", "slow", *software_quality, "-pix_fmt", "yuv420p"],
+            ["-c:v", "libx264", "-preset", software_preset, *software_quality, "-pix_fmt", "yuv420p"],
             "libx264",
             quality,
         )
@@ -195,12 +217,12 @@ def _codec_command(
             x265_extra = ["-x265-params", x265_params] if x265_params else []
             # For x265, use x265-params exclusively for HDR (generic breaks VUI)
             return (
-                ["-c:v", "libx265", "-preset", "slow", *software_quality, "-pix_fmt", pix_fmt, *x265_extra],
+                ["-c:v", "libx265", "-preset", software_preset, *software_quality, "-pix_fmt", pix_fmt, *x265_extra],
                 "libx265",
                 quality,
             )
         return (
-            ["-c:v", "libx265", "-preset", "slow", *software_quality, "-pix_fmt", pix_fmt, *hdr_color],
+            ["-c:v", "libx265", "-preset", software_preset, *software_quality, "-pix_fmt", pix_fmt, *hdr_color],
             "libx265",
             quality,
         )
@@ -211,7 +233,7 @@ def _codec_command(
             )
         pix_fmt = "yuv420p10le" if hdr_mode else "yuv420p"
         # Prefer libsvtav1 (fastest CPU AV1), fallback to libaom-av1
-        if _encoder_probe("libsvtav1", width, height):
+        if _cpu_encoder_available("libsvtav1"):
             if quality["mode"] == "constant-quality":
                 return (
                     ["-c:v", "libsvtav1", "-preset", "6", "-crf", "0", "-pix_fmt", pix_fmt, *hdr_color],
@@ -223,7 +245,7 @@ def _codec_command(
                 "libsvtav1",
                 quality,
             )
-        if _encoder_probe("libaom-av1", width, height):
+        if _cpu_encoder_available("libaom-av1"):
             if quality["mode"] == "constant-quality":
                 return (
                     ["-c:v", "libaom-av1", "-cpu-used", "4", "-crf", "0", "-b:v", "0", "-pix_fmt", pix_fmt, *hdr_color],
@@ -303,32 +325,75 @@ def start_encoder(
     hdr_metadata: dict | None = None,
     preserve_timestamps: bool = False,
     *, video_filter: str | None = None, keep_start_time: bool = False, bounded_logs: bool = False,
+    speed_profile: str = "default", source_audio: Path | None = None,
+    direct_container: str | None = None, comment: str | None = None,
+    audio_duration: float | None = None, include_source_metadata: bool = True,
 ):
     codec_args, selected, quality = _codec_command(
-        codec, quality_name, width, height, fps, gpu_ordinal, require_nvenc, hdr_mode, hdr_metadata
+        codec, quality_name, width, height, fps, gpu_ordinal, require_nvenc, hdr_mode, hdr_metadata,
+        speed_profile=speed_profile,
     )
-    command = [
-        str(FFMPEG),
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-y",
-        *(["-copyts"] if keep_start_time else []),
-        "-f",
-        "nut",
-        "-i",
-        "pipe:0",
-        "-map",
-        "0:v:0",
-        "-an",
-        *(["-vf", video_filter] if video_filter else []),
-        *codec_args,
-        "-fps_mode",
-        "passthrough",
-        *(["-enc_time_base:v", "demux"] if preserve_timestamps else []),
-        *(["-avoid_negative_ts", "disabled"] if keep_start_time else []),
-        str(temp_video),
-    ]
+    direct_mux = source_audio is not None and direct_container in {"MP4", "MOV"}
+    if direct_mux:
+        command = [
+            str(FFMPEG),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            *( ["-copyts"] if keep_start_time else [] ),
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            *( ["-t", f"{float(audio_duration):.9f}"] if audio_duration is not None and audio_duration > 0 else [] ),
+            "-i",
+            str(source_audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            *( ["-map_metadata", "1", "-map_chapters", "1"] if include_source_metadata else ["-map_metadata", "-1", "-map_chapters", "-1"] ),
+            *( ["-vf", video_filter] if video_filter else [] ),
+            *codec_args,
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-fps_mode",
+            "passthrough",
+            *( ["-enc_time_base:v", "demux"] if preserve_timestamps else [] ),
+            "-movflags",
+            "+faststart",
+            "-metadata:s:v:0",
+            "rotate=0",
+            *( ["-metadata", "comment=" + comment] if comment is not None else [] ),
+            *( ["-avoid_negative_ts", "disabled"] if keep_start_time else [] ),
+            str(temp_video),
+        ]
+    else:
+        command = [
+            str(FFMPEG),
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            *( ["-copyts"] if keep_start_time else [] ),
+            "-f",
+            "nut",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-an",
+            *( ["-vf", video_filter] if video_filter else [] ),
+            *codec_args,
+            "-fps_mode",
+            "passthrough",
+            *( ["-enc_time_base:v", "demux"] if preserve_timestamps else [] ),
+            *( ["-avoid_negative_ts", "disabled"] if keep_start_time else [] ),
+            str(temp_video),
+        ]
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,

@@ -49,5 +49,5 @@ def preview_mode(paths):
     available = bool(paths)
     single = len(paths) == 1
     label = "Input video preview" if len(paths) <= 1 else f"Input video preview (first of {len(paths)})"
-    return (gr.update(value=paths[0] if available else None, visible=available, label=label),
+    return (gr.update(value=paths[0] if available else None, visible=True if available else "hidden", label=label),
             gr.update(value=None, visible=True), gr.update(visible=single), gr.update(visible=single))

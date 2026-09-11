@@ -52,7 +52,7 @@ class FrameInterpolationOptions:
     quality: str = "Auto (Default)"
     hdr_mode: bool = False
     rename_mode: str = "Auto"
-    custom_suffix: str = "_DLSSFG"
+    custom_suffix: str = "_Frame_Interpolation"
     preview_seconds: float | None = None
     # True = truncated preview uses the forced H.264 SDR path (current behavior).
     # False = truncated preview uses the user's codec/container (HDR preserved).

@@ -8,6 +8,7 @@ from fractions import Fraction
 
 import numpy as np
 
+from ..core import app_log
 from ..core.jobs import Cancelled, JobController
 from .capabilities import DLSSG_WORKER, RUNTIME_DIR
 
@@ -106,6 +107,7 @@ class DirectDLSSGSession:
         )
         if magic != SETUP_OUT_MAGIC or status:
             self.close()
+            app_log.error("dlssg", f"DLSSG session creation failed (status {status})", self.log_text()[-500:])
             raise RuntimeError(
                 f"DLSSG session creation failed (status {status}); runtime maximum is "
                 f"{maximum + 1}×.\n{self.log_text()}"
@@ -165,6 +167,7 @@ class DirectDLSSGSession:
             "<4I", _read_exact(self.process.stdout, struct.calcsize("<4I"))
         )
         if magic != FRAME_OUT_MAGIC or status:
+            app_log.error("dlssg", f"DLSSG evaluation failed at frame {self._next_index - 1} (status {status})", self.log_text()[-500:])
             raise RuntimeError(
                 f"DLSSG evaluation failed at input frame {self._next_index - 1} "
                 f"(status {status}).\n{self.log_text()}"

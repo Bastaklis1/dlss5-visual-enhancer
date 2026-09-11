@@ -8,12 +8,6 @@ LIVE_MAX_HEIGHT_CHOICES = tuple(str(height) for height in LIVE_MAX_HEIGHTS)
 LIVE_SOURCE_QUALITY_CHOICES = ("Auto", *LIVE_MAX_HEIGHT_CHOICES)
 LIVE_SEGMENT_CHOICES = ("1", "2", "4")
 LIVE_FPS_CHOICES = ("Auto", "Source", "60", "30", "24")
-LIVE_GUIDE_CHOICES = ("Fast", "Quality")
-
-# Frame count reported to the native worker for endless sessions
-# (the worker treats it as informational).
-LIVE_FRAME_COUNT = 1_000_000_000
-
 
 @dataclass(slots=True)
 class LiveOptions:
@@ -23,21 +17,27 @@ class LiveOptions:
     max_height: int = 720
     # Shared DLSS values (mirrored with the Neural Rendering modes, persisted
     # globally); effects can update during playback, sizing stays fixed.
-    nr_preset: str = "Default"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
+    nr_passes: int = 1
     local_tone_strength: float = 1.0
     local_structure_strength: float = 1.0
     skin_structure_strength: float = -1.0
+    nr_color_strength: float = 1.0
+    tone_preservation: float = 0.0
+    face_skin_protection: float = 0.0
+    grain_preservation: float = 0.0
+    shimmer_suppression: float = 0.70
+    mask_feather: int = 0
+    nr_mask: object | None = None
     automatic_mask: bool = False
-    dlss_model_preset: str = "Default"
-    # Speed-first default: 720p in -> 1080p out keeps the pipe/NVENC cheap
-    # on mid-range GPUs (2x/3x cost ~2x the output bytes per frame).
-    upscaling_factor: float = 1.5
+    nr_gpu_mode: bool = True
+    # Source default: Live renders at the input size; 75%/50%/25% downscale
+    # first (Lanczos) and keep the pipe/NVENC cheap on mid-range GPUs.
+    upscaling_factor: float = 1.0
     segment_seconds: int = 2
     target_fps: str = "Auto"
     buffer_seconds: float = 6.0
-    guide_quality: str = "Fast"
     queue_frames: int = 3
     network_timeout: float = 20.0
     open_mpv: bool = True

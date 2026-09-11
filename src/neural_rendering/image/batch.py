@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 import time
 from contextlib import suppress
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import replace
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -17,15 +17,46 @@ from ...core.gpu_selection import resolve_runtime_ai_gpu
 from ...core.jobs import Cancelled, JobController, active_job
 from ...core.render_metadata import prepare_render_note
 from ...core.naming import output_filename, validate_rename
-from ...core.paths import LOGS, OUTPUTS
+from ...core.paths import OUTPUTS
 from ...core.runtime import (
     DLSSFrameSession, prepare_runtime, resize_fit, resolve_native_settings,
     resolve_output_size, resolve_upscaling_mode, verify_feature_18, write_failure_report,
 )
-from .decoder import decode_image
+from .decoder import _DecodedImage, decode_image
 from .encoder import _encode_image, take_image_preview
-from .models import IMAGE_EXTENSIONS, IMAGE_FORMATS, ImageBatchResult, ImageConversionFailure, ImageConversionOptions, ImageConversionResult
-from .reports import _build_manifest_and_zip, _report_data, _write_report
+from .models import (
+    IMAGE_EXTENSIONS, IMAGE_FORMATS, ImageBatchResult, ImageConversionFailure,
+    ImageConversionOptions, ImageConversionResult,
+)
+from .reports import (
+    IncrementalImageArchive, _ImageReportData, _SessionReportData, _build_manifest,
+    _report_data, _write_report, snapshot_session, update_report_performance,
+)
+
+
+@dataclass(slots=True)
+class _OutputTask:
+    index: int
+    path: Path
+    output: Path
+    processed: np.ndarray
+    metadata: dict[str, object]
+    report_data: _ImageReportData
+    session_data: _SessionReportData
+    evidence: dict[str, object]
+    gpu: dict[str, object]
+    input_width: int
+    input_height: int
+    render_width: int
+    render_height: int
+    output_width: int
+    output_height: int
+    resize_method: str
+    memory_path: str
+    bridge_status: dict[str, object]
+    source_warnings: list[str]
+    has_transparency: bool
+    timings: dict[str, float]
 
 
 def _validate_options(options: ImageConversionOptions) -> ImageConversionOptions:
@@ -53,6 +84,118 @@ def _output_path(source, output_format, stamp, index, rename_mode, custom_suffix
     )
 
 
+def _timed_decode(path: Path) -> tuple[_DecodedImage, float]:
+    started = time.monotonic()
+    decoded = decode_image(path)
+    return decoded, time.monotonic() - started
+
+
+def _finalize_output(
+    task: _OutputTask,
+    options: ImageConversionOptions,
+    reporter: BatchProgress,
+    controller: JobController,
+    generate_previews: bool,
+    archive: IncrementalImageArchive | None,
+) -> ImageConversionResult:
+    """CPU/I/O stage. Runs on exactly one bounded output worker."""
+    output_file = None
+    try:
+        if controller.cancel.is_set():
+            raise Cancelled("Image rendering stopped by user.")
+        reporter.advance(task.index, .80, "Encoding image")
+        output_file = OutputFile(task.output)
+        metadata_diagnostics: dict = {}
+        render_note = prepare_render_note(options, metadata_diagnostics)
+        warnings = _encode_image(
+            output_file.temporary,
+            task.processed,
+            options,
+            task.metadata,
+            generate_preview=generate_previews,
+            preview_path=task.output,
+            render_note=render_note,
+            metadata_diagnostics=metadata_diagnostics,
+            controller=controller,
+            has_transparency=task.has_transparency,
+            timings=task.timings,
+        )
+        warning = metadata_diagnostics.get("warning")
+        if warning and warning not in warnings:
+            warnings.append(warning)
+        if controller.cancel.is_set():
+            raise Cancelled("Image rendering stopped by user.")
+
+        reporter.advance(task.index, .95, "Writing diagnostic report")
+        result = ImageConversionResult(
+            input_path=str(task.path),
+            output_path=str(task.output),
+            report_path="",
+            elapsed_seconds=reporter.elapsed(task.index),
+            gpu=str(task.gpu["display_name"]),
+            input_width=task.input_width,
+            input_height=task.input_height,
+            render_width=task.render_width,
+            render_height=task.render_height,
+            output_width=task.output_width,
+            output_height=task.output_height,
+            upscaling_factor=float(options.upscaling_factor),
+            output_format=options.output_format,
+            neural_dimensions={"width": task.render_width, "height": task.render_height},
+            resize_method=task.resize_method,
+            memory_path=task.memory_path,
+            bridge_status=task.bridge_status,
+            warnings=[*task.source_warnings, *warnings],
+            timings=task.timings,
+        )
+        # Keep the externally reported GPU name identical to the selected GPU.
+        # The batch caller replaces the temporary value below before report write.
+        report_started = time.monotonic()
+        result.report_path = _write_report(
+            result, options, task.report_data,
+            task.gpu,
+            task.session_data, task.evidence,
+            metadata_diagnostics=metadata_diagnostics,
+        )
+        task.timings["report"] = time.monotonic() - report_started
+        if controller.cancel.is_set():
+            raise Cancelled("Image rendering stopped by user.")
+
+        publish_started = time.monotonic()
+        output_file.publish()
+        task.timings["publish"] = time.monotonic() - publish_started
+
+        # Archive work is deliberately after publication: cancellation or archive
+        # failure must never roll back a valid completed image.
+        if archive is not None:
+            archive_started = time.monotonic()
+            try:
+                archive.add(task.output)
+            except Cancelled:
+                pass
+            task.timings["archive"] = time.monotonic() - archive_started
+
+        result.elapsed_seconds = reporter.elapsed(task.index)
+        task.timings["total"] = result.elapsed_seconds
+        with suppress(Exception):
+            update_report_performance(result)
+        reporter.complete(
+            task.index, str(task.output),
+            "; ".join([*result.warnings, f"Report: {result.report_path}"]),
+        )
+        return result
+    except Exception:
+        if output_file is not None:
+            output_file.cleanup(rollback=True)
+        preview = take_image_preview(task.output)
+        if preview is not None:
+            preview.close()
+        raise
+    finally:
+        if output_file is not None:
+            output_file.cleanup()
+
+
 def convert_images(
     input_paths: Iterable[str | os.PathLike[str]],
     options: ImageConversionOptions | None = None,
@@ -68,130 +211,247 @@ def convert_images(
         raise ValueError("Choose at least one image.")
     controller = controller or JobController()
     reporter = BatchProgress(paths, on_item_update, progress)
-    successes, failures = [], []
-    session = None
+    successes: list[ImageConversionResult] = []
+    failures: list[ImageConversionFailure] = []
+    session: DLSSFrameSession | None = None
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
+    archive: IncrementalImageArchive | None = None
+    pending: tuple[int, Path, Future[ImageConversionResult]] | None = None
+
+    def collect_pending() -> None:
+        nonlocal pending
+        if pending is None:
+            return
+        index, path, future = pending
+        pending = None
+        try:
+            result = future.result()
+        except Exception as exc:
+            cancelled_item = isinstance(exc, Cancelled) or controller.cancel.is_set()
+            failures.append(ImageConversionFailure(str(path), str(exc)))
+            reporter.fail(index, exc, cancelled=cancelled_item)
+            if cancelled_item:
+                controller.stop()
+        else:
+            # Output tasks are submitted in input order and only one may be
+            # outstanding, so appending here preserves stable result ordering.
+            successes.append(result)
+
     try:
         destination = prepare_output_dir(output_dir, default=OUTPUTS)
-        LOGS.mkdir(exist_ok=True)
-        with active_job(controller), ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlss5-image-decode") as decoder:
+        if create_zip:
+            archive = IncrementalImageArchive(
+                destination / f"DLSS5_IMAGE_BATCH_{stamp}.zip", controller,
+            )
+        with (
+            active_job(controller),
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlss5-image-decode") as decoder,
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlss5-image-output") as output_worker,
+        ):
             if controller.cancel.is_set():
                 raise Cancelled("Stopped before rendering.")
             prepared = prepare_runtime()
             gpu = resolve_runtime_ai_gpu(prepared.gpus, prepared.runtime_bundle, options.ai_gpu_uuid)
             factor, mode = resolve_upscaling_mode(options.upscaling_factor)
             native = resolve_native_settings(options)
-            next_decode = None
-            session_size = None
+            next_decode: Future[tuple[_DecodedImage, float]] | None = None
+            session_size: tuple[int, int] | None = None
+            session_evidence: dict[str, object] | None = None
             sent = 0
             try:
                 for index, path in enumerate(paths):
                     if controller.cancel.is_set():
                         break
                     reporter.advance(index, 0.0, "Decoding image")
-                    output_file = None
-                    output = _output_path(path, options.output_format, stamp, index,
-                                          options.rename_mode, options.custom_suffix, output_dir=destination)
-                    decoded = processed = render_rgba = None
+                    output = _output_path(
+                        path, options.output_format, stamp, index,
+                        options.rename_mode, options.custom_suffix, output_dir=destination,
+                    )
+                    decoded = None
+                    render_rgba = None
+                    processed = None
+                    timings: dict[str, float] = {}
                     try:
-                        future = next_decode or decoder.submit(decode_image, path)
+                        future = next_decode or decoder.submit(_timed_decode, path)
                         next_decode = None
                         while True:
                             if controller.cancel.is_set():
                                 future.cancel()
                                 raise Cancelled("Image rendering stopped by user.")
                             try:
-                                decoded = future.result(timeout=.1)
+                                decoded, timings["decode"] = future.result(timeout=.1)
                                 break
                             except TimeoutError:
                                 continue
                         del future
-                        # Only one future image may be decoded ahead of the active file.
+                        # Decode only one future image ahead to keep memory bounded.
                         if index + 1 < len(paths):
-                            next_decode = decoder.submit(decode_image, paths[index + 1])
+                            next_decode = decoder.submit(_timed_decode, paths[index + 1])
+
                         height, width = decoded.rgba.shape[:2]
                         if width < 64 or height < 64:
-                            raise ValueError(f"{path.name} is {width}×{height}; DLSS requires at least 64×64.")
-                        output_width, output_height = resolve_output_size(width, height, options.upscaling_factor)
-                        output_file = OutputFile(output)
+                            raise ValueError(
+                                f"{path.name} is {width}×{height}; DLSS requires at least 64×64."
+                            )
+                        output_width, output_height = resolve_output_size(
+                            width, height, options.upscaling_factor,
+                        )
                         dimensions = (output_width, output_height)
                         if session is not None and dimensions != session_size:
+                            close_started = time.monotonic()
                             session.close()
+                            timings["previous_session_close"] = time.monotonic() - close_started
                             session = None
+                            session_evidence = None
+
                         if session is None:
-                            reporter.advance(index, .1, "Starting DLSS")
+                            reporter.advance(index, .10, "Starting D3D12/NGX bridge")
+                            setup_started = time.monotonic()
                             session = DLSSFrameSession(
-                                input_width=width, input_height=height,
-                                output_width=output_width, output_height=output_height,
-                                frame_count=None, warmup_frames=options.warmup_frames,
-                                factor=factor, mode=mode, native_settings=native, gpu=gpu,
-                                runtime_bundle=prepared.runtime_bundle, controller=controller,
+                                input_width=width,
+                                input_height=height,
+                                output_width=output_width,
+                                output_height=output_height,
+                                frame_count=None,
+                                warmup_frames=options.warmup_frames,
+                                factor=factor,
+                                mode=mode,
+                                native_settings=native,
+                                composition_mask=options.nr_mask,
+                                gpu=gpu,
+                                runtime_bundle=prepared.runtime_bundle,
+                                controller=controller,
                             )
+                            timings["dlss_setup"] = time.monotonic() - setup_started
                             session_size, sent = dimensions, 0
-                            motion = np.zeros((session.render_height, session.render_width, 2), dtype=np.float16)
+                            session_evidence = None
+
                         reporter.advance(index, .25, "Processing image")
-                        render_rgba = resize_fit(decoded.rgba, session.render_width, session.render_height)
-                        processed, _pts = session.process(index=sent, rgba=render_rgba, motion=motion, reset=True, pts=sent)
-                        sent += 1
-                        evidence = verify_feature_18(session.worker_logs, session.reshade_log_text())
-                        alpha = (decoded.alpha if decoded.alpha.shape == dimensions[::-1] else
-                                 cv2.resize(decoded.alpha, dimensions, interpolation=cv2.INTER_LANCZOS4))
-                        processed[..., 3] = alpha
-                        reporter.advance(index, .8, "Saving image")
-                        metadata_diagnostics = {}
-                        render_note = prepare_render_note(options, session.applied_dlss_model_preset,
-                                                          metadata_diagnostics)
-                        warnings = _encode_image(output_file.temporary, processed, options, decoded.metadata,
-                                                 generate_preview=generate_previews, preview_path=output,
-                                                 render_note=render_note, metadata_diagnostics=metadata_diagnostics,
-                                                 controller=controller)
-                        if metadata_diagnostics.get("warning") not in warnings and metadata_diagnostics.get("warning"):
-                            warnings.append(metadata_diagnostics["warning"])
-                        if controller.cancel.is_set():
-                            raise Cancelled("Image rendering stopped by user.")
-                        reporter.advance(index, .95, "Verifying image and writing report")
-                        if index == len(paths) - 1:
-                            session.close()
-                        result = ImageConversionResult(
-                            str(path), str(output), "", reporter.elapsed(index), str(gpu["display_name"]),
-                            width, height, session.render_width, session.render_height, output_width, output_height,
-                            float(options.upscaling_factor), str(session.mode["name"]), options.output_format,
-                            options.dlss_model_preset, session.applied_dlss_model_preset, [*decoded.warnings, *warnings],
+                        prep_started = time.monotonic()
+                        render_rgba = resize_fit(
+                            decoded.rgba, session.render_width, session.render_height,
                         )
-                        result.report_path = _write_report(result, options, _report_data(decoded), gpu, session, evidence,
-                                                          metadata_diagnostics=metadata_diagnostics)
+                        timings["render_prepare"] = time.monotonic() - prep_started
+
+                        dlss_started = time.monotonic()
+                        processed, _pts = session.process(
+                            index=sent, rgba=render_rgba, reset=True, pts=sent,
+                        )
+                        timings["dlss_evaluate"] = time.monotonic() - dlss_started
+                        sent += 1
+
+                        if session_evidence is None:
+                            evidence_started = time.monotonic()
+                            # Signed-runtime/setup evidence is session-invariant;
+                            # direct process() success still validates every image.
+                            session_evidence = verify_feature_18(
+                                session.bridge_logs, session.structured_status(),
+                            )
+                            timings["feature18_verify"] = time.monotonic() - evidence_started
+                        else:
+                            timings["feature18_verify"] = 0.0
+
+                        alpha_started = time.monotonic()
+                        if decoded.alpha is None:
+                            processed[..., 3] = 255
+                        elif decoded.alpha.shape == dimensions[::-1]:
+                            processed[..., 3] = decoded.alpha
+                        else:
+                            processed[..., 3] = cv2.resize(
+                                decoded.alpha, dimensions, interpolation=cv2.INTER_LANCZOS4,
+                            )
+                        timings["alpha"] = time.monotonic() - alpha_started
+
+                        session_data = snapshot_session(session)
+                        evidence_snapshot = dict(session_evidence)
+                        render_width = session.render_width
+                        render_height = session.render_height
+                        resize_method = "none" if factor == 1.0 else "lanczos"
+                        memory_path = session.diagnostics.memory_path
+                        bridge_status = session.structured_status()
+
+                        # Preserve the old invariant that the final image is not
+                        # published if native streaming completion fails.
+                        if index == len(paths) - 1:
+                            close_started = time.monotonic()
+                            session.close()
+                            timings["session_close"] = time.monotonic() - close_started
+                            session = None
+                            session_size = None
+                            session_evidence = None
+
+                        # This wait happens only after the current GPU evaluation,
+                        # overlapping image N CPU/I/O with image N+1 DLSS work while
+                        # bounding retained full-resolution outputs to one pending item.
+                        collect_pending()
                         if controller.cancel.is_set():
                             raise Cancelled("Image rendering stopped by user.")
-                        output_file.publish()
-                        successes.append(result)
-                        reporter.complete(index, str(output), "; ".join([*result.warnings, f"Report: {result.report_path}"]))
+
+                        task = _OutputTask(
+                            index=index,
+                            path=path,
+                            output=output,
+                            processed=processed,
+                            metadata=decoded.metadata,
+                            report_data=_report_data(decoded),
+                            session_data=session_data,
+                            evidence=evidence_snapshot,
+                            gpu=dict(gpu),
+                            input_width=width,
+                            input_height=height,
+                            render_width=render_width,
+                            render_height=render_height,
+                            output_width=output_width,
+                            output_height=output_height,
+                            resize_method=resize_method,
+                            memory_path=memory_path,
+                            bridge_status=bridge_status,
+                            source_warnings=list(decoded.warnings),
+                            has_transparency=decoded.alpha is not None,
+                            timings=timings,
+                        )
+                        pending = (
+                            index,
+                            path,
+                            output_worker.submit(
+                                _finalize_output, task, options, reporter, controller,
+                                generate_previews, archive,
+                            ),
+                        )
+                        # Ownership of the full output moves to the worker.
+                        processed = None
                     except Exception as exc:
-                        cancelled = isinstance(exc, Cancelled) or controller.cancel.is_set()
-                        if output_file is not None:
-                            output_file.cleanup(rollback=True)
-                        preview = take_image_preview(output)
-                        if preview is not None:
-                            preview.close()
+                        cancelled_item = isinstance(exc, Cancelled) or controller.cancel.is_set()
                         if session is not None:
                             session.abort()
-                            if not cancelled:
+                            if not cancelled_item:
                                 with suppress(Exception):
                                     report = write_failure_report(
-                                        operation="image-render", source=str(path), error=exc, gpu=gpu,
-                                        runtime_bundle=prepared.runtime_bundle, worker_logs=session.worker_logs,
-                                        reshade_lines=session.reshade_log_text().splitlines(), logs_dir=LOGS,
+                                        operation="image-render",
+                                        source=str(path),
+                                        error=exc,
+                                        gpu=gpu,
+                                        runtime_bundle=prepared.runtime_bundle,
+                                        bridge_status=session.structured_status(),
+                                        bridge_log=session.bridge_logs,
                                     )
-                                    exc = RuntimeError(f"{exc}\nDiagnostic report: {report}")
+                                    exc = RuntimeError(f"{exc}\nDetails: {report}")
                             session = None
+                            session_size = None
+                            session_evidence = None
                         failures.append(ImageConversionFailure(str(path), str(exc)))
-                        reporter.fail(index, exc, cancelled=cancelled)
-                        if cancelled:
+                        reporter.fail(index, exc, cancelled=cancelled_item)
+                        if cancelled_item:
                             controller.stop()
                             break
                     finally:
-                        if output_file is not None:
-                            output_file.cleanup()
-                        decoded = processed = render_rgba = None
+                        decoded = None
+                        render_rgba = None
+                        processed = None
+
+                # Drain the final output task. This does not reduce GPU overlap
+                # because there is no subsequent image to process.
+                collect_pending()
                 if session is not None and not session.closed:
                     if controller.cancel.is_set():
                         session.abort()
@@ -202,20 +462,29 @@ def convert_images(
                     next_decode.cancel()
                 if session is not None and not session.closed:
                     session.abort()
+                # ThreadPoolExecutor waits for a running output task; collect it
+                # before leaving so its success/failure reaches the manifest.
+                collect_pending()
+
         cancelled = controller.cancel.is_set()
         if cancelled:
             for item in reporter.items:
                 if item.state == "Queued":
                     failures.append(ImageConversionFailure(item.input_path, "Cancelled before rendering."))
             reporter.skip_from(0)
-        manifest, zip_path = _build_manifest_and_zip(
-            stamp, options, successes, failures, cancelled, create_zip=create_zip and not cancelled,
-            output_dir=destination, batch_diagnostics=reporter.diagnostics(final=True),
-            controller=controller,
+
+        zip_path = archive.finish(cancelled=cancelled) if archive is not None else None
+        archive_error = archive.error if archive is not None else None
+        manifest = _build_manifest(
+            stamp, options, successes, failures, cancelled,
+            output_dir=destination,
+            batch_diagnostics=reporter.diagnostics(final=True),
+            archive_error=archive_error,
         )
-        cancelled = controller.cancel.is_set()
         reporter.finish(cancelled=cancelled, manifest_path=manifest)
         return ImageBatchResult(successes, failures, cancelled, manifest, zip_path)
     except BaseException as exc:
+        if archive is not None and not archive.closed:
+            archive.abort()
         reporter.finish(cancelled=controller.cancel.is_set(), error=str(exc))
         raise

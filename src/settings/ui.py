@@ -20,32 +20,77 @@ from ..upscale.image.models import SETTING_FIELDS as IMAGE_UPSCALE_FIELDS, Image
 
 _CONFIG_LOCK = SETTINGS_STATE.lock
 UPSCALING_CHOICES = tuple((mode["label"], factor) for factor, mode in UPSCALING_MODES.items())
+_SKIN_STRUCTURE_INDEX = 5
+_AUTOMATIC_MASK_INDEX = 7
+_NR_COLOR_INDEX = 8
+_TONE_PRESERVATION_INDEX = 9
+PROCESSING_ENGINE_CHOICES = ("VRAM", "RAM")
+
+
+def processing_engine_choice(enabled: bool) -> str:
+    """Map the stored bool path to its visible VRAM/RAM label."""
+    return "VRAM" if enabled else "RAM"
+
+
+def parse_processing_engine(value: object) -> bool:
+    """Map the visible VRAM/RAM selection back to its stored bool path."""
+    if value not in PROCESSING_ENGINE_CHOICES:
+        choices = ", ".join(PROCESSING_ENGINE_CHOICES)
+        raise ValueError(f"Processing Engine Path must be one of: {choices}.")
+    return value == "VRAM"
+
+
+def automatic_mask_for_skin_input(
+    skin_structure_strength: float, automatic_mask: str,
+) -> str:
+    """Make an explicit Skin adjustment effective without overriding later Mask Off."""
+    try:
+        skin = float(skin_structure_strength)
+    except (TypeError, ValueError) as exc:
+        raise gr.Error("Skin Structure Strength must be between -1 and 2.") from exc
+    if not -1.0 <= skin <= 2.0:
+        raise gr.Error("Skin Structure Strength must be between -1 and 2.")
+    return "On" if skin > -1.0 else automatic_mask
+
+
+def _persist_skin_input(persist, values: tuple) -> tuple:
+    effective = list(values)
+    effective[_AUTOMATIC_MASK_INDEX] = automatic_mask_for_skin_input(
+        effective[_SKIN_STRUCTURE_INDEX], effective[_AUTOMATIC_MASK_INDEX]
+    )
+    mirrored = persist(*effective)
+    return (effective[_AUTOMATIC_MASK_INDEX], *mirrored)
+
 
 def _neural_values(
     settings: UISettings,
-) -> tuple[str, str, float, float, float, float, float, str]:
+) -> tuple[str, float, int, float, float, float, float, str, float, float, float, float, int]:
     return (
-        settings.nr_preset,
         settings.nr_style,
         settings.nr_intensity,
+        settings.nr_passes,
         settings.local_tone_strength,
         settings.local_structure_strength,
         settings.skin_structure_strength,
         settings.upscaling_factor,
         automatic_mask_choice(settings.automatic_mask),
+        settings.nr_color_strength,
+        settings.tone_preservation,
+        settings.face_skin_protection,
+        settings.grain_preservation,
+        settings.mask_feather,
     )
 
 
-def _shared_dlss_values(
-    settings: UISettings,
-) -> tuple[str, str, float, float, float, float, float, str, str]:
-    return (*_neural_values(settings), settings.dlss_model_preset)
-
-
 def _mirrored_dlss_values(settings: UISettings) -> tuple:
-    """Shared 9-tuple twice: feeds the Image and Video mode controls."""
-    shared = _shared_dlss_values(settings)
-    return (*shared, *shared)
+    """Image controls followed by temporal Video/Live controls."""
+    shared = _neural_values(settings)
+    temporal = (*shared, settings.shimmer_suppression)
+    return (*shared, *temporal)
+
+
+def _video_live_values(settings: UISettings) -> tuple:
+    return (*_neural_values(settings), settings.shimmer_suppression)
 
 
 def _notify_live_effects(settings: UISettings) -> None:
@@ -57,15 +102,19 @@ def _notify_live_effects(settings: UISettings) -> None:
 
 
 def persist_image_settings(
-    nr_preset: str,
     nr_style: str,
     nr_intensity: float,
+    nr_passes: float,
     local_tone_strength: float,
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
-    dlss_model_preset: str,
+    nr_color_strength: float,
+    tone_preservation: float,
+    face_skin_protection: float,
+    grain_preservation: float,
+    mask_feather: float,
     image_format: str,
     image_quality: float,
     rename_mode: str,
@@ -75,15 +124,19 @@ def persist_image_settings(
         current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
         settings = replace(
             current,
-            nr_preset=nr_preset,
             nr_style=nr_style,
             nr_intensity=nr_intensity,
+            nr_passes=int(nr_passes),
             local_tone_strength=local_tone_strength,
             local_structure_strength=local_structure_strength,
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
             automatic_mask=parse_automatic_mask(automatic_mask),
-            dlss_model_preset=dlss_model_preset,
+            nr_color_strength=float(nr_color_strength),
+            tone_preservation=float(tone_preservation),
+            face_skin_protection=float(face_skin_protection),
+            grain_preservation=float(grain_preservation),
+            mask_feather=int(mask_feather),
             image_format=image_format,
             image_quality=int(image_quality),
             image_rename_mode=rename_mode,
@@ -93,19 +146,25 @@ def persist_image_settings(
             save_settings(CONFIG_PATH, settings)
         SETTINGS_STATE.current = settings
         _notify_live_effects(settings)
-    return _mirrored_dlss_values(settings)
+    temporal = _video_live_values(settings)
+    return (*temporal, *temporal)
 
 
 def persist_video_settings(
-    nr_preset: str,
     nr_style: str,
     nr_intensity: float,
+    nr_passes: float,
     local_tone_strength: float,
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
-    dlss_model_preset: str,
+    nr_color_strength: float,
+    tone_preservation: float,
+    face_skin_protection: float,
+    grain_preservation: float,
+    mask_feather: float,
+    shimmer_suppression: float,
     codec: str,
     container: str,
     quality: str,
@@ -118,15 +177,20 @@ def persist_video_settings(
         coerced_hdr = coerce_hdr_mode(codec, hdr_mode)
         settings = replace(
             current,
-            nr_preset=nr_preset,
             nr_style=nr_style,
             nr_intensity=nr_intensity,
+            nr_passes=int(nr_passes),
             local_tone_strength=local_tone_strength,
             local_structure_strength=local_structure_strength,
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
             automatic_mask=parse_automatic_mask(automatic_mask),
-            dlss_model_preset=dlss_model_preset,
+            nr_color_strength=float(nr_color_strength),
+            tone_preservation=float(tone_preservation),
+            face_skin_protection=float(face_skin_protection),
+            grain_preservation=float(grain_preservation),
+            mask_feather=int(mask_feather),
+            shimmer_suppression=float(shimmer_suppression),
             codec=codec,
             container=container,
             quality=quality,
@@ -138,39 +202,106 @@ def persist_video_settings(
             save_settings(CONFIG_PATH, settings)
         SETTINGS_STATE.current = settings
         _notify_live_effects(settings)
-    return _mirrored_dlss_values(settings)
+    return (*_neural_values(settings), *_video_live_values(settings))
 
 
 def persist_live_settings(
-    nr_preset: str,
     nr_style: str,
     nr_intensity: float,
+    nr_passes: float,
     local_tone_strength: float,
     local_structure_strength: float,
     skin_structure_strength: float,
     upscaling_factor: float,
     automatic_mask: str,
-    dlss_model_preset: str,
+    nr_color_strength: float,
+    tone_preservation: float,
+    face_skin_protection: float,
+    grain_preservation: float,
+    mask_feather: float,
+    shimmer_suppression: float,
 ) -> tuple:
     with _CONFIG_LOCK:
         current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
         settings = replace(
             current,
-            nr_preset=nr_preset,
             nr_style=nr_style,
             nr_intensity=nr_intensity,
+            nr_passes=int(nr_passes),
             local_tone_strength=local_tone_strength,
             local_structure_strength=local_structure_strength,
             skin_structure_strength=skin_structure_strength,
             upscaling_factor=upscaling_factor,
             automatic_mask=parse_automatic_mask(automatic_mask),
-            dlss_model_preset=dlss_model_preset,
+            nr_color_strength=float(nr_color_strength),
+            tone_preservation=float(tone_preservation),
+            face_skin_protection=float(face_skin_protection),
+            grain_preservation=float(grain_preservation),
+            mask_feather=int(mask_feather),
+            shimmer_suppression=float(shimmer_suppression),
         )
         if settings != current:
             save_settings(CONFIG_PATH, settings)
         SETTINGS_STATE.current = settings
         _notify_live_effects(settings)
-    return _mirrored_dlss_values(settings)
+    return (*_neural_values(settings), *_video_live_values(settings))
+
+
+def persist_image_skin_settings(*values) -> tuple:
+    return _persist_skin_input(persist_image_settings, values)
+
+
+def persist_video_skin_settings(*values) -> tuple:
+    return _persist_skin_input(persist_video_settings, values)
+
+
+def persist_live_skin_settings(*values) -> tuple:
+    return _persist_skin_input(persist_live_settings, values)
+
+
+def persist_nr_mask(selection: object | None) -> None:
+    """Update session-only mask state without writing its temporary path to disk."""
+    from ..core.nr_composition import mask_selection
+
+    selected = mask_selection(selection)
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, nr_mask=selected)
+        SETTINGS_STATE.current = settings
+        _notify_live_effects(settings)
+
+
+def apply_detail_only_settings() -> tuple:
+    """Apply the editable Detail-Only preset to every mirrored interface."""
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, nr_color_strength=0.0, tone_preservation=1.0)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+        _notify_live_effects(settings)
+    shared = _neural_values(settings)
+    temporal = _video_live_values(settings)
+    return (*shared, *temporal, *temporal)
+
+
+def persist_nr_gpu_mode(selection: object) -> bool:
+    """Persist the global Processing Engine Path switch and update Live effects."""
+    if isinstance(selection, bool):
+        enabled = selection
+    else:
+        try:
+            enabled = parse_processing_engine(selection)
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, nr_gpu_mode=enabled)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+        _notify_live_effects(settings)
+    return enabled
 
 
 def persist_frame_interpolation_settings(
@@ -249,10 +380,11 @@ def persist_upscale_mode(mode: str) -> None:
 
 
 def _settings_component_values(settings: UISettings) -> tuple:
-    shared = _shared_dlss_values(settings)
+    shared = _neural_values(settings)
+    temporal = _video_live_values(settings)
     return (
         *shared,
-        *shared,
+        *temporal,
         settings.image_format,
         settings.image_quality,
         settings.image_rename_mode,
@@ -283,7 +415,10 @@ def _settings_component_values(settings: UISettings) -> tuple:
         settings.ai_gpu_uuid,
         settings.video_gpu_uuid,
         settings.preview_encoding,
-        *shared,
+        settings.full_size_image_previews,
+        processing_engine_choice(settings.nr_gpu_mode),
+        settings.nr_gpu_mode,
+        *temporal,
         settings.upscale_mode,
         *(getattr(settings, "upscale_" + name) for name in SETTING_FIELDS),
         *(getattr(settings, "upscale_image_" + name) for name in IMAGE_UPSCALE_FIELDS),
@@ -336,6 +471,17 @@ def persist_preview_encoding(preview_encoding: str) -> None:
         SETTINGS_STATE.current = settings
 
 
+def persist_full_size_image_previews(enabled: bool) -> None:
+    if not isinstance(enabled, bool):
+        raise gr.Error("Full size quality preview must be enabled or disabled.")
+    with _CONFIG_LOCK:
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        settings = replace(current, full_size_image_previews=enabled)
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+
+
 def persist_gpu_settings(ai_gpu_uuid: str, video_gpu_uuid: str) -> str:
     prepared = prepare_runtime()
     ai_choices, video_choices = _gpu_choices(prepared)
@@ -362,12 +508,16 @@ def persist_gpu_settings(ai_gpu_uuid: str, video_gpu_uuid: str) -> str:
 
 def reset_saved_settings() -> tuple:
     with _CONFIG_LOCK:
-        save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
-        SETTINGS_STATE.current = DEFAULT_SETTINGS
-        _notify_live_effects(DEFAULT_SETTINGS)
+        current = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+        # Custom NR Mask is session-scoped, so resetting persisted controls must
+        # not silently detach the mask that remains visible in all three tabs.
+        settings = replace(DEFAULT_SETTINGS, nr_mask=current.nr_mask)
+        save_settings(CONFIG_PATH, settings)
+        SETTINGS_STATE.current = settings
+        _notify_live_effects(settings)
     message = "All Neural Rendering, Upscale, and Frame Interpolation settings were reset to defaults."
     return (
-        *_settings_component_values(DEFAULT_SETTINGS),
+        *_settings_component_values(settings),
         message,
         message,
         message,
@@ -429,6 +579,9 @@ class SettingsTab:
     ai_gpu_selector: object
     video_gpu_selector: object
     preview_encoding_selector: object
+    full_size_image_previews: object
+    gpu_mode: object
+    processing_engine_state: object
     preset_name: object
     preset_export: object
     preset_import: object
@@ -454,51 +607,43 @@ def build_settings_tab(
     settings: UISettings,
     ai_gpu_choices: list[tuple[str, str]],
     video_gpu_choices: list[tuple[str, str]],
+    processing_engine_state: object,
 ) -> SettingsTab:
-    gr.Markdown(
-        "## GPU Selection\n"
-        "AI Processing controls DLSS, RTX Video, and Frame Generation. Video Processing "
-        "controls only codecs suffixed (NVIDIA NVENC); plain H.264/H.265/AV1 and ProRes remain CPU-based."
-    )
+    gr.Markdown("## GPU Selection")
     with gr.Row():
         ai_gpu_selector = gr.Dropdown(
             choices=ai_gpu_choices,
             value=settings.ai_gpu_uuid,
             label="AI Processing GPU",
-            info="Used for DLSS Neural Rendering, RTX Video, and Frame Generation.",
         )
         video_gpu_selector = gr.Dropdown(
             choices=video_gpu_choices,
             value=settings.video_gpu_uuid,
             label="Video Processing GPU",
-            info="Used only for codecs suffixed (NVIDIA NVENC); plain H.264/H.265/AV1 and ProRes stay on CPU.",
         )
-    gr.Markdown(
-        "## Preview Encoding\n"
-        "Controls how in-app video previews are produced for Neural Rendering's Video mode, "
-        "Upscale, and Frame Interpolation (preview buttons and final-render player)."
+    gr.Markdown("## Processing Engine Path")
+    gpu_mode = gr.Radio(
+        choices=list(PROCESSING_ENGINE_CHOICES),
+        value=processing_engine_choice(settings.nr_gpu_mode),
+        label="Processing Engine Path",
+        show_label=False,
     )
+    gr.Markdown("## Preview Encoding")
     preview_encoding_selector = gr.Radio(
         choices=list(PREVIEW_ENCODING_CHOICES),
         value=normalize_preview_encoding(settings.preview_encoding),
         label="Preview Encoding",
-        info=(
-            "Auto uses the result directly when the browser can play it (MP4 + H.264, "
-            "verified by probe); otherwise creates an H.264 preview. "
-            "Always H.264 always generates a browser-compatible preview. "
-            "Disabled never creates one and sends the actual file to the browser. "
-            "Non-H.264 previews can be slower and larger."
-        ),
+        show_label=False,
     )
-    gr.Markdown(
-        "## Settings Presets\n"
-        "Export every adjustable option from Neural Rendering's Image and Video modes, "
-        "Upscale, and Frame Interpolation, or import a preset to apply it everywhere."
+    gr.Markdown("## Image Preview Quality")
+    full_size_image_previews = gr.Checkbox(
+        value=settings.full_size_image_previews,
+        label="Full size quality preview",
     )
+    gr.Markdown("## Settings Presets")
     preset_name = gr.Textbox(
         label="Preset name",
-        placeholder="Cinematic 2",
-        info="The exported file uses this name; the original name is stored in JSON.",
+        placeholder="Preset 13",
     )
     with gr.Row():
         preset_export = gr.DownloadButton(
@@ -518,8 +663,8 @@ def build_settings_tab(
         )
     preset_status = gr.Markdown("", elem_id="preset-status")
     return SettingsTab(
-        ai_gpu_selector, video_gpu_selector, preview_encoding_selector,
-        preset_name, preset_export, preset_import, preset_status
+        ai_gpu_selector, video_gpu_selector, preview_encoding_selector, full_size_image_previews,
+        gpu_mode, processing_engine_state, preset_name, preset_export, preset_import, preset_status
     )
 
 
@@ -527,9 +672,7 @@ def build_settings_tab(
 def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, live_tab, upscale_tab) -> list[object]:
     return [
         *image_tab.neural,
-        image_tab.model_preset,
         *video_tab.neural,
-        video_tab.model_preset,
         image_tab.output_format,
         image_tab.quality,
         image_tab.rename_mode,
@@ -551,8 +694,10 @@ def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, li
         settings_tab.ai_gpu_selector,
         settings_tab.video_gpu_selector,
         settings_tab.preview_encoding_selector,
+        settings_tab.full_size_image_previews,
+        settings_tab.gpu_mode,
+        settings_tab.processing_engine_state,
         *live_tab.neural,
-        live_tab.model_preset,
         upscale_tab.mode,
         *upscale_tab.video.settings_inputs,
         *upscale_tab.image.settings_inputs,
@@ -560,10 +705,12 @@ def settings_component_outputs(image_tab, video_tab, frame_tab, settings_tab, li
 
 
 def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab, upscale_tab) -> None:
-    video_mirror = [*video_tab.neural, video_tab.model_preset]
-    image_mirror = [*image_tab.neural, image_tab.model_preset]
-    live_mirror = [*live_tab.neural, live_tab.model_preset]
+    video_mirror = [*video_tab.neural]
+    image_mirror = [*image_tab.neural]
+    live_mirror = [*live_tab.neural]
     for component in image_tab.settings_inputs:
+        if component is image_tab.neural[_SKIN_STRUCTURE_INDEX]:
+            continue
         component.input(
             persist_image_settings,
             inputs=image_tab.settings_inputs,
@@ -571,6 +718,8 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab
             queue=False,
         )
     for component in video_tab.settings_inputs:
+        if component is video_tab.neural[_SKIN_STRUCTURE_INDEX]:
+            continue
         component.input(
             persist_video_settings,
             inputs=video_tab.settings_inputs,
@@ -578,11 +727,43 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab
             queue=False,
         )
     for component in live_tab.settings_inputs:
+        if component is live_tab.neural[_SKIN_STRUCTURE_INDEX]:
+            continue
         component.input(
             persist_live_settings,
             inputs=live_tab.settings_inputs,
             outputs=[*image_mirror, *video_mirror],
             queue=False,
+        )
+    image_tab.neural[_SKIN_STRUCTURE_INDEX].input(
+        persist_image_skin_settings,
+        inputs=image_tab.settings_inputs,
+        outputs=[image_tab.neural[_AUTOMATIC_MASK_INDEX], *video_mirror, *live_mirror],
+        queue=False,
+    )
+    video_tab.neural[_SKIN_STRUCTURE_INDEX].input(
+        persist_video_skin_settings,
+        inputs=video_tab.settings_inputs,
+        outputs=[video_tab.neural[_AUTOMATIC_MASK_INDEX], *image_mirror, *live_mirror],
+        queue=False,
+    )
+    live_tab.neural[_SKIN_STRUCTURE_INDEX].input(
+        persist_live_skin_settings,
+        inputs=live_tab.settings_inputs,
+        outputs=[live_tab.neural[_AUTOMATIC_MASK_INDEX], *image_mirror, *video_mirror],
+        queue=False,
+    )
+    detail_outputs = [*image_tab.neural, *video_tab.neural, *live_tab.neural]
+    for button in (
+        image_tab.composition.detail_only,
+        video_tab.composition.detail_only,
+        live_tab.composition.detail_only,
+    ):
+        button.click(
+            apply_detail_only_settings,
+            outputs=detail_outputs,
+            queue=False,
+            show_progress="hidden",
         )
     for component in frame_tab.settings_inputs:
         component.input(
@@ -623,6 +804,17 @@ def bind_settings_events(settings_tab, image_tab, video_tab, frame_tab, live_tab
     settings_tab.preview_encoding_selector.input(
         persist_preview_encoding,
         inputs=settings_tab.preview_encoding_selector,
+        queue=False,
+    )
+    settings_tab.full_size_image_previews.input(
+        persist_full_size_image_previews,
+        inputs=settings_tab.full_size_image_previews,
+        queue=False,
+    )
+    settings_tab.gpu_mode.input(
+        persist_nr_gpu_mode,
+        inputs=settings_tab.gpu_mode,
+        outputs=settings_tab.processing_engine_state,
         queue=False,
     )
     reset_outputs = [*outputs, image_tab.status, video_tab.status, frame_tab.status, upscale_tab.video.status, upscale_tab.image.status]

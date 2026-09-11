@@ -2,9 +2,22 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from pathlib import Path
 
+from ..core.jobs import BoundedLogBuffer, drain_bounded_text
 from ..core.paths import MPV, YTDLP
+
+
+def mpv_tail(process: subprocess.Popen | None, limit: int = 12) -> str:
+    """Return the last captured MPV stderr lines (empty when unavailable)."""
+    logs = getattr(process, "_dlss5_err", None)
+    if logs is None:
+        return ""
+    try:
+        return "\n".join(logs.snapshot()[-limit:])
+    except Exception:
+        return ""
 
 
 def check_live_binaries(*, resolve_pages: bool, play: bool) -> None:
@@ -60,13 +73,23 @@ def launch_mpv(
     ]
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        return subprocess.Popen(
+        process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             env=env,
             creationflags=creation_flags,
         )
     except OSError as exc:
         raise RuntimeError(f"Could not launch MPV: {exc}.") from exc
+    try:
+        logs = BoundedLogBuffer(max_tail=60)
+        assert process.stderr is not None
+        threading.Thread(
+            target=drain_bounded_text, args=(process.stderr, logs), daemon=True
+        ).start()
+        process._dlss5_err = logs  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return process

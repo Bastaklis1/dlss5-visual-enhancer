@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from ...core.batch_progress import BatchItemUpdate, BatchProgress
-from ...core.disk_paths import prepare_output_dir
+from ...core.disk_paths import StreamingMediaArchive, prepare_output_dir
 from ...core.jobs import Cancelled, JobController, active_job
-from ...core.paths import LOGS
 from ...core.runtime import prepare_runtime
 from .models import ConversionOptions, VideoBatchResult, VideoConversionFailure, VideoConversionSuccess
 from . import processor
@@ -23,6 +22,7 @@ def convert_videos(
     *, output_dir: str | os.PathLike[str] | None = None,
     controller: JobController | None = None,
     on_item_update: Callable[[BatchItemUpdate], None] | None = None,
+    create_archive: bool = False,
 ) -> VideoBatchResult:
     """Render in input order, publishing a completed row before starting the next file."""
     options = replace(options) if options else ConversionOptions()
@@ -32,9 +32,16 @@ def convert_videos(
     controller = controller or JobController()
     reporter = BatchProgress(paths, on_item_update, progress)
     successes, failures = [], []
+    archive: StreamingMediaArchive | None = None
+    archive_path: str | None = None
+    archive_error = ""
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
     try:
         destination = prepare_output_dir(output_dir, default=processor.OUTPUTS)
+        if create_archive and len(paths) > 1:
+            archive = StreamingMediaArchive(
+                destination, "DLSS5_VIDEO_BATCH", controller=controller
+            )
         with active_job(controller):
             if controller.cancel.is_set():
                 raise Cancelled("Stopped before rendering.")
@@ -61,6 +68,9 @@ def convert_videos(
                     else:
                         successes.append(VideoConversionSuccess(index, str(path), result))
                         reporter.complete(index, result.output_path, f"{result.frames} frames; report: {result.report_path}")
+                        if archive is not None and not archive.add(result.output_path):
+                            if archive.error is not None and not archive_error:
+                                archive_error = str(archive.error)
             finally:
                 del processor._BATCH_CONTEXT.controller
                 del processor._BATCH_CONTEXT.prepared_runtime
@@ -70,11 +80,28 @@ def convert_videos(
                 if item.state == "Queued":
                     failures.append(VideoConversionFailure(item.index, item.input_path, "Cancelled before rendering.", True))
             reporter.skip_from(0)
-        manifest = _write_video_batch_manifest(stamp, options, successes, failures, cancelled,
-                                              batch_diagnostics=reporter.diagnostics(final=True),
-                                              output_dir=str(destination))
+        if archive is not None:
+            try:
+                archive_path = archive.close(publish=len(successes) > 1)
+            except Exception as exc:
+                archive_error = str(exc)
+                archive_path = None
+        diagnostics = reporter.diagnostics(final=True)
+        if archive_error:
+            diagnostics["archive_error"] = archive_error
+        manifest = _write_video_batch_manifest(
+            stamp, options, successes, failures, cancelled,
+            batch_diagnostics=diagnostics, output_dir=str(destination)
+        )
         reporter.finish(cancelled=cancelled, manifest_path=manifest)
-        return VideoBatchResult(successes, failures, cancelled, manifest)
+        return VideoBatchResult(
+            successes, failures, cancelled, manifest, archive_path, archive_error
+        )
     except BaseException as exc:
+        if archive is not None:
+            try:
+                archive.abort()
+            except Exception:
+                pass
         reporter.finish(cancelled=controller.cancel.is_set(), error=str(exc))
         raise

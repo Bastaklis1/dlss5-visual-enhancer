@@ -4,17 +4,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import gradio as gr
+from PIL import Image
 
 from ...core.batch_ui import (BATCH_HEADERS, bind_batch_ui, build_media_clear_button,
-                             build_media_select_button, build_path_controls)
-from ...core.disk_paths import create_media_archive, resolve_inputs
+                             build_media_select_button, build_path_controls, build_save_controls)
+from ...core.disk_paths import resolve_inputs
 from ...core.naming import RENAME_MODES
-from ...neural_rendering.image.decoder import decode_image
+from ...neural_rendering.image.decoder import decode_image, full_size_image_preview_path
 from ...neural_rendering.image.encoder import take_image_preview
 from ...neural_rendering.image.models import RAW_EXTENSIONS
 from ...neural_rendering.image.ui import preview_input_images
-from ...settings.storage import processing_gpu_settings
+from ...settings.storage import full_size_image_previews_enabled, processing_gpu_settings
 from .batch import upscale_images
+from .processor import preview_upscale_image
 from .models import (IMAGE_FORMATS, SCALE_FACTORS, SETTING_FIELDS, SIZE_MODES, VSR_QUALITIES,
                      ImageUpscaleOptions, options_from_settings, output_size)
 
@@ -27,23 +29,50 @@ def options_from_values(values):
 
 def render_image_batch(paths, *values, progress=None, output_dir=None, controller=None,
                        on_item_update=None, direct_disk=False):
-    result = upscale_images(paths, options_from_values(values), progress, output_dir=output_dir,
-                            controller=controller, on_item_update=on_item_update, generate_previews=not direct_disk)
+    full_size = full_size_image_previews_enabled()
+    result = upscale_images(
+        paths, options_from_values(values), progress, output_dir=output_dir,
+        controller=controller, on_item_update=on_item_update,
+        generate_previews=not direct_disk and not full_size,
+    )
     gallery = []
     if not direct_disk:
         for item in result.successes:
-            preview = take_image_preview(item.output_path)
-            if preview is not None:
-                gallery.append((preview, Path(item.output_path).name))
-    archive_path = None
-    if not direct_disk and not result.cancelled:
-        archive_path = create_media_archive(
-            (item.output_path for item in result.successes),
-            output_dir,
-            "RTXVIDEO_IMAGE_BATCH",
-            controller=controller,
-        )
-    return gallery, archive_path, [], str(result.manifest_path)
+            preview = None
+            if full_size:
+                try:
+                    preview = full_size_image_preview_path(item.output_path)
+                except Exception:
+                    preview = None
+            else:
+                preview = take_image_preview(item.output_path)
+            if preview is None:
+                try:
+                    with Image.open(item.output_path) as output:
+                        preview = output.convert("RGBA")
+                        preview.thumbnail((1200, 900), Image.Resampling.BILINEAR)
+                        preview = preview.copy()
+                except Exception:
+                    continue
+            gallery.append((preview, Path(item.output_path).name))
+    files = [item.output_path for item in result.successes]
+    return gallery, files, [], str(result.manifest_path)
+
+
+def preview_image(paths, *values, progress=gr.Progress(track_tqdm=False)):
+    selected = [paths] if isinstance(paths, str) else list(paths or [])
+    if len(selected) != 1:
+        raise gr.Error("Choose exactly one image to preview.")
+    full_size = full_size_image_previews_enabled()
+    image, status = preview_upscale_image(
+        selected[0], options_from_values(values),
+        progress=lambda value, message: progress(value, desc=message),
+        full_size_preview=full_size,
+    )
+    return (
+        gr.update(value=[(image, f"Preview — {Path(selected[0]).name}")], visible=True),
+        status,
+    )
 
 
 def describe_size(paths, input_path, *values):
@@ -77,7 +106,7 @@ def build_image_tab(settings):
                               elem_classes=["media-upload-surface"])
             input_gallery = gr.Gallery(
                 label="Input images", columns=3, height=520, object_fit="contain",
-                visible=False, interactive=False, type="pil", buttons=["fullscreen"],
+                visible="hidden", interactive=False, type="pil", buttons=["fullscreen"],
                 elem_id="upscale-image-input-preview",
             )
             with gr.Row(visible=False, elem_classes=["media-input-actions"]) as input_actions:
@@ -85,8 +114,12 @@ def build_image_tab(settings):
                     "Choose Images", upload_types, "upscale-image-select-input",
                 )
                 clear_source = build_media_clear_button("upscale-image-clear-input")
-            input_path, output_path = build_path_controls()
-            with gr.Accordion("RTX Video Super Resolution", open=True, elem_id="upscale-image-vsr-box"):
+            with gr.Row():
+                render = gr.Button("Upscale image(s)", variant="primary")
+                stop = gr.Button("Stop", variant="stop")
+                preview = gr.Button("Preview", visible=False)
+                reset = gr.Button("Reset settings")
+            with gr.Column(elem_id="upscale-image-vsr-box"):
                 c["vsr_quality"] = gr.Dropdown(VSR_QUALITIES, value=opts.vsr_quality, label="VSR quality")
                 c["size_mode"] = gr.Radio(SIZE_MODES, value=opts.size_mode, label="Output sizing")
                 c["scale_factor"] = gr.Dropdown(
@@ -98,18 +131,15 @@ def build_image_tab(settings):
                 ) as custom_dimensions_row:
                     c["width"] = gr.Number(value=opts.width, minimum=1, maximum=16384, precision=0, label="Output width")
                     c["height"] = gr.Number(value=opts.height, minimum=1, maximum=16384, precision=0, label="Output height")
-                c["aspect_lock"] = gr.Checkbox(value=opts.aspect_lock, label="Lock aspect ratio", info="Custom width determines height for each image.")
+                c["aspect_lock"] = gr.Checkbox(value=opts.aspect_lock, label="Lock aspect ratio")
                 dimensions = gr.Markdown(visible=False, elem_id="upscale-image-dimensions")
+            input_path, output_path = build_path_controls()
             c["output_format"] = gr.Dropdown(IMAGE_FORMATS, value=opts.output_format, label="Output format")
-            c["quality"] = gr.Slider(1, 100, value=opts.quality, step=1, precision=0, label="Image quality", info="Used for JPEG, WebP, and AVIF.")
+            c["quality"] = gr.Slider(1, 100, value=opts.quality, step=1, precision=0, label="Image quality")
             c["preserve_metadata"] = gr.Checkbox(value=opts.preserve_metadata, label="Preserve metadata")
             with gr.Row():
                 c["rename_mode"] = gr.Radio(RENAME_MODES, value=opts.rename_mode, label="Rename")
                 c["custom_suffix"] = gr.Textbox(value=opts.custom_suffix, label="Custom suffix", interactive=opts.rename_mode == "Custom")
-            with gr.Row():
-                render = gr.Button("Upscale image(s)", variant="primary")
-                stop = gr.Button("Stop", variant="stop")
-                reset = gr.Button("Reset settings")
         with gr.Column(scale=3):
             output_gallery = gr.Gallery(
                 label="Upscaled images", columns=2, height=520, object_fit="contain",
@@ -117,17 +147,22 @@ def build_image_tab(settings):
                 buttons=["download", "download_all", "fullscreen"],
                 elem_id="upscale-image-output-preview",
             )
-            zip_download = gr.DownloadButton("Save as ZIP", visible=False)
+            save_download, zip_button, zip_download = build_save_controls("image", "upscale-image")
             status = gr.Textbox(label="Status", interactive=False, lines=5)
             results = gr.Dataframe(headers=BATCH_HEADERS, datatype=["str"] * len(BATCH_HEADERS), interactive=False,
                                    label="Batch results", wrap=True)
     tab = SimpleNamespace(sources=sources, input_gallery=input_gallery, input_actions=input_actions,
                           select_source=select_source, clear_source=clear_source, input_path=input_path,
-                          output_path=output_path, render=render, stop=stop, reset=reset, output_gallery=output_gallery,
-                          zip_download=zip_download, status=status, results=results,
+                          output_path=output_path, render=render, stop=stop, preview=preview, reset=reset, output_gallery=output_gallery,
+                          save_download=save_download, zip_button=zip_button, zip_download=zip_download, status=status, results=results,
                           controls=c, settings_inputs=[c[n] for n in SETTING_FIELDS])
     tab.render_inputs = [sources, *tab.settings_inputs]
-    bind_batch_ui(tab, render_image_batch, kind="image", preview_mode=preview_input_images)
+    tab.preview_inputs = list(tab.render_inputs)
+    bind_batch_ui(
+        tab, render_image_batch, kind="image", preview_mode=preview_input_images,
+        archive_prefix="RTXVIDEO_IMAGE_BATCH",
+        preview_actions=[(tab.preview, preview_image)],
+    )
     c["rename_mode"].change(lambda mode: gr.update(interactive=mode == "Custom"), inputs=c["rename_mode"], outputs=c["custom_suffix"], queue=False)
 
     def sizing_controls(mode, lock):

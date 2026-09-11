@@ -9,6 +9,7 @@ from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any
 
+from ..core.paths import GRADIO_TEMP
 from .models import (
     DEFAULT_SETTINGS, MAX_PRESET_BYTES, PRESET_FORMAT, PRESET_SCHEMA_VERSION, UISettings, _validate,
 )
@@ -51,11 +52,13 @@ def preset_document(name: str, settings: UISettings) -> dict[str, Any]:
     """Build the versioned user-facing preset document."""
     display_name = _preset_name(name)
     _validate(settings)
+    values = asdict(settings)
+    values.pop("nr_mask", None)
     return {
         "format": PRESET_FORMAT,
         "schema_version": PRESET_SCHEMA_VERSION,
         "name": display_name,
-        "settings": asdict(settings),
+        "settings": values,
     }
 
 
@@ -63,7 +66,8 @@ def export_settings_preset(name: str, settings: UISettings) -> Path:
     """Write a validated preset to an isolated temporary download directory."""
     document = preset_document(name, settings)
     filename = preset_filename(document["name"])
-    directory = Path(tempfile.mkdtemp(prefix="dlss5-settings-preset-"))
+    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="dlss5-settings-preset-", dir=GRADIO_TEMP))
     path = directory / filename
     path.write_text(
         json.dumps(document, indent=2, ensure_ascii=False) + "\n",
@@ -99,7 +103,7 @@ def _coerce_preset_value(field_name: str, value: Any, current: UISettings) -> An
 def import_settings_preset(
     path: str | os.PathLike[str], current: UISettings
 ) -> tuple[str, UISettings]:
-    """Load, compatibly merge, and atomically validate a version-1 preset."""
+    """Load and migrate schema-v1 through v6 presets, then validate atomically."""
     preset_path = Path(path)
     if preset_path.suffix.casefold() != ".json":
         raise ValueError("Choose a JSON preset file.")
@@ -120,7 +124,7 @@ def import_settings_preset(
     version = document.get("schema_version")
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError("Preset schema_version must be an integer.")
-    if version != PRESET_SCHEMA_VERSION:
+    if version not in range(1, PRESET_SCHEMA_VERSION + 1):
         direction = "newer" if version > PRESET_SCHEMA_VERSION else "unsupported"
         raise ValueError(
             f"Preset schema version {version} is {direction}; this build supports version "
@@ -135,8 +139,29 @@ def import_settings_preset(
     changes = {
         key: _coerce_preset_value(key, value, current)
         for key, value in imported.items()
-        if key in known_names
+        if key in known_names and key != "nr_mask"
     }
+    if version == 1:
+        # v1's DLSS model-preset field was never applied by feature 18. Ignore
+        # it and default the newly introduced shared GPU staging switch to ON.
+        changes.pop("dlss_model_preset", None)
+        changes["nr_gpu_mode"] = DEFAULT_SETTINGS.nr_gpu_mode
+    if version < 3:
+        changes["nr_color_strength"] = DEFAULT_SETTINGS.nr_color_strength
+        changes["tone_preservation"] = DEFAULT_SETTINGS.tone_preservation
+        changes["mask_feather"] = DEFAULT_SETTINGS.mask_feather
+    if version < 4:
+        changes["face_skin_protection"] = DEFAULT_SETTINGS.face_skin_protection
+        changes["grain_preservation"] = DEFAULT_SETTINGS.grain_preservation
+    if version < 5:
+        changes["nr_passes"] = DEFAULT_SETTINGS.nr_passes
+    if version < 6:
+        changes["shimmer_suppression"] = DEFAULT_SETTINGS.shimmer_suppression
+    # NR Preset was removed entirely (non-functional). Old preset files still
+    # carry it; ignore so imports from previous builds keep working.
+    # (Unknown keys are already filtered above; this covers any edge case where
+    # the field still exists on older UISettings shapes.)
+    changes.pop("nr_preset", None)
     # Presets created before the Upscale tab get its defaults independently of
     # whichever RTX settings happen to be selected when the preset is imported.
     for key in known_names:

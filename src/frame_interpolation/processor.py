@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import shutil
 import subprocess
 import threading
 import time
-from contextlib import nullcontext
-from dataclasses import asdict, dataclass, replace
+from contextlib import nullcontext, suppress
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
@@ -16,12 +15,12 @@ from typing import Callable
 import av
 import numpy as np
 
-from ..core import ffmpeg
+from ..core import app_log, ffmpeg
 from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import Cancelled, active_job
 from ..core.naming import output_filename, validate_rename
 from ..core.disk_paths import OutputFile, prepare_output_dir
-from ..core.paths import JOBS, LOGS, OUTPUTS
+from ..core.paths import JOBS, OUTPUTS
 from ..core.runtime import prepare_runtime, rotate_frame
 from .capabilities import probe_frame_interpolation_capabilities
 from .guides import DLSSGGuideGenerator, Guide
@@ -308,7 +307,7 @@ def interpolate_video(
 
             destination = prepare_output_dir(output_dir, default=OUTPUTS)
             JOBS.mkdir(exist_ok=True)
-            LOGS.mkdir(exist_ok=True)
+            app_log.info("frame-interp", f"start src={source.name}")
             stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
             job_dir = JOBS / f"{source.stem}-DLSSFG-{stamp}-{os.getpid()}"
             job_dir.mkdir(parents=True, exist_ok=False)
@@ -469,39 +468,20 @@ def interpolate_video(
             timings["total_seconds"] = elapsed
             performance.update(source_frames_per_second=decoded / elapsed,
                                output_frames_per_second=output_count / elapsed)
-            report = {
-                "status": "success",
-                "input": str(source),
-                "output": str(output),
-                "options": _json_safe(asdict(options)),
-                "capabilities": asdict(capabilities),
-                "ai_gpu": ai_gpu,
-                "video_gpu": video_gpu,
-                "plan": {key: str(value) if isinstance(value, Fraction) else value for key, value in asdict(plan).items()},
-                "input_frames": decoded,
-                "output_frames": output_count,
-                "copied_frames": writer.copied,
-                "generated_frames": writer.generated,
-                "dropped_frames": dropped_frames,
-                "maximum_temporal_approximation_seconds": float(writer.max_error),
-                "scene_cuts": scene_cuts,
-                "duplicate_intervals": duplicate_intervals,
-                "timestamp_discontinuities": discontinuities,
-                "encoder": selected_encoder,
-                "encoding_quality": quality,
-                "elapsed_seconds": elapsed,
-                "timings": timings,
-                "performance": performance,
-            }
-            report_path = LOGS / f"DLSSFG_{source.stem}_{stamp}.report.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+            report_path = app_log.session_path()
             if controller.cancel.is_set():
+                app_log.info("frame-interp", f"cancelled src={source.name}")
                 raise Cancelled("Frame interpolation stopped by user.")
+            app_log.info(
+                "frame-interp",
+                f"done src={source.name} out={output.name} frames={output_count} "
+                f"elapsed={elapsed:.0f}s",
+            )
             output_file.publish()
             _report_progress(1.0, "Frame interpolation complete")
             return FrameInterpolationResult(
                 output_path=str(output.resolve()),
-                report_path=str(report_path.resolve()),
+                report_path=str(report_path),
                 selected_path=plan.path,
                 native_multiplier=plan.native_multiplier,
                 cascade_stages=plan.cascade_stages,
@@ -521,27 +501,15 @@ def interpolate_video(
             if controller.cancel.is_set():
                 raise Cancelled("Frame interpolation stopped by user.") from exc
             if isinstance(exc, Cancelled):
+                app_log.info("frame-interp", f"cancelled src={source.name}")
                 raise
-            LOGS.mkdir(exist_ok=True)
-            failure_stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
-            failure_path = LOGS / f"DLSSFG_{source.stem}_{failure_stamp}.failure.json"
-            failure_path.write_text(
-                json.dumps(
-                    {
-                        "status": "failure",
-                        "input": str(source),
-                        "options": _json_safe(asdict(options)),
-                        "error": str(exc),
-                        "capabilities": asdict(capabilities),
-                        "worker_logs": [session.log_text() for session in sessions],
-                        "timings": timings,
-                        "performance": performance,
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            raise RuntimeError(f"{exc}\nDiagnostic report: {failure_path.resolve()}") from exc
+            tails: dict[str, object] = {}
+            with suppress(Exception):
+                tails["worker"] = [session.log_text() for session in sessions]
+            if "encoder_logs" in locals() and encoder_logs:
+                tails["ffmpeg"] = list(encoder_logs)[-40:]
+            failure_path = app_log.fail("frame-interp", f"DLSSFG_{source.stem}", exc, tails or None)
+            raise RuntimeError(f"{exc}\nDetails: {failure_path.resolve()}") from exc
         finally:
             if output_file is not None:
                 output_file.cleanup()

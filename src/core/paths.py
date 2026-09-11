@@ -4,19 +4,17 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
+TEMP = ROOT / "temp"
+GRADIO_TEMP = TEMP / "gradio"
 RUNTIME = ROOT / "bin" / "runtime"
-HOST_DIR = RUNTIME / "host"
-DLSS_DIR = RUNTIME / "dlss"
 DLSSG_DIR = RUNTIME / "dlssg"
-# Universal FP16 Neural Rendering runtime for all supported RTX architectures.
+# In-process D3D12/NGX feature-18 runtime. The bridge and caller shim are
+# self-contained and require no Python tensor framework or external add-on.
 DLSSNR_DIR = RUNTIME / "dlssnr"
+DLSSNR_BRIDGE = DLSSNR_DIR / "neuroframe_engine.dll"
+DLSSNR_CALLER_SHIM = DLSSNR_DIR / "neuroframe_caller.dll"
 FFMPEG = ROOT / "bin" / "ffmpeg" / "bin" / "ffmpeg.exe"
 FFPROBE = ROOT / "bin" / "ffmpeg" / "bin" / "ffprobe.exe"
-WORKER = HOST_DIR / "nvngx.dll"  # Signed-snippet caller checks require this image name.
-ADDON = DLSSNR_DIR / "renodx-dlss5.addon64"
-HOST_DXGI = HOST_DIR / "dxgi.dll"
-RESHADE_LOG = HOST_DIR / "ReShade.log"
-DLSS_SUPERRES = DLSS_DIR / "nvngx_dlss.dll"
 NEURAL_RUNTIME = DLSSNR_DIR / "nvngx_dlssnr.dll"
 # Live-tab externals (vendored, optional: only Live sessions require them).
 MPV = ROOT / "bin" / "mpv" / "mpv.exe"

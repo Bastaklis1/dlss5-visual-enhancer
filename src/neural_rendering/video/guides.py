@@ -5,60 +5,58 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+
+SCENE_CUT_THRESHOLD = 0.24
+
+
 @dataclass(slots=True)
 class GuideFrame:
-    motion: np.ndarray
     reset: bool
     scene_score: float
 
 
 class TemporalGuideGenerator:
-    """Estimate the guide buffers an encoded video does not contain."""
+    """Reduced-luma scene reset detector that retains history between cuts."""
 
     def __init__(self, width: int, height: int, flow_width: int = 640) -> None:
-        self.width = width
-        self.height = height
-        scale = min(1.0, flow_width / width)
-        self.flow_width = max(64, int(round(width * scale / 2) * 2))
-        self.flow_height = max(64, int(round(height * scale / 2) * 2))
+        scale = min(1.0, flow_width / max(1, width))
+        self.luma_width = max(32, int(round(width * scale / 2) * 2))
+        self.luma_height = max(32, int(round(height * scale / 2) * 2))
+        self._small_rgba = np.empty((self.luma_height, self.luma_width, 4), dtype=np.uint8)
+        self._gray_a = np.empty((self.luma_height, self.luma_width), dtype=np.uint8)
+        self._gray_b = np.empty_like(self._gray_a)
+        self._difference = np.empty_like(self._gray_a)
+        self._current_gray = self._gray_a
         self.previous_gray: np.ndarray | None = None
-        self.zero_motion = np.zeros((height, width, 2), dtype=np.float16)
-        self.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
-        self.dis.setUseSpatialPropagation(True)
-        self.dis.setFinestScale(1)
+        self.duplicate_frames = 0
 
     def _small_gray(self, rgba: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2GRAY)
-        return cv2.resize(
-            gray,
-            (self.flow_width, self.flow_height),
+        cv2.resize(
+            rgba,
+            (self.luma_width, self.luma_height),
+            dst=self._small_rgba,
             interpolation=cv2.INTER_AREA,
         )
+        cv2.cvtColor(self._small_rgba, cv2.COLOR_RGBA2GRAY, dst=self._current_gray)
+        return self._current_gray
 
-    def process(self, rgba: np.ndarray) -> GuideFrame:
+    def process(
+        self, rgba: np.ndarray, *, motion_buffer: np.ndarray | None = None
+    ) -> GuideFrame:
+        del motion_buffer
         current = self._small_gray(rgba)
         if self.previous_gray is None:
-            motion = self.zero_motion
             reset = True
             scene_score = 1.0
         else:
-            scene_score = float(np.mean(cv2.absdiff(current, self.previous_gray))) / 255.0
-            reset = scene_score > 0.24
-            if reset:
-                motion = self.zero_motion
+            cv2.absdiff(current, self.previous_gray, dst=self._difference)
+            if cv2.countNonZero(self._difference) == 0:
+                self.duplicate_frames += 1
+                scene_score = 0.0
             else:
-                motion = self.dis.calc(current, self.previous_gray, None)
-                motion = cv2.resize(
-                    motion,
-                    (self.width, self.height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-                motion[..., 0] *= self.width / self.flow_width
-                motion[..., 1] *= self.height / self.flow_height
-                motion = np.ascontiguousarray(motion.astype(np.float16))
+                scene_score = float(np.mean(self._difference)) / 255.0
+            reset = scene_score > SCENE_CUT_THRESHOLD
+
         self.previous_gray = current
-        return GuideFrame(
-            motion=motion,
-            reset=reset,
-            scene_score=scene_score,
-        )
+        self._current_gray = self._gray_b if current is self._gray_a else self._gray_a
+        return GuideFrame(reset=reset, scene_score=scene_score)

@@ -193,11 +193,21 @@ def resolve_encoding_quality(
         if norm not in _BASE_CODEC_MAP and norm != "HEVC":
             raise ValueError(f"Unknown video codec: {codec!r}.")
     if _normalize_codec(norm) == "ProRes Proxy" or _base_codec(norm) == "ProRes Proxy":
+        # prores_ks otherwise ignores the application's quality selection.
+        # Keep profile 0 while allowing higher selections to preserve fine
+        # temporally stabilized detail instead of reintroducing quantizer crawl.
+        bits_per_mb = {
+            "Auto (Default)": None,
+            "Good": 300,
+            "Best": 500,
+            "Max": 800,
+        }[quality_name]
         return {
             "selection": quality_name,
             "mode": "fixed-prores-proxy-profile",
             "target_bitrate_kbps": None,
             "cq": None,
+            "bits_per_mb": bits_per_mb,
         }
     if quality_name == "Max":
         return {

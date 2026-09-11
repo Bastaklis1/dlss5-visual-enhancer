@@ -1,6 +1,6 @@
 from .batch import convert_videos
 from .models import (
-    ConversionOptions, ConversionResult, DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES,
+    ConversionOptions, ConversionResult, NR_STYLES,
     UPSCALING_MODES, VideoBatchResult, VideoConversionFailure, VideoConversionSuccess,
 )
 from .processor import convert_video
@@ -11,8 +11,8 @@ from .sizing import (
 )
 
 __all__ = [
-    "AUTO_BITRATE_DIVISORS", "ConversionOptions", "ConversionResult", "DLSS_MODEL_PRESETS",
-    "ENCODING_QUALITIES", "NR_PRESETS", "NR_STYLES", "UPSCALING_CHOICES", "UPSCALING_MODES",
+    "AUTO_BITRATE_DIVISORS", "ConversionOptions", "ConversionResult",
+    "ENCODING_QUALITIES", "NR_STYLES", "UPSCALING_CHOICES", "UPSCALING_MODES",
     "VideoBatchResult", "VideoConversionFailure", "VideoConversionSuccess",
     "calculate_auto_bitrate_kbps", "convert_video", "convert_videos", "probe_video",
     "resolve_encoding_quality", "resolve_native_settings", "resolve_output_size",

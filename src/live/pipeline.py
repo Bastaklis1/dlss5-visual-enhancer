@@ -10,24 +10,29 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import asdict, replace
+from contextlib import suppress
+from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import av
 import numpy as np
+from av.codec.hwaccel import HWAccel
 
 from ..core.gpu_selection import resolve_runtime_ai_gpu
 from ..core.jobs import BoundedLogBuffer, Cancelled, JobController, active_job, drain_bounded_text
-from ..core.paths import FFMPEG, LIVE_DIR, LOGS
+from ..core import app_log
+from ..core.paths import FFMPEG, LIVE_DIR
 from ..core.runtime import (DLSSFrameSession, prepare_runtime, resolve_native_settings,
-                            resolve_output_size, resolve_upscaling_mode, verify_feature_18)
+                            resolve_output_size, resolve_upscaling_mode, resize_fit,
+                            rotate_frame, verify_feature_18)
 from ..settings.storage import processing_gpu_settings
 from ..neural_rendering.video.guides import TemporalGuideGenerator
 from .effects import EffectSettings, EffectUpdates, NativeDeadline, EFFECT_REPLACEMENT_TIMEOUT
 from .hls_server import HlsServer
-from .models import (LIVE_FRAME_COUNT, LIVE_FPS_CHOICES, LIVE_GUIDE_CHOICES,
+from .models import (LIVE_FPS_CHOICES,
                      LIVE_MAX_HEIGHTS, LIVE_SOURCE_QUALITY_CHOICES, LiveOptions, LiveSessionInfo, ResolvedSource)
-from .player import check_live_binaries, launch_mpv
+from .player import check_live_binaries, launch_mpv, mpv_tail
 from .source_resolver import _classify, input_args, probe_source, resolve_source, run_capture
 from .transport import TIME_BASE, AdaptiveRate, PipeReader, TimestampMuxer, VideoFrame, get, put
 
@@ -48,8 +53,8 @@ def validate_options(options: LiveOptions) -> None:
         raise ValueError(f"Max input height must be one of: {', '.join(map(str, LIVE_MAX_HEIGHTS))}.")
     if options.source_quality not in LIVE_SOURCE_QUALITY_CHOICES:
         raise ValueError("Choose a valid Source quality.")
-    if options.target_fps not in LIVE_FPS_CHOICES or options.guide_quality not in LIVE_GUIDE_CHOICES:
-        raise ValueError("Choose a valid frame rate and motion guide quality.")
+    if options.target_fps not in LIVE_FPS_CHOICES:
+        raise ValueError("Choose a valid frame rate.")
     if options.segment_seconds not in (1, 2, 4, 6):
         raise ValueError("Segment length must be 1, 2, 4 or 6 seconds.")
     if not math.isfinite(options.buffer_seconds) or not 2 <= options.buffer_seconds <= 30:
@@ -66,7 +71,7 @@ def _redact(text: str) -> str:
 
 
 class LiveSession(threading.Thread):
-    """Bounded decode/guide -> DLSS -> timestamped encode -> buffered playback."""
+    """Bounded decode/scene reset -> feature 18 -> encode -> buffered playback."""
 
     def __init__(self, options: LiveOptions) -> None:
         super().__init__(daemon=True, name="dlss5-live-session")
@@ -89,8 +94,9 @@ class LiveSession(threading.Thread):
         self._logs: dict[str, BoundedLogBuffer] = {}
         self._log_threads: list[threading.Thread] = []
         self._rate: AdaptiveRate | None = None
-        self._native_logs: list[str] = []
+        self._bridge_logs: list[str] = []
         self._feature_evidence: dict = {}
+        self._bridge_status: dict = {}
         self._title = ""
         self._published_seconds = 0.0
         self._published_sequence = -1
@@ -122,6 +128,7 @@ class LiveSession(threading.Thread):
         with self._error_lock:
             if self._error is None and not self.controller.cancel.is_set():
                 self._error = _redact(f"{stage}: {exc}")
+        app_log.error("live", f"{stage}: {exc}")
         self.controller.stop()
 
     def _spawn(self, name: str, command: list[str], **kwargs) -> subprocess.Popen:
@@ -136,26 +143,32 @@ class LiveSession(threading.Thread):
 
     def _process_error(self, name: str, process: subprocess.Popen) -> RuntimeError:
         detail = "\n".join(self._logs[name].snapshot()[-12:])
+        app_log.error("live-ffmpeg", f"{name} exited code={process.returncode}", detail)
         return RuntimeError(_redact(f"{name} exited with code {process.returncode}.\n{detail}"))
 
     def _remember_native(self, native) -> None:
-        self._native_logs = [*self._native_logs, *native.worker_logs][-500:]
+        self._bridge_logs = [*self._bridge_logs, *native.bridge_logs][-500:]
+        self._bridge_status = native.structured_status()
 
-    def _verified_effect_worker(self, settings: EffectSettings, native_args: dict,
+    def _verified_effect_session(self, settings: EffectSettings, native_args: dict,
                                 item: VideoFrame, index: int):
         native = None
         try:
             with NativeDeadline(self.controller, EFFECT_REPLACEMENT_TIMEOUT) as deadline:
                 native = DLSSFrameSession(**native_args, controller=deadline,
-                                         native_settings=resolve_native_settings(settings))
+                                         native_settings=resolve_native_settings(settings),
+                                         composition_mask=settings.nr_mask)
+                native.diagnostics.encode_backend = (
+                    "nvenc" if self.info.encoder == "NVIDIA NVENC" else "cpu"
+                )
                 start = time.perf_counter()
-                output, pts = native.process(index=index, rgba=item.rgba, motion=item.motion,
-                                             reset=True, pts=item.pts)
+                output, pts = native.process(index=index, rgba=item.rgba,
+                                              reset=True, pts=item.pts)
                 cost = time.perf_counter() - start
                 if pts != item.pts:
-                    raise RuntimeError("Replacement DLSS worker returned a different frame timestamp.")
-                evidence = verify_feature_18(native.worker_logs, native.reshade_log_text())
-            self._feature_evidence = {k: v for k, v in evidence.items() if k != "reshade_log"}
+                    raise RuntimeError("Replacement bridge session returned a different frame timestamp.")
+                evidence = verify_feature_18(native.bridge_logs, native.structured_status())
+            self._feature_evidence = dict(evidence)
             return native, output, cost
         except Exception:
             if native is not None:
@@ -169,7 +182,7 @@ class LiveSession(threading.Thread):
         native.abort()  # release resources/config/log ownership before starting another
         error = ""
         try:
-            replacement, output, cost = self._verified_effect_worker(request.settings, native_args, item, index)
+            replacement, output, cost = self._verified_effect_session(request.settings, native_args, item, index)
         except Cancelled:
             raise
         except Exception as exc:
@@ -177,7 +190,7 @@ class LiveSession(threading.Thread):
                 raise Cancelled("Live stopped.") from exc
             error = _redact(str(exc))
             try:
-                replacement, output, cost = self._verified_effect_worker(self.effects.applied, native_args, item, index)
+                replacement, output, cost = self._verified_effect_session(self.effects.applied, native_args, item, index)
             except Cancelled:
                 raise
             except Exception as recovery:
@@ -186,7 +199,7 @@ class LiveSession(threading.Thread):
                                       error=detail, restored=False)
                 raise RuntimeError(detail) from recovery
         self.effects.complete(request, pts=item.pts, milliseconds=(time.perf_counter()-start)*1000,
-                              error=error, worker_pid=getattr(getattr(replacement, "worker", None), "pid", None))
+                                      error=error)
         self._rate.reset_measurements()
         self._last_progress = time.monotonic()
         self._write_report()
@@ -226,9 +239,18 @@ class LiveSession(threading.Thread):
             command += [*input_args(source.audio_url, source.audio_headers, opts.network_timeout),
                         "-thread_queue_size", "32", "-i", source.audio_url]
             audio_input = "1"
-        # FFmpeg autorotates once. Explicit transpose here used to rotate twice.
+        if opts.nr_gpu_mode:
+            # Demux compressed video without decoding pixels. Audio alone is
+            # normalized to timestamped stereo PCM for PyAV's HLS mux.
+            command += ["-map", "0:v:0", "-map", f"{audio_input}:a:0?", "-sn", "-dn",
+                        "-c:v", "copy",
+                        "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+                        "-af", "aresample=async=1:first_pts=0",
+                        "-f", "nut", "-write_index", "0", "pipe:1"]
+            return command
+        # GPU OFF keeps the host-staging pipeline and its decoded RGBA stream.
         filters = [] if opts.target_fps == "Source" else [f"fps={rate}"]
-        filters += [f"scale={width}:{height}:flags=fast_bilinear", "setsar=1"]
+        filters += [f"scale={width}:{height}:flags=lanczos", "setsar=1"]
         command += ["-map", "0:v:0", "-map", f"{audio_input}:a:0?", "-sn", "-dn",
                     "-vf", ",".join(filters),
                     "-c:v", "rawvideo", "-pix_fmt", "rgba", "-threads:v", "1",
@@ -269,8 +291,7 @@ class LiveSession(threading.Thread):
             with av.open(PipeReader(decoder.stdout), format="nut", options={"probesize": "32768", "analyzeduration": "0"}) as container:
                 audio = next(iter(container.streams.audio), None)
                 put(prepared, audio, self.controller.cancel)  # stream header (None means silent)
-                guides = TemporalGuideGenerator(width, height,
-                    flow_width=320 if self.options.guide_quality == "Fast" else 640)
+                guides = TemporalGuideGenerator(width, height, flow_width=320)
                 index = 0
                 last_pts: int | None = None
                 sampled = 0
@@ -309,8 +330,9 @@ class LiveSession(threading.Thread):
                     duration = (max(1, round(packet.duration * packet.time_base / TIME_BASE))
                                 if self.options.target_fps == "Source" and packet.duration
                                 else max(1, round(1 / rate.fps / TIME_BASE)))
-                    put(prepared, VideoFrame(current, pts, duration, rgba, guide.motion,
-                                             guide.reset or discontinuity), self.controller.cancel)
+                    put(prepared, VideoFrame(
+                        current, pts, duration, rgba, reset=guide.reset or discontinuity
+                    ), self.controller.cancel)
                     last_pts = pts
                 code = decoder.wait(timeout=5)
                 if code:
@@ -321,7 +343,7 @@ class LiveSession(threading.Thread):
         except Cancelled:
             pass
         except Exception as exc:
-            self._stage_error("Decode / motion guides", exc)
+            self._stage_error("Decode / scene analysis", exc)
 
     def _encode(self, encoder: subprocess.Popen, outgoing: queue.Queue, width: int, height: int) -> None:
         muxer = None
@@ -358,6 +380,300 @@ class LiveSession(threading.Thread):
                     muxer.close()
                 except Exception:
                     pass
+
+    def _produce_cuda(
+        self, resolved: ResolvedSource, metadata: dict, in_w: int, in_h: int,
+        out_w: int, out_h: int, factor: float, mode: dict, prepared_runtime,
+        gpu: dict, ordinal: int,
+    ) -> None:
+        """Compressed demux -> PyAV NVDEC -> feature 18 -> PyAV NVENC -> HLS."""
+        if self._session_dir is None or self._rate is None:
+            raise RuntimeError("Live session storage and cadence must be initialized.")
+        decoder = native = input_container = hls = None
+        watchdog_done = threading.Event()
+        watchdog = threading.Thread(target=self._watchdog, args=(watchdog_done,), daemon=True)
+        self._last_progress = time.monotonic()
+        watchdog.start()
+        matrix_name = str(metadata.get("color_space") or "").casefold()
+        color_matrix = 2 if "2020" in matrix_name else (
+            0 if matrix_name in {"bt470bg", "smpte170m", "smpte240m", "fcc"} else 1
+        )
+        color_range = int(
+            str(metadata.get("color_range") or "").casefold() in {"pc", "jpeg", "full"}
+        )
+        try:
+            decoder = self._spawn(
+                "demux", self._decoder_command(resolved, in_w, in_h, self._rate.rate),
+                stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            )
+            decode_device = HWAccel(
+                "cuda", device=str(ordinal), allow_software_fallback=True,
+                options={"primary_ctx": "1"}, is_hw_owned=True,
+            )
+            input_container = av.open(
+                PipeReader(decoder.stdout), mode="r", format="nut",
+                options={"probesize": "32768", "analyzeduration": "0"},
+                hwaccel=decode_device,
+            )
+            video_input = input_container.streams.video[0]
+            audio_input = next(iter(input_container.streams.audio), None)
+
+            encode_device = HWAccel(
+                "cuda", device=str(ordinal), options={"primary_ctx": "1"}, is_hw_owned=True
+            )
+            list_size = max(
+                12, math.ceil((self.options.buffer_seconds + 60) / self.options.segment_seconds)
+            )
+            hls = av.open(
+                str(self._session_dir / "index.m3u8"), mode="w", format="hls",
+                options={
+                    "hls_time": str(self.options.segment_seconds),
+                    "hls_list_size": str(list_size),
+                    "hls_delete_threshold": "6",
+                    "hls_flags": "delete_segments+independent_segments+temp_file",
+                    "hls_segment_filename": str(self._session_dir / "seg%07d.ts"),
+                },
+            )
+            video_output = hls.add_stream(
+                "h264_nvenc", rate=self._rate.rate, hwaccel=encode_device
+            )
+            video_output.width, video_output.height = out_w, out_h
+            video_output.pix_fmt = "cuda"
+            video_output.codec_context.sw_format = "nv12"
+            video_output.time_base = TIME_BASE
+            video_output.codec_context.time_base = TIME_BASE
+            video_output.codec_context.gop_size = max(
+                1, math.ceil(float(self._rate.rate) * self.options.segment_seconds)
+            )
+            video_output.codec_context.max_b_frames = 0
+            video_output.codec_context.options = {
+                "preset": "p1", "tune": "ll", "rc": "vbr", "cq": "23",
+                "gpu": str(ordinal), "rc-lookahead": "0", "zerolatency": "1",
+                "forced-idr": "1",
+            }
+            audio_output = audio_resampler = None
+            if audio_input is not None:
+                audio_output = hls.add_stream("aac", rate=48000)
+                audio_output.codec_context.layout = "stereo"
+                audio_output.codec_context.bit_rate = 160_000
+                audio_output.time_base = Fraction(1, 48000)
+                audio_output.codec_context.time_base = Fraction(1, 48000)
+                audio_resampler = av.AudioResampler(format="fltp", layout="stereo", rate=48000)
+
+            native_args = dict(
+                input_width=in_w, input_height=in_h, output_width=out_w, output_height=out_h,
+                frame_count=None, warmup_frames=0, factor=factor, mode=mode,
+                gpu=gpu, runtime_bundle=prepared_runtime.runtime_bundle, cuda_video=True,
+            )
+            native = DLSSFrameSession(
+                **native_args, native_settings=resolve_native_settings(self.options),
+                composition_mask=self.options.nr_mask,
+                controller=self.controller,
+            )
+            self._ready.set()
+            processing_start = time.perf_counter()
+            pacing_seconds = 0.0
+            processed = source_frames = sampled = 0
+            last_pts: int | None = None
+            software_guides = TemporalGuideGenerator(out_w, out_h, flow_width=320)
+
+            for packet in input_container.demux():
+                if self.controller.cancel.is_set():
+                    raise Cancelled("Live stopped.")
+                self._last_progress = time.monotonic()
+                if packet.stream.type == "audio":
+                    if audio_output is not None and audio_resampler is not None:
+                        for audio_frame in packet.decode():
+                            for converted in audio_resampler.resample(audio_frame):
+                                for encoded_packet in audio_output.encode(converted):
+                                    hls.mux(encoded_packet)
+                    continue
+                if packet.stream.type != "video":
+                    continue
+                for frame in packet.decode():
+                    current = source_frames
+                    source_frames += 1
+                    self._set(source_frames=source_frames)
+                    if not self._rate.accepts(current):
+                        sampled += 1
+                        self._set(sampled_frames=sampled)
+                        continue
+                    frame_time_base = frame.time_base or video_input.time_base
+                    source_pts = int(frame.pts if frame.pts is not None else current)
+                    pts = round(source_pts * frame_time_base / TIME_BASE)
+                    discontinuity = last_pts is not None and (
+                        pts <= last_pts or (pts - last_pts) * TIME_BASE > 0.5
+                    )
+                    duration = (
+                        max(1, round(frame.duration * frame_time_base / TIME_BASE))
+                        if self.options.target_fps == "Source" and frame.duration
+                        else max(1, round(1 / self._rate.fps / TIME_BASE))
+                    )
+                    self._update_playback()
+                    pacing_seconds += self._pace(pts)
+                    guide_started = time.perf_counter()
+                    rgba = None
+                    if frame.format.name == "cuda":
+                        scene_score, reset = native.score_cuda_frame(
+                            frame, color_matrix=color_matrix, color_range=color_range
+                        )
+                    else:
+                        rgba = rotate_frame(
+                            frame.to_ndarray(format="rgba"), int(metadata.get("rotation") or 0)
+                        )
+                        if rgba.shape[:2] != (out_h, out_w):
+                            rgba = resize_fit(rgba, out_w, out_h)
+                        rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+                        guide = software_guides.process(rgba)
+                        scene_score, reset = guide.scene_score, guide.reset
+                    guide_cost = time.perf_counter() - guide_started
+                    reset = bool(reset or discontinuity)
+
+                    def evaluate(settings, force_reset: bool):
+                        resolved_settings = resolve_native_settings(settings)
+                        if (
+                            settings.nr_mask != native.composition_mask
+                            or int(resolved_settings["mask_feather"])
+                            != int(native.native_settings.get("mask_feather", 0))
+                        ):
+                            native.update_composition_mask(
+                                settings.nr_mask, int(resolved_settings["mask_feather"])
+                            )
+                        native.native_settings = resolved_settings
+                        native.bridge_status["nr_passes"] = int(resolved_settings["nr_passes"])
+                        native.bridge_status["allocated_feature_instances"] = int(
+                            resolved_settings["nr_passes"]
+                        )
+                        native.bridge_status["composition"]["color_strength"] = float(
+                            resolved_settings["color_strength"]
+                        )
+                        native.bridge_status["composition"]["tone_preservation"] = float(
+                            resolved_settings["tone_preservation"]
+                        )
+                        native.bridge_status["composition"]["face_skin_protection"] = float(
+                            resolved_settings["face_skin_protection"]
+                        )
+                        native.bridge_status["composition"]["grain_preservation"] = float(
+                            resolved_settings["grain_preservation"]
+                        )
+                        native.bridge_status["temporal_stabilization"]["shimmer_suppression"] = float(
+                            resolved_settings["shimmer_suppression"]
+                        )
+                        evaluation_started = time.perf_counter()
+                        values = dict(
+                            index=processed, reset=force_reset, scene_score=scene_score,
+                            pts=pts, duration=duration, time_base=TIME_BASE,
+                            color_matrix=color_matrix, color_range=color_range,
+                        )
+                        if frame.format.name == "cuda":
+                            result, result_pts = native.process_video_frame(
+                                frame=frame, rotation=int(metadata.get("rotation") or 0), **values
+                            )
+                        else:
+                            result, result_pts = native.process_video_frame(rgba=rgba, **values)
+                        return result, result_pts, time.perf_counter() - evaluation_started
+
+                    request = self.effects.take_due()
+                    if request is None:
+                        output, output_pts, cost = evaluate(self.effects.applied, reset)
+                    else:
+                        old_settings = self.effects.applied
+                        update_started = time.perf_counter()
+                        try:
+                            if not request.settings.nr_gpu_mode:
+                                raise RuntimeError("Changing GPU mode during Live requires Stop and Start.")
+                            output, output_pts, cost = evaluate(request.settings, True)
+                            self.effects.complete(
+                                request, pts=pts,
+                                milliseconds=(time.perf_counter() - update_started) * 1000,
+                            )
+                        except Cancelled:
+                            raise
+                        except Exception as exc:
+                            output, output_pts, cost = evaluate(old_settings, True)
+                            self.effects.complete(
+                                request, pts=pts,
+                                milliseconds=(time.perf_counter() - update_started) * 1000,
+                                error=_redact(str(exc)),
+                            )
+                        self._rate.reset_measurements()
+                        self._write_report()
+                    if output_pts != pts:
+                        raise RuntimeError("Neural Rendering changed a Live frame timestamp.")
+                    encode_started = time.perf_counter()
+                    for encoded_packet in video_output.encode(output):
+                        hls.mux(encoded_packet)
+                    encode_cost = time.perf_counter() - encode_started
+                    processed += 1
+                    last_pts = pts
+                    if processed == 1:
+                        self._feature_evidence = verify_feature_18(
+                            native.bridge_logs, native.structured_status()
+                        )
+                        self._first_frame_at = time.monotonic()
+                    old_info = self.snapshot()
+                    self._rate.observe(cost, guide_cost, encode_cost)
+                    guide_ms, encode_ms = guide_cost * 1000, encode_cost * 1000
+                    self._set(
+                        processed_frames=processed,
+                        guide_ms=guide_ms if not old_info.guide_ms else old_info.guide_ms * 0.9 + guide_ms * 0.1,
+                        dlss_ms=cost * 1000 if processed == 1 else old_info.dlss_ms * 0.9 + cost * 100,
+                        encode_ms=encode_ms if not old_info.encode_ms else old_info.encode_ms * 0.9 + encode_ms * 0.1,
+                        target_fps=self._rate.fps,
+                        effective_fps=processed / max(
+                            time.perf_counter() - processing_start - pacing_seconds, 0.001
+                        ),
+                        media_seconds=float((pts + duration) * TIME_BASE),
+                    )
+                    self._last_progress = time.monotonic()
+
+            for encoded_packet in video_output.encode():
+                hls.mux(encoded_packet)
+            if audio_output is not None:
+                if audio_resampler is not None:
+                    for converted in audio_resampler.resample(None):
+                        for encoded_packet in audio_output.encode(converted):
+                            hls.mux(encoded_packet)
+                for encoded_packet in audio_output.encode():
+                    hls.mux(encoded_packet)
+            hls.close()
+            hls = None
+            input_container.close()
+            input_container = None
+            code = decoder.wait(timeout=10)
+            if code:
+                raise self._process_error("demux", decoder)
+            if not processed:
+                raise RuntimeError("The decoder produced no accepted video frames.")
+            native.close()
+            self._remember_native(native)
+            self._bridge_status = native.structured_status()
+            native = None
+            self.effects.finish()
+            self._finished = True
+        finally:
+            watchdog_done.set()
+            if native is not None:
+                self._remember_native(native)
+                self._bridge_status = native.structured_status()
+                with suppress(Exception):
+                    native.abort()
+            if hls is not None:
+                with suppress(Exception):
+                    hls.close()
+            if input_container is not None:
+                with suppress(Exception):
+                    input_container.close()
+            if decoder is not None:
+                if decoder.poll() is None:
+                    decoder.terminate()
+                    with suppress(subprocess.TimeoutExpired):
+                        decoder.wait(timeout=5)
+                if decoder.poll() is None:
+                    decoder.kill()
+                    decoder.wait(timeout=5)
+                self.controller.unregister(decoder)
+            watchdog.join(timeout=1)
 
     def _playlist(self) -> tuple[int, float]:
         try:
@@ -400,6 +716,8 @@ class LiveSession(threading.Thread):
                       av_sync_ms=float(self._player_state.get("avsync", 0)) * 1000)
             if code is not None and not finished:
                 if code:
+                    tail = mpv_tail(self._mpv)
+                    app_log.error("live-mpv", f"MPV exited code={code}", tail)
                     raise RuntimeError(f"MPV exited with code {code}.")
                 self.stop()
                 return
@@ -471,13 +789,25 @@ class LiveSession(threading.Thread):
         in_w, in_h = _fit_height(metadata["width"], metadata["height"], options.max_height)
         factor, mode = resolve_upscaling_mode(options.upscaling_factor)
         out_w, out_h = resolve_output_size(in_w, in_h, factor)
-        self._set(status=f"Preparing DLSS: {in_w}x{in_h} -> {out_w}x{out_h}...")
+        self._set(status=f"Preparing Neural Rendering: {in_w}x{in_h} -> {out_w}x{out_h}...")
         prepared_runtime = prepare_runtime()
         ai_uuid, video_uuid = processing_gpu_settings()
         gpu = resolve_runtime_ai_gpu(prepared_runtime.gpus, prepared_runtime.runtime_bundle, ai_uuid)
-        nvenc, ordinal = self._select_encoder(prepared_runtime.gpus, video_uuid, out_w, out_h)
+        encoder_uuid = ai_uuid if options.nr_gpu_mode else video_uuid
+        nvenc, ordinal = self._select_encoder(prepared_runtime.gpus, encoder_uuid, out_w, out_h)
         self._set(input_size=f"{in_w}x{in_h}", output_size=f"{out_w}x{out_h}",
                   encoder="NVIDIA NVENC" if nvenc else "CPU x264")
+        if options.nr_gpu_mode:
+            if not nvenc or ordinal is None:
+                raise RuntimeError(
+                    "GPU ON Live requires H.264 NVENC on the selected AI GPU. "
+                    "Switch GPU OFF to use the host-staging CPU encoder boundary."
+                )
+            self._produce_cuda(
+                resolved, metadata, in_w, in_h, out_w, out_h, factor, mode,
+                prepared_runtime, gpu, ordinal,
+            )
+            return
         native = None
         processes: list[subprocess.Popen] = []
         threads: list[threading.Thread] = []
@@ -487,12 +817,14 @@ class LiveSession(threading.Thread):
         watchdog.start()
         try:
             native_args = dict(input_width=in_w, input_height=in_h, output_width=out_w, output_height=out_h,
-                frame_count=LIVE_FRAME_COUNT, warmup_frames=0, factor=factor, mode=mode,
+                frame_count=None, warmup_frames=0, factor=factor, mode=mode,
                 gpu=gpu, runtime_bundle=prepared_runtime.runtime_bundle)
             native = DLSSFrameSession(**native_args, native_settings=resolve_native_settings(options),
+                                      composition_mask=options.nr_mask,
                                       controller=self.controller)
+            native.diagnostics.encode_backend = "nvenc" if nvenc else "cpu"
             self._last_progress = time.monotonic()
-            decoder = self._spawn("decoder", self._decoder_command(resolved, in_w, in_h, self._rate.rate),
+            decoder = self._spawn("decoder", self._decoder_command(resolved, out_w, out_h, self._rate.rate),
                                   stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
             processes.append(decoder)
             encoder = self._spawn("encoder", self._encoder_command(self._rate.rate, ordinal, nvenc),
@@ -502,7 +834,7 @@ class LiveSession(threading.Thread):
             # writes. Playback seconds are stored as compressed HLS, not RGBA.
             incoming: queue.Queue = queue.Queue(maxsize=options.queue_frames)
             outgoing: queue.Queue = queue.Queue(maxsize=options.queue_frames)
-            threads = [threading.Thread(target=self._decode, args=(decoder, incoming, in_w, in_h), daemon=True),
+            threads = [threading.Thread(target=self._decode, args=(decoder, incoming, out_w, out_h), daemon=True),
                        threading.Thread(target=self._encode, args=(encoder, outgoing, out_w, out_h), daemon=True)]
             for thread in threads:
                 thread.start()
@@ -525,15 +857,15 @@ class LiveSession(threading.Thread):
                         native, output, cost = self._replace_effects(native, request, native_args, item, processed)
                     else:
                         start = time.perf_counter()
-                        output, pts = native.process(index=processed, rgba=item.rgba, motion=item.motion,
+                        output, pts = native.process(index=processed, rgba=item.rgba,
                                                      reset=item.reset, pts=item.pts)
                         cost = time.perf_counter() - start
                         if pts != item.pts:
-                            raise RuntimeError("DLSS worker returned a different frame timestamp.")
+                            raise RuntimeError("Neural Rendering bridge returned a different frame timestamp.")
                     processed += 1
                     if processed == 1:
-                        evidence = verify_feature_18(native.worker_logs, native.reshade_log_text())
-                        self._feature_evidence = {k: v for k, v in evidence.items() if k != "reshade_log"}
+                        evidence = verify_feature_18(native.bridge_logs, native.structured_status())
+                        self._feature_evidence = dict(evidence)
                     if self._first_frame_at is None:
                         self._first_frame_at = time.monotonic()
                     info = self.snapshot()
@@ -586,19 +918,9 @@ class LiveSession(threading.Thread):
             watchdog.join(timeout=1)
 
     def _write_report(self) -> None:
-        if not self.info.report_path:
-            return
-        payload = {"session": asdict(self.snapshot()),
-                   "settings": {k: v for k, v in asdict(self.options).items() if k not in ("source", "mpv_args")},
-                   "effects": self.effects.report(),
-                   "player": self._player_state, "rate_changes": self._rate.changes if self._rate else [],
-                   "native": self._native_logs,
-                   "feature_18": self._feature_evidence,
-                   "logs": {name: [_redact(line) for line in log.snapshot()] for name, log in self._logs.items()}}
-        try:
-            Path(self.info.report_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        # Reporting is now a single compact session-log line (see run()).
+        # Kept as a no-op for existing callers.
+        return
 
     def run(self) -> None:
         started = time.monotonic()
@@ -611,9 +933,8 @@ class LiveSession(threading.Thread):
             self._session_dir = LIVE_DIR / f"live-{stamp}"
             self._session_dir.mkdir()
             (self._session_dir / "owner.json").write_text(json.dumps({"pid": os.getpid(), "keep": self.options.keep_files}))
-            report = LOGS / "live" / f"{stamp}.json"
-            report.parent.mkdir(parents=True, exist_ok=True)
-            self._set(report_path=str(report))
+            self._set(report_path="")
+            app_log.info("live", f"start src={_redact(self.options.source)[:60]}")
             server = HlsServer(self._session_dir)
             server.start()
             self._set(playlist_url=server.playlist_url())
@@ -629,13 +950,24 @@ class LiveSession(threading.Thread):
                 self._update_playback(finished=True)
                 if self._mpv and self._mpv.poll() is not None:
                     if self._mpv.returncode:
+                        tail = mpv_tail(self._mpv)
+                        app_log.error("live-mpv", f"MPV exited code={self._mpv.returncode}", tail)
                         raise RuntimeError(f"MPV exited with code {self._mpv.returncode}.")
                     break
         except Exception as exc:
             error = self._error or (None if self.controller.cancel.is_set() else _redact(str(exc)))
             if error:
-                self._set(status=f"Failed: {error}", failures=[error])
+                tails = {name: log.snapshot()[-12:] for name, log in self._logs.items()}
+                if self._bridge_logs:
+                    tails["bridge"] = self._bridge_logs[-20:]
+                if self._mpv is not None:
+                    tail = mpv_tail(self._mpv)
+                    if tail:
+                        tails["mpv"] = tail
+                err_path = app_log.fail("live", f"live-{stamp}", error, tails)
+                self._set(report_path=str(err_path), status=f"Failed: {error}", failures=[error])
             else:
+                app_log.info("live", "cancelled")
                 self._set(status="Stopped.")
         finally:
             self.effects.finish()
@@ -653,6 +985,7 @@ class LiveSession(threading.Thread):
                       elapsed_seconds=time.monotonic() - started)
             if self._finished and not self.snapshot().failures:
                 self._set(status=f"Finished: {self._title}. {self.info.processed_frames} frames enhanced.")
+                app_log.info("live", f"done frames={self.info.processed_frames} elapsed={self.info.elapsed_seconds:.0f}s")
             elif not self.snapshot().failures:
                 self._set(status="Stopped.")
             self._write_report()

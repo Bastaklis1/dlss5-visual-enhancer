@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import json
 import os
-import time
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable
 
+from ..core import app_log
 from ..core.batch_progress import BatchItemUpdate, BatchProgress
 from ..core.disk_paths import prepare_output_dir
 from ..core.jobs import Cancelled, JobController, active_job
-from ..core.paths import LOGS
 from .models import FrameInterpolationBatchResult, FrameInterpolationFailure, FrameInterpolationOptions, FrameInterpolationSuccess
 from . import processor
 
@@ -29,7 +27,6 @@ def interpolate_videos(
         raise ValueError("Choose at least one video.")
     controller = controller or JobController()
     reporter = BatchProgress(paths, on_item_update, progress)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
     successes, failures = [], []
     try:
         destination = prepare_output_dir(output_dir, default=processor.OUTPUTS)
@@ -63,18 +60,11 @@ def interpolate_videos(
                 if item.state == "Queued":
                     failures.append(FrameInterpolationFailure(item.index, item.input_path, "Cancelled before rendering.", True))
             reporter.skip_from(0)
-        manifest = {
-            "status": "cancelled" if cancelled else ("partial" if failures else "success"),
-            "options": processor._json_safe(asdict(options)),
-            "successes": [asdict(item) for item in successes],
-            "failures": [asdict(item) for item in failures],
-            "output_directory": str(destination), "batch": reporter.diagnostics(final=True),
-        }
-        LOGS.mkdir(exist_ok=True)
-        manifest_path = LOGS / f"DLSSFG_BATCH_{stamp}.manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        reporter.finish(cancelled=cancelled, manifest_path=str(manifest_path))
-        return FrameInterpolationBatchResult(successes, failures, cancelled, str(manifest_path.resolve()))
+        status = "cancelled" if cancelled else ("partial" if failures else "success")
+        app_log.info("frame-interp-batch", f"{status} ok={len(successes)} failed={len(failures)}")
+        manifest_path = app_log.session_path()
+        reporter.finish(cancelled=cancelled, manifest_path=manifest_path)
+        return FrameInterpolationBatchResult(successes, failures, cancelled, manifest_path)
     except BaseException as exc:
         reporter.finish(cancelled=controller.cancel.is_set(), error=str(exc))
         raise

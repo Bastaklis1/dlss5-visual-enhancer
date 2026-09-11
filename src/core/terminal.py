@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import ctypes
 from ctypes import wintypes
-import io
 import logging
 import os
 import shutil
@@ -13,6 +12,8 @@ import time
 import warnings
 import webbrowser
 from pathlib import Path
+
+from . import app_log
 
 
 GITHUB_URL = "https://github.com/Merserk/dlss5-visual-enhancer"
@@ -58,73 +59,6 @@ def colorize_text(text: str, t_start: float = 0.0, t_end: float = 1.0, bold: boo
             else:
                 res.append(f"\033[38;2;{r};{g};{b}m{ch}\033[0m")
     return "".join(res)
-
-
-class FileLoggerStream:
-    """Redirects stdout/stderr cleanly to a log file instead of terminal.
-
-    Implements the minimal file-like API expected by uvicorn/click/gradio
-    (isatty, fileno, reconfigure, encoding) so `sys.stdout.isatty()` etc.
-    do not crash after `sys.stdout` is replaced.
-    """
-
-    def __init__(self, log_path: Path):
-        self.log_path = log_path
-        self._lock = threading.Lock()
-        self.encoding = "utf-8"
-        self.errors = "replace"
-        self._closed = False
-
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        try:
-            with self._lock:
-                with open(self.log_path, "a", encoding="utf-8", errors="replace") as f:
-                    f.write(s)
-        except Exception:
-            pass
-        return len(s)
-
-    def writelines(self, lines) -> None:
-        for line in lines:
-            self.write(line)
-
-    def flush(self) -> None:
-        pass
-
-    def isatty(self) -> bool:
-        return False
-
-    def fileno(self):
-        raise io.UnsupportedOperation("FileLoggerStream has no fileno")
-
-    def reconfigure(self, *args, **kwargs) -> None:
-        # Accept stream.reconfigure(encoding=...) calls from render_screen / libs
-        if "encoding" in kwargs:
-            self.encoding = kwargs["encoding"]
-        if "errors" in kwargs:
-            self.errors = kwargs["errors"]
-
-    @property
-    def buffer(self):
-        raise io.UnsupportedOperation("FileLoggerStream has no buffer")
-
-    def readable(self) -> bool:
-        return False
-
-    def writable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return False
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
-
-    def close(self) -> None:
-        self._closed = True
 
 
 class TerminalUI:
@@ -393,9 +327,10 @@ class TerminalUI:
         self._listener_thread.start()
 
     def silence_and_redirect(self) -> None:
-        """Silence stdout/stderr and redirect all logging/exceptions to app.log."""
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        log_stream = FileLoggerStream(self.log_file)
+        """Start the session log and redirect all output/exceptions to it."""
+        session = app_log.init_session()
+        self.log_file = session
+        log_stream = app_log.SessionStream()
 
         # Redirect standard streams
         sys.stdout = log_stream  # type: ignore[assignment]
@@ -405,7 +340,7 @@ class TerminalUI:
         warnings.filterwarnings("ignore")
 
         # Configure file logging for libraries
-        file_handler = logging.FileHandler(str(self.log_file), encoding="utf-8")
+        file_handler = logging.FileHandler(str(session), encoding="utf-8")
         file_handler.setLevel(logging.INFO)
         formatter = logging.Formatter("[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
         file_handler.setFormatter(formatter)

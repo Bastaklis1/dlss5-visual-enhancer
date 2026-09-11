@@ -34,7 +34,7 @@ class UpscaleOptions:
     container: str = "MP4"
     quality: str = "Auto (Default)"
     rename_mode: str = "Auto"
-    custom_suffix: str = "_RTXVIDEO"
+    custom_suffix: str = "_Upscale"
     ai_gpu_uuid: str = "auto"
     video_gpu_uuid: str = "auto"
     preview_seconds: float | None = None

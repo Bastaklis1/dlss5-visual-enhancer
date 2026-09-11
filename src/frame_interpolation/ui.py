@@ -7,9 +7,8 @@ from pathlib import Path
 import gradio as gr
 from ..core.batch_ui import (
     BATCH_HEADERS, bind_batch_ui, build_media_clear_button, build_media_select_button,
-    build_path_controls,
+    build_path_controls, build_save_controls,
 )
-from ..core.disk_paths import create_media_archive
 
 from ..core.ffmpeg import hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
@@ -109,12 +108,7 @@ def render_frame_interpolation_batch(
         status += f"\nFirst error: {result.failures[0].error}"
     if used_derivative:
         status += "\nBrowser preview transcoded to H.264; the original file is unchanged."
-    archive_path = None
-    if not direct_disk and not result.cancelled:
-        archive_path = create_media_archive(
-            files, output_dir, "DLSSFG_VIDEO_BATCH", controller=controller,
-        )
-    return gr.update(value=preview, visible=not direct_disk), archive_path, rows, status
+    return gr.update(value=preview, visible=not direct_disk), files, rows, status
 
 @dataclass(slots=True)
 class FrameInterpolationTab:
@@ -136,6 +130,8 @@ class FrameInterpolationTab:
     stop: object
     reset: object
     output_video: object
+    save_download: object
+    zip_button: object
     zip_download: object
     status: object
     results: object
@@ -170,7 +166,7 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 type="filepath", allow_reordering=True, elem_id="frame-interpolation-upload-list",
                 elem_classes=["media-upload-surface"],
             )
-            input_preview = gr.Video(label="Input video preview", interactive=False, visible=False)
+            input_preview = gr.Video(label="Input video preview", interactive=False, visible="hidden")
             with gr.Row(
                 visible=False, elem_id="frame-interpolation-input-actions",
                 elem_classes=["media-input-actions"],
@@ -179,25 +175,29 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                     "Choose Videos", ["video"], "frame-interpolation-select-input",
                 )
                 clear_source = build_media_clear_button("frame-interpolation-clear-input")
-            input_path, output_path = build_path_controls()
-            with gr.Accordion("DLSS Frame Generation Settings", open=True):
+            with gr.Row():
+                render = gr.Button("Interpolate video(s)", variant="primary")
+                preview = gr.Button("Preview 3 sec", visible=False)
+                stop = gr.Button("Stop", variant="stop")
+                reset = gr.Button("Reset settings")
+            with gr.Column():
                 with gr.Row():
                     target_fps = gr.Dropdown(
                         FPS_CHOICES, value=settings.frame_interpolation_target_fps,
-                        label="Output FPS", info="Fractional choices use exact 1001-based rates.",
+                        label="Output FPS",
                     )
                     engine = gr.Radio(
                         ENGINE_CHOICES, value=settings.frame_interpolation_engine, label="DLSS engine",
-                        info="Auto uses a supported exact native grid, then the 2× cascade when required.",
                     )
+            input_path, output_path = build_path_controls()
             quality = gr.Radio(
                 QUALITY_CHOICES, value=settings.frame_interpolation_quality,
-                label="Encoding quality", info="Auto uses output resolution, selected FPS, and codec.",
+                label="Encoding quality",
             )
             with gr.Row():
                 codec = gr.Dropdown(
                     CODEC_CHOICES, value=settings.frame_interpolation_codec,
-                    label="Video codec", info="Plain = CPU, Suffixed = NVIDIA NVENC.",
+                    label="Video codec",
                 )
                 container = gr.Dropdown(
                     CONTAINER_CHOICES, value=settings.frame_interpolation_container, label="Container"
@@ -205,28 +205,21 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
             with gr.Row():
                 rename_mode = gr.Radio(
                     RENAME_MODES, value=settings.frame_interpolation_rename_mode, label="Rename",
-                    info="Auto adds a DLSSFG timestamp; Copy keeps the original base name; Custom appends your suffix.",
                 )
                 custom_suffix = gr.Textbox(
                     value=settings.frame_interpolation_custom_suffix, label="Custom suffix",
-                    placeholder="_DLSSFG", interactive=settings.frame_interpolation_rename_mode == "Custom",
+                    placeholder="_Frame_Interpolation", interactive=settings.frame_interpolation_rename_mode == "Custom",
                 )
             hdr_mode = gr.Checkbox(
                 value=settings.frame_interpolation_hdr_mode and hdr_mode_supported(settings.frame_interpolation_codec),
                 label="HDR Mode",
-                info="When on: 10-bit output, copies input colorspace; keeps HDR if input is HDR. Only for H.265 / AV1 / ProRes.",
                 interactive=hdr_mode_supported(settings.frame_interpolation_codec),
             )
-            with gr.Row():
-                preview = gr.Button("Preview 3 sec", visible=False)
-                render = gr.Button("Interpolate video(s)", variant="primary")
-                stop = gr.Button("Stop", variant="stop")
-                reset = gr.Button("Reset settings")
         with gr.Column(scale=3):
             output_video = gr.Video(
                 label="Interpolated output", interactive=False, visible=True, height=520,
             )
-            zip_download = gr.DownloadButton("Save as ZIP", visible=False)
+            save_download, zip_button, zip_download = build_save_controls("video", "frame-interpolation")
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
                 headers=BATCH_HEADERS,
@@ -235,7 +228,7 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
             )
     tab = FrameInterpolationTab(
         sources, input_preview, input_actions, select_source, clear_source, target_fps, engine, quality, codec, container, rename_mode,
-        custom_suffix, hdr_mode, preview, render, stop, reset, output_video, zip_download, status, results
+        custom_suffix, hdr_mode, preview, render, stop, reset, output_video, save_download, zip_button, zip_download, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_frame_interpolation_events(tab)
@@ -243,8 +236,10 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
 
 
 def bind_frame_interpolation_events(tab: FrameInterpolationTab) -> None:
-    bind_batch_ui(tab, render_frame_interpolation_batch, kind="video",
-                  preview_mode=update_frame_interpolation_preview_mode,
-                  preview_actions=[(tab.preview, preview_frame_interpolation)])
+    bind_batch_ui(
+        tab, render_frame_interpolation_batch, kind="video",
+        preview_mode=update_frame_interpolation_preview_mode, archive_prefix="DLSSFG_VIDEO_BATCH",
+        preview_actions=[(tab.preview, preview_frame_interpolation)],
+    )
     tab.codec.change(hdr_mode_update, inputs=tab.codec, outputs=tab.hdr_mode, queue=False)
     tab.rename_mode.change(rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False)

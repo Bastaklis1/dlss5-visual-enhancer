@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import atexit
 import os
+import tempfile
 import threading
 import time
 import warnings as python_warnings
@@ -12,45 +14,171 @@ from PIL import Image
 
 from .models import ImageConversionOptions
 from ...core.jobs import Cancelled
+from ...core.paths import GRADIO_TEMP
 from ...core.render_metadata import (
     IMAGE_NOTE_FORMATS, MetadataNoteError, check_cancelled, embedding_warning,
     merge_render_note, record_embedding,
 )
 
-_PREVIEW_CACHE_LIMIT = 32
-_preview_cache: OrderedDict[str, Image.Image] = OrderedDict()
+# Keep UI previews bounded in RAM. Older previews spill as already-downscaled PNGs
+# so large batches never have to reopen and resize their full-resolution outputs.
+_PREVIEW_CACHE_BYTES = 256 * 1024 * 1024
+_preview_cache: OrderedDict[str, tuple[Image.Image, int]] = OrderedDict()
+_preview_spill: dict[str, Path] = {}
+_preview_cache_bytes = 0
 _preview_cache_lock = threading.Lock()
 
+
+def _clear_preview_cache() -> None:
+    global _preview_cache_bytes
+    with _preview_cache_lock:
+        while _preview_cache:
+            _key, (image, _size) = _preview_cache.popitem()
+            image.close()
+        for path in _preview_spill.values():
+            _delete_spill(path)
+        _preview_spill.clear()
+        _preview_cache_bytes = 0
+
+
+def _delete_spill(path: Path | None) -> None:
+    if path is not None:
+        path.unlink(missing_ok=True)
+
+
+atexit.register(_clear_preview_cache)
+
+
 def take_image_preview(output_path: str | os.PathLike[str]) -> Image.Image | None:
-    """Return and remove a UI thumbnail created from the rendered frame in memory."""
+    """Return and remove a pre-generated UI thumbnail for a rendered output."""
+    global _preview_cache_bytes
     key = str(Path(output_path).resolve())
     with _preview_cache_lock:
-        return _preview_cache.pop(key, None)
+        cached = _preview_cache.pop(key, None)
+        spill = _preview_spill.pop(key, None)
+        if cached is not None:
+            image, size = cached
+            _preview_cache_bytes -= size
+            return image
+    if spill is None:
+        return None
+    try:
+        with Image.open(spill) as image:
+            image.load()
+            return image.copy()
+    finally:
+        _delete_spill(spill)
 
 
-def _remember_image_preview(
-    output_path: Path, rgba: np.ndarray, output_format: str
-) -> None:
+def _spill_preview(key: str, image: Image.Image) -> None:
+    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+    handle, raw_path = tempfile.mkstemp(
+        prefix="dlss5-preview-", suffix=".png", dir=GRADIO_TEMP
+    )
+    os.close(handle)
+    path = Path(raw_path)
+    try:
+        image.save(path, format="PNG", optimize=False, compress_level=1)
+    except Exception:
+        path.unlink(missing_ok=True)
+        return
+    previous = _preview_spill.pop(key, None)
+    _delete_spill(previous)
+    _preview_spill[key] = path
+
+
+def make_image_preview(
+    rgba: np.ndarray, output_format: str, has_transparency: bool | None = None,
+) -> Image.Image:
+    """Build the same gallery thumbnail used by a completed image render.
+
+    The preview is derived directly from the processed RGBA pixels, before file
+    encoding. JPEG is the one format-specific exception: production JPEG output
+    composites transparency over white, so the gallery preview mirrors that.
+    """
     image = Image.fromarray(rgba, mode="RGBA")
     try:
         if output_format == "JPEG":
-            background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-            background.alpha_composite(image)
-            preview = background
+            if has_transparency is None:
+                has_transparency = bool(np.any(rgba[..., 3] != 255))
+            if has_transparency:
+                preview = Image.new("RGBA", image.size, (255, 255, 255, 255))
+                preview.alpha_composite(image)
+            else:
+                preview = image.copy()
         else:
             preview = image.copy()
-        preview.thumbnail((1600, 1200), Image.Resampling.LANCZOS)
+        # Preview pixels are not production output; bilinear is dramatically
+        # cheaper than Lanczos and is visually sufficient at gallery scale.
+        preview.thumbnail((1200, 900), Image.Resampling.BILINEAR)
+        return preview
+    finally:
+        image.close()
+
+
+def save_full_size_image_preview(
+    rgba: np.ndarray, output_format: str, has_transparency: bool | None = None,
+) -> str:
+    """Write processed preview pixels as a full-resolution browser-safe PNG.
+
+    This avoids handing a full-size PIL object to Gradio (which would create an
+    additional cache encode). JPEG preview semantics still composite transparent
+    pixels over white, matching the production JPEG path.
+    """
+    GRADIO_TEMP.mkdir(parents=True, exist_ok=True)
+    handle, raw_path = tempfile.mkstemp(
+        prefix="dlss5-fullsize-processed-", suffix=".png", dir=GRADIO_TEMP
+    )
+    os.close(handle)
+    path = Path(raw_path)
+    source = Image.fromarray(rgba, mode="RGBA")
+    display = source
+    try:
+        if output_format == "JPEG":
+            if has_transparency is None:
+                has_transparency = bool(np.any(rgba[..., 3] != 255))
+            if has_transparency:
+                display = Image.new("RGBA", source.size, (255, 255, 255, 255))
+                display.alpha_composite(source)
+        display.save(path, format="PNG", optimize=False, compress_level=1)
+        return str(path.resolve())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    finally:
+        if display is not source:
+            display.close()
+        source.close()
+
+
+def _remember_image_preview(
+    output_path: Path, rgba: np.ndarray, output_format: str,
+    has_transparency: bool | None = None,
+) -> None:
+    global _preview_cache_bytes
+    preview = make_image_preview(rgba, output_format, has_transparency)
+    try:
         key = str(output_path.resolve())
+        size = preview.width * preview.height * 4
         with _preview_cache_lock:
             previous = _preview_cache.pop(key, None)
             if previous is not None:
-                previous.close()
-            _preview_cache[key] = preview
-            while len(_preview_cache) > _PREVIEW_CACHE_LIMIT:
-                _unused_key, unused = _preview_cache.popitem(last=False)
-                unused.close()
+                old, old_size = previous
+                _preview_cache_bytes -= old_size
+                old.close()
+            old_spill = _preview_spill.pop(key, None)
+            _delete_spill(old_spill)
+            _preview_cache[key] = (preview, size)
+            _preview_cache_bytes += size
+            preview = None
+            while _preview_cache_bytes > _PREVIEW_CACHE_BYTES and _preview_cache:
+                old_key, (old_image, old_size) = _preview_cache.popitem(last=False)
+                _preview_cache_bytes -= old_size
+                _spill_preview(old_key, old_image)
+                old_image.close()
     finally:
-        image.close()
+        if preview is not None:
+            preview.close()
 
 
 def _encode_image(
@@ -59,17 +187,30 @@ def _encode_image(
     options: ImageConversionOptions,
     metadata: dict[str, object],
     *, generate_preview: bool = True, preview_path: Path | None = None,
-    render_note: str | None = None, metadata_diagnostics: dict | None = None, controller=None,
+    render_note: str | None = None, metadata_diagnostics: dict | None = None,
+    controller=None, has_transparency: bool | None = None, timings: dict[str, float] | None = None,
 ) -> list[str]:
-    warnings = save_image(output, rgba, options, metadata, render_note=render_note,
-                          metadata_diagnostics=metadata_diagnostics, controller=controller)
+    started = time.monotonic()
+    warnings = save_image(
+        output, rgba, options, metadata, render_note=render_note,
+        metadata_diagnostics=metadata_diagnostics, controller=controller,
+        has_transparency=has_transparency, timings=timings,
+    )
+    if timings is not None:
+        timings["encode"] = time.monotonic() - started
     try:
         if generate_preview:
-            _remember_image_preview(preview_path or output, rgba, options.output_format)
+            preview_started = time.monotonic()
+            _remember_image_preview(
+                preview_path or output, rgba, options.output_format, has_transparency
+            )
+            if timings is not None:
+                timings["preview"] = time.monotonic() - preview_started
     except Exception:
         # A UI convenience must never invalidate an otherwise correct output.
         pass
     return warnings
+
 
 def _metadata_save_args(metadata: dict[str, object], output_format: str) -> dict[str, object]:
     args: dict[str, object] = {}
@@ -89,32 +230,43 @@ def save_image(
     rgba: np.ndarray,
     options: ImageConversionOptions,
     metadata: dict[str, object],
-    *, render_note: str | None = None, metadata_diagnostics: dict | None = None, controller=None,
+    *, render_note: str | None = None, metadata_diagnostics: dict | None = None,
+    controller=None, has_transparency: bool | None = None, timings: dict[str, float] | None = None,
 ) -> list[str]:
     output_format = options.output_format
-    image = Image.fromarray(rgba, mode="RGBA")
+    source_image = Image.fromarray(rgba, mode="RGBA")
+    image = source_image
     warnings: list[str] = []
     args = _metadata_save_args(metadata, output_format) if options.preserve_metadata else {}
     if output_format == "PNG":
-        args.update(optimize=False, compress_level=6)
+        # PNG compression effort changes only file size/CPU time, never pixels.
+        args.update(optimize=False, compress_level=1)
     elif output_format == "TIFF":
-        args.update(compression="tiff_deflate")
+        # LZW is lossless and materially lighter on CPU than Deflate here.
+        args.update(compression="tiff_lzw")
     elif output_format == "JPEG":
-        background = Image.new("RGBA", image.size, (255, 255, 255, 255))
-        background.alpha_composite(image)
-        image = background.convert("RGB")
+        if has_transparency is None:
+            has_transparency = bool(np.any(rgba[..., 3] != 255))
+        if has_transparency:
+            background = Image.new("RGBA", source_image.size, (255, 255, 255, 255))
+            background.alpha_composite(source_image)
+            image = background.convert("RGB")
+            background.close()
+            warnings.append("Transparency was composited over white for JPEG output.")
+        else:
+            image = source_image.convert("RGB")
         args.update(
             quality=int(options.quality),
             subsampling=0,
             optimize=False,
             progressive=False,
         )
-        if np.any(rgba[..., 3] != 255):
-            warnings.append("Transparency was composited over white for JPEG output.")
     elif output_format == "WebP":
-        args.update(quality=int(options.quality), method=6)
+        # Preserve the requested quality while avoiding maximum encoder effort.
+        args.update(quality=int(options.quality), method=4)
     elif output_format == "AVIF":
-        args.update(quality=int(options.quality), speed=4)
+        # Preserve the requested quality; speed controls encoder effort.
+        args.update(quality=int(options.quality), speed=6)
 
     temporary = output.with_name(f".{output.stem}.{time.time_ns()}{output.suffix}")
     note_requested = render_note is not None and output_format in IMAGE_NOTE_FORMATS
@@ -139,9 +291,13 @@ def save_image(
             check_cancelled(controller)
             image.save(temporary, format=output_format, **args)
             check_cancelled(controller)
-            # Note-free legacy calls retain their existing validation behavior.
+            # Header/container validation deliberately avoids saved.load(), which
+            # would decode every output pixel a second time immediately after save.
             if render_note is not None or metadata_diagnostics is not None:
+                verify_started = time.monotonic()
                 _verify_image(temporary, image.size, description if note_requested else None)
+                if timings is not None:
+                    timings["output_verification"] = timings.get("output_verification", 0.0) + time.monotonic() - verify_started
         except Cancelled:
             raise
         except (ValueError, TypeError, KeyError, SyntaxError, OSError, RuntimeError) as exc:
@@ -152,14 +308,19 @@ def save_image(
             warnings.append(embedding_warning(metadata_diagnostics, exc))
             image.save(temporary, format=output_format, **original_args)
             check_cancelled(controller)
+            verify_started = time.monotonic()
             _verify_image(temporary, image.size, None)
+            if timings is not None:
+                timings["output_verification"] = timings.get("output_verification", 0.0) + time.monotonic() - verify_started
             note_requested = False
         check_cancelled(controller)
         os.replace(temporary, output)
         if note_requested:
             record_embedding(metadata_diagnostics, "embedded", field="EXIF.ImageDescription")
     finally:
-        image.close()
+        if image is not source_image:
+            image.close()
+        source_image.close()
         if temporary.exists():
             temporary.unlink()
     return warnings
@@ -197,8 +358,9 @@ def _exif_fields(exif: Image.Exif) -> dict:
 
 
 def _verify_image(path: Path, size: tuple[int, int], description: str | None) -> None:
+    # Image.open() parses the container header lazily. Accessing size and EXIF does
+    # not decode the raster payload, which avoids a redundant full-image pass.
     with Image.open(path) as saved:
-        saved.load()
         if saved.size != size:
             raise MetadataNoteError("Saved image dimensions changed")
         if description is not None and saved.getexif().get(270) != description:

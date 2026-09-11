@@ -16,7 +16,7 @@ CONTAINER_CHOICES = ("MP4", "MKV", "MOV")
 IMAGE_FORMAT_CHOICES = ("PNG", "JPEG", "WebP", "AVIF", "TIFF")
 CONFIG_SECTION = "Settings"
 PRESET_FORMAT = "dlss5-visual-enhancer-settings-preset"
-PRESET_SCHEMA_VERSION = 1
+PRESET_SCHEMA_VERSION = 6
 MAX_PRESET_BYTES = 1024 * 1024
 
 AUTOMATIC_MASK_CHOICES = ("Off", "On")
@@ -45,23 +45,34 @@ class UISettings:
     video_gpu_uuid: str = "auto"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
+    nr_passes: int = 1
     local_tone_strength: float = 1.0
     local_structure_strength: float = 1.0
     skin_structure_strength: float = -1.0
+    nr_color_strength: float = 1.0
+    tone_preservation: float = 0.0
+    face_skin_protection: float = 0.0
+    grain_preservation: float = 0.0
+    # Video/Live temporal residual stabilization. Image rendering always
+    # remains reset-based and does not consume this value.
+    shimmer_suppression: float = 0.70
+    mask_feather: int = 0
+    # Validated Gradio upload identity; intentionally omitted from config/presets.
+    nr_mask: object | None = None
     upscaling_factor: float = 1.0
-    codec: str = "H.264"
+    # Factory default only. Existing saved codec values are loaded unchanged.
+    codec: str = "H.264 (NVIDIA NVENC)"
     container: str = "MP4"
     quality: str = "Auto (Default)"
     hdr_mode: bool = False
     image_format: str = "PNG"
     image_quality: int = 95
-    nr_preset: str = "Default"
     automatic_mask: bool = False
     image_rename_mode: str = "Auto"
-    image_custom_suffix: str = "_DLSS5"
+    image_custom_suffix: str = "_Neural_Rendering"
     video_rename_mode: str = "Auto"
-    video_custom_suffix: str = "_DLSS5"
-    dlss_model_preset: str = "Default"
+    video_custom_suffix: str = "_Neural_Rendering"
+    nr_gpu_mode: bool = True
     frame_interpolation_target_fps: str = "60"
     frame_interpolation_engine: str = "Auto"
     frame_interpolation_codec: str = "H.264"
@@ -69,8 +80,9 @@ class UISettings:
     frame_interpolation_quality: str = "Auto (Default)"
     frame_interpolation_hdr_mode: bool = False
     frame_interpolation_rename_mode: str = "Auto"
-    frame_interpolation_custom_suffix: str = "_DLSSFG"
+    frame_interpolation_custom_suffix: str = "_Frame_Interpolation"
     preview_encoding: str = "Auto"
+    full_size_image_previews: bool = False
     upscale_mode: str = "Image"
     upscale_image_vsr_quality: int = 4
     upscale_image_size_mode: str = "Scale factor"
@@ -82,7 +94,7 @@ class UISettings:
     upscale_image_quality: int = 95
     upscale_image_preserve_metadata: bool = True
     upscale_image_rename_mode: str = "Auto"
-    upscale_image_custom_suffix: str = "_RTXIMAGE"
+    upscale_image_custom_suffix: str = "_Upscale"
     upscale_vsr_enabled: bool = True
     upscale_vsr_quality: int = 4
     upscale_size_mode: str = "Scale factor"
@@ -100,24 +112,30 @@ class UISettings:
     upscale_container: str = "MP4"
     upscale_quality: str = "Auto (Default)"
     upscale_rename_mode: str = "Auto"
-    upscale_custom_suffix: str = "_RTXVIDEO"
+    upscale_custom_suffix: str = "_Upscale"
 
     def component_values(
         self,
-    ) -> tuple[str, str, float, float, float, float, float, bool, str, str, str, str]:
+    ) -> tuple[str, float, int, float, float, float, float, float, float, float, float, int, float, bool, bool, str, str, str]:
         return (
-            self.nr_preset,
             self.nr_style,
             self.nr_intensity,
+            self.nr_passes,
             self.local_tone_strength,
             self.local_structure_strength,
             self.skin_structure_strength,
+            self.nr_color_strength,
+            self.tone_preservation,
+            self.face_skin_protection,
+            self.grain_preservation,
+            self.shimmer_suppression,
+            self.mask_feather,
             self.upscaling_factor,
             self.automatic_mask,
+            self.nr_gpu_mode,
             self.codec,
             self.container,
             self.quality,
-            self.dlss_model_preset,
         )
 
 
@@ -134,13 +152,25 @@ def _validate(settings: UISettings) -> UISettings:
         if not isinstance(value, str) or not value.strip() or len(value) > 160:
             raise ValueError(f"{label} selection must be Automatic or a valid GPU UUID.")
     resolve_native_settings(settings)
+    if isinstance(settings.nr_passes, bool) or not isinstance(settings.nr_passes, int):
+        raise ValueError("NR Passes must be an integer from 1 to 4.")
+    if not 1 <= settings.nr_passes <= 4:
+        raise ValueError("NR Passes must be between 1 and 4.")
+    if isinstance(settings.mask_feather, bool) or not isinstance(settings.mask_feather, int):
+        raise ValueError("Mask Feather must be an integer from 0 to 128.")
+    if not 0 <= settings.mask_feather <= 128:
+        raise ValueError("Mask Feather must be between 0 and 128 pixels.")
     resolve_upscaling_mode(settings.upscaling_factor)
     if not isinstance(settings.automatic_mask, bool):
         raise ValueError("Automatic Mask must be a boolean value.")
+    if not isinstance(settings.nr_gpu_mode, bool):
+        raise ValueError("Neural Rendering GPU mode must be a boolean value.")
     if not isinstance(settings.hdr_mode, bool):
         raise ValueError("HDR Mode must be a boolean value.")
     if not isinstance(settings.frame_interpolation_hdr_mode, bool):
         raise ValueError("Frame Interpolation HDR Mode must be a boolean value.")
+    if not isinstance(settings.full_size_image_previews, bool):
+        raise ValueError("Full size quality preview must be a boolean value.")
     # Migrate old codec names before validation
     migrated_codec = _migrate_codec(settings.codec)
     migrated_fi_codec = _migrate_codec(settings.frame_interpolation_codec)

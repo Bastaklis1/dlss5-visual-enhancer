@@ -1,46 +1,38 @@
 from __future__ import annotations
 
-"""Automatic cleanup of stale Gradio caches and app-owned temp leftovers.
+"""Automatic cleanup of stale app-local Gradio caches and job leftovers.
 
-Official Gradio mechanism (see https://gradio.app/guides/resource-cleanup and
-``gr.Blocks(delete_cache=...)`` docs): while the server runs, Gradio
-periodically deletes tracked temp files older than ``age`` seconds, and wipes
-the session cache on graceful shutdown. That does NOT cover files orphaned by
-a crashed/killed process (untracked, never cleaned), which is why this module
-performs a best-effort, age-gated sweep at startup over:
+Official Gradio cleanup (``gr.Blocks(delete_cache=...)``) handles tracked
+session files while the server runs and on graceful shutdown. Crash-orphaned
+files are covered here by an age-gated startup sweep over only this install's
+portable locations:
 
-1. The Gradio cache dir (``GRADIO_TEMP_DIR`` or ``<temp>/gradio``).
-2. ``<temp>/dlss5-settings-preset-*`` dirs leaked by settings preset export.
-3. Orphaned ``JOBS/*`` per-render dirs left behind by killed runs.
+1. ``<app>/temp/gradio`` (Gradio uploads/cache plus UI-owned temp artifacts).
+2. Orphaned ``<app>/jobs/*`` per-render dirs left behind by killed runs.
 
-Only entries older than ``CACHE_MAX_AGE_SECONDS`` are removed, so files from
-concurrently running Gradio apps (fresh mtime/ctime) are left alone. Final
-deliverables in ``OUTPUTS/`` and anything in ``LOGS/`` are never touched.
-Every failure is swallowed per-entry so cleanup can never block startup.
+No system/user temp directory is inspected or migrated. This build is isolated
+from previous installations. Final deliverables in ``OUTPUTS/`` and anything
+in ``LOGS/`` are never touched. Every failure is swallowed per-entry so
+cleanup can never block startup.
 """
 
 import os
 import shutil
-import tempfile
 import time
 from pathlib import Path
 
-from .paths import JOBS, LOGS
+from .paths import GRADIO_TEMP, JOBS
 
 # Agreed retention: sweep hourly while running (via Blocks delete_cache),
 # treat anything older than 24h as stale (startup sweep + periodic sweep).
 CACHE_SWEEP_INTERVAL_SECONDS = 3600
 CACHE_MAX_AGE_SECONDS = 24 * 3600
 
-_PRESET_TMP_PREFIX = "dlss5-settings-preset-"
-
 
 def resolve_gradio_temp_dir() -> Path | None:
-    """Mirror Gradio's own cache location (env override or ``<temp>/gradio``)."""
-    configured = os.environ.get("GRADIO_TEMP_DIR")
-    candidate = Path(configured) if configured else Path(tempfile.gettempdir()) / "gradio"
+    """Return this installation's fixed app-local Gradio temp directory."""
     try:
-        resolved = candidate.resolve()
+        resolved = GRADIO_TEMP.resolve()
     except OSError:
         return None
     return resolved if resolved.is_dir() else None
@@ -106,29 +98,6 @@ def sweep_dir_by_age(root: Path, max_age_seconds: int) -> tuple[int, int]:
     return (removed, freed)
 
 
-def _sweep_preset_tmpdirs(temp_root: Path, max_age_seconds: int) -> tuple[int, int]:
-    """Remove stale ``dlss5-settings-preset-*`` dirs from the system temp dir."""
-    removed = 0
-    freed = 0
-    try:
-        entries = list(os.scandir(temp_root))
-    except OSError:
-        return (0, 0)
-    now = time.time()
-    for entry in entries:
-        if not entry.name.startswith(_PRESET_TMP_PREFIX):
-            continue
-        try:
-            stat_result = os.stat(entry.path, follow_symlinks=False)
-        except OSError:
-            continue
-        if _entry_age_seconds(stat_result, now) <= max_age_seconds:
-            continue
-        freed += _remove_entry(Path(entry.path))
-        removed += 1
-    return (removed, freed)
-
-
 def cleanup_old_caches(
     max_age_seconds: int = CACHE_MAX_AGE_SECONDS,
     logs_dir: Path | None = None,
@@ -151,14 +120,6 @@ def cleanup_old_caches(
             pass
 
     try:
-        system_temp = Path(tempfile.gettempdir())
-        removed, freed = _sweep_preset_tmpdirs(system_temp, max_age_seconds)
-        removed_total += removed
-        freed_total += freed
-    except Exception:
-        pass
-
-    try:
         if JOBS.is_dir():
             removed, freed = sweep_dir_by_age(JOBS, max_age_seconds)
             removed_total += removed
@@ -168,16 +129,13 @@ def cleanup_old_caches(
 
     elapsed = time.time() - started
     try:
-        destination = logs_dir or LOGS
-        destination.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(destination / "cache_cleanup.log", "a", encoding="utf-8") as handle:
-            handle.write(
-                f"{stamp} removed={removed_total} "
-                f"freed_mb={freed_total / (1024 * 1024):.1f} "
-                f"elapsed_s={elapsed:.1f} "
-                f"max_age_s={max_age_seconds}\n"
-            )
-    except OSError:
+        from . import app_log
+
+        app_log.info(
+            "cache",
+            f"removed={removed_total} freed_mb={freed_total / (1024 * 1024):.1f} "
+            f"elapsed_s={elapsed:.1f}",
+        )
+    except Exception:
         pass
     return {"removed": removed_total, "freed_bytes": freed_total}

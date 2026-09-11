@@ -10,6 +10,7 @@ from pathlib import Path
 import av
 import numpy as np
 
+from ...core import app_log
 from ...core.ffmpeg.probe import _run_json
 from ...core.jobs import BoundedLogBuffer, Cancelled, drain_bounded_text
 from ...core.paths import FFMPEG, FFPROBE
@@ -191,6 +192,7 @@ def finish_process(process, thread, logs, controller, *, expected_stop=False):
             raise Cancelled("Upscale stopped by user.")
         if process.returncode and not expected_stop:
             detail = logs.snapshot() if hasattr(logs, "snapshot") else logs[-60:]
+            app_log.error("ffmpeg", "video subprocess failed", "\n".join(detail)[-500:])
             raise RuntimeError("Video subprocess failed:\n" + "\n".join(detail))
     finally:
         controller.unregister(process)

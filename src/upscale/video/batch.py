@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import json
-import time
-import uuid
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
+from ...core import app_log
 from ...core.batch_progress import BatchProgress
 from ...core.disk_paths import prepare_output_dir
 from ...core.jobs import Cancelled, JobController, active_job
-from ...core.paths import LOGS
 from .models import UpscaleOptions, UpscaleBatchResult, UpscaleSuccess, UpscaleFailure
 from .native import probe_capabilities
 from .processor import upscale_video
@@ -51,12 +48,11 @@ def upscale_videos(input_paths, options=None, progress=None, *, output_dir=None,
                 if item.state == "Queued":
                     failures.append(UpscaleFailure(item.index, item.input_path, "Cancelled before rendering.", True))
             reporter.skip_from(0)
-        LOGS.mkdir(exist_ok=True)
-        manifest = LOGS / f"upscale-batch-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
-        result = UpscaleBatchResult(successes, failures, controller.cancel.is_set(), str(manifest))
-        manifest.write_text(json.dumps({**asdict(result), "options": asdict(options),
-                                       "progress": reporter.diagnostics(final=True)}, indent=2), encoding="utf-8")
-        reporter.finish(cancelled=result.cancelled, manifest_path=str(manifest))
+        status = "cancelled" if controller.cancel.is_set() else ("partial" if failures else "success")
+        app_log.info("upscale-batch", f"{status} ok={len(successes)} failed={len(failures)}")
+        manifest = app_log.session_path()
+        result = UpscaleBatchResult(successes, failures, controller.cancel.is_set(), manifest)
+        reporter.finish(cancelled=result.cancelled, manifest_path=manifest)
         return result
     except BaseException as exc:
         reporter.finish(cancelled=controller.cancel.is_set(), error=str(exc))

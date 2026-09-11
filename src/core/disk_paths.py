@@ -7,6 +7,8 @@ import tempfile
 import time
 import uuid
 import zipfile
+import queue
+import threading
 from pathlib import Path
 
 from .naming import require_available_output
@@ -119,6 +121,103 @@ class OutputFile:
                     self.destination.unlink()
             except FileNotFoundError:
                 pass
+
+
+
+class StreamingMediaArchive:
+    """Build an uncompressed ZIP on one bounded worker while later renders run."""
+
+    def __init__(self, output_dir, prefix: str, *, controller=None) -> None:
+        destination = prepare_output_dir(output_dir)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.archive_path = destination / f"{prefix}_{stamp}_{uuid.uuid4().hex[:8]}.zip"
+        self.output_file = OutputFile(self.archive_path)
+        self.controller = controller
+        self.items: queue.Queue[Path | None] = queue.Queue(maxsize=1)
+        self.error: BaseException | None = None
+        self.cancelled = False
+        self._closed = False
+        self.added = 0
+        self.thread = threading.Thread(target=self._run, name="media-archive-writer", daemon=True)
+        self.thread.start()
+
+    def _is_cancelled(self) -> bool:
+        return self.cancelled or (self.controller is not None and self.controller.cancel.is_set())
+
+    def _run(self) -> None:
+        used_names: set[str] = set()
+        try:
+            with zipfile.ZipFile(
+                self.output_file.temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True,
+            ) as archive:
+                while True:
+                    source = self.items.get()
+                    if source is None:
+                        break
+                    if self._is_cancelled():
+                        self.cancelled = True
+                        break
+                    candidate = source.name
+                    index = 2
+                    while candidate.casefold() in used_names:
+                        candidate = f"{source.stem}_{index}{source.suffix}"
+                        index += 1
+                    used_names.add(candidate.casefold())
+                    info = zipfile.ZipInfo.from_file(source, arcname=candidate)
+                    info.compress_type = zipfile.ZIP_STORED
+                    with source.open("rb") as input_stream, archive.open(
+                        info, "w", force_zip64=True,
+                    ) as output_stream:
+                        while True:
+                            if self._is_cancelled():
+                                self.cancelled = True
+                                break
+                            chunk = input_stream.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            output_stream.write(chunk)
+                    if self.cancelled:
+                        break
+        except BaseException as exc:
+            self.error = exc
+
+    def add(self, path: str | os.PathLike[str]) -> bool:
+        source = Path(path).resolve()
+        while not self._is_cancelled() and self.error is None:
+            try:
+                self.items.put(source, timeout=0.1)
+                self.added += 1
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def close(self, *, publish: bool = True) -> str | None:
+        if self._closed:
+            return str(self.archive_path) if self.archive_path.exists() else None
+        self._closed = True
+        while self.thread.is_alive():
+            try:
+                self.items.put(None, timeout=0.1)
+                break
+            except queue.Full:
+                if self.error is not None or self._is_cancelled():
+                    self.cancelled = self.cancelled or self._is_cancelled()
+                    continue
+        self.thread.join()
+        try:
+            if self.error is not None:
+                raise self.error
+            if self._is_cancelled() or self.cancelled or not publish or self.added == 0:
+                return None
+            self.output_file.publish()
+            return str(self.archive_path)
+        finally:
+            self.output_file.cleanup()
+
+    def abort(self) -> None:
+        self.cancelled = True
+        self.close()
 
 
 def create_media_archive(

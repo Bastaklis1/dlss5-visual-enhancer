@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import json
+import os
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import TiffImagePlugin
-
-from ...core.paths import LOGS, OUTPUTS
+from ...core import app_log
+from ...core.paths import OUTPUTS
 from ...core.disk_paths import OutputFile
 from ...core.jobs import Cancelled
-from ...core.runtime import DLSSFrameSession, DLSS_MODEL_PRESETS
+from ...core.runtime import DLSSFrameSession
 from .decoder import _DecodedImage
 from .models import ImageConversionFailure, ImageConversionOptions, ImageConversionResult
+
 
 @dataclass(slots=True)
 class _ImageReportData:
@@ -21,84 +21,143 @@ class _ImageReportData:
     warnings: list[str]
 
 
+@dataclass(frozen=True, slots=True)
+class _SessionReportData:
+    minimum_width: int
+    minimum_height: int
+    maximum_width: int
+    maximum_height: int
+    setup_result: int
+    native_settings: dict[str, int | float]
+    runtime_bundle: dict[str, object]
+    bridge_status: dict[str, object]
+    bridge_log: tuple[str, ...]
+
+
 def _report_data(decoded: _DecodedImage) -> _ImageReportData:
-    """Keep diagnostics without retaining the decoded pixel and alpha arrays."""
-    return _ImageReportData(decoded.decoder, decoded.metadata, decoded.warnings)
+    """Keep diagnostics without retaining decoded pixel/alpha arrays."""
+    return _ImageReportData(decoded.decoder, decoded.metadata, list(decoded.warnings))
 
 
-def _json_safe_metadata(value: object) -> object:
-    """Create a report-only JSON-safe copy without changing save metadata."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, TiffImagePlugin.IFDRational):
-        return float(value)
-    if isinstance(value, dict):
-        return {str(key): _json_safe_metadata(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe_metadata(item) for item in value]
-    if isinstance(value, bytes):
-        return {"type": "bytes", "length": len(value)}
-    return str(value)
+def snapshot_session(session: DLSSFrameSession) -> _SessionReportData:
+    """Detach structured report inputs from the live bridge session."""
+    return _SessionReportData(
+        minimum_width=session.minimum_width,
+        minimum_height=session.minimum_height,
+        maximum_width=session.maximum_width,
+        maximum_height=session.maximum_height,
+        setup_result=session.setup_result,
+        native_settings=dict(session.native_settings),
+        runtime_bundle=dict(session.runtime_bundle),
+        bridge_status=session.structured_status(),
+        bridge_log=tuple(session.bridge_logs),
+    )
+
 
 def _write_report(
     result: ImageConversionResult,
     options: ImageConversionOptions,
     decoded: _ImageReportData,
     gpu: dict,
-    session: DLSSFrameSession,
+    session: _SessionReportData,
     evidence: dict[str, object],
     *, metadata_diagnostics: dict | None = None,
 ) -> str:
-    report = {
-        "status": "success",
-        "input": result.input_path,
-        "output": result.output_path,
-        "options": asdict(options),
-        "gpu": gpu,
-        "decoder": decoded.decoder,
-        "source_metadata": {
-            key: _json_safe_metadata(value)
-            for key, value in decoded.metadata.items()
-            if key not in {"icc_profile", "exif", "xmp"}
-        },
-        "warnings": result.warnings,
-        "metadata_embedding": metadata_diagnostics or {"status": "not_requested"},
-        "input_dimensions": {"width": result.input_width, "height": result.input_height},
-        "negotiated_render_dimensions": {"width": result.render_width, "height": result.render_height},
-        "negotiated_render_range": {
-            "minimum": {"width": session.minimum_width, "height": session.minimum_height},
-            "maximum": {"width": session.maximum_width, "height": session.maximum_height},
-        },
-        "output_dimensions": {"width": result.output_width, "height": result.output_height},
-        "dlss_mode": result.dlss_mode,
-        "requested_upscaling_factor": result.upscaling_factor,
-        "dlss_model_preset": result.dlss_model_preset,
-        "requested_dlss_model_preset": result.dlss_model_preset,
-        "requested_dlss_model_preset_code": DLSS_MODEL_PRESETS[
-            result.dlss_model_preset
-        ],
-        "applied_dlss_model_preset": result.applied_dlss_model_preset,
-        "applied_dlss_model_preset_name": next(
-            name
-            for name, code in DLSS_MODEL_PRESETS.items()
-            if code == result.applied_dlss_model_preset
-        ),
-        "pipeline": "renodx-dlssnr-feature18-image",
-        "feature_id": 18,
-        "feature_18_confirmed": True,
-        "ngx_setup_result": f"0x{session.setup_result:08X}",
-        "carrier_create_result": evidence["carrier_create_result"],
-        "native_settings": session.native_settings,
-        "addon_release": session.runtime_bundle["addon"]["release"],
-        "dlssnr_runtime": session.runtime_bundle["neural_runtime"],
-        "worker_log": session.worker_logs,
-        "worker_log_dropped_lines": session.worker_log_dropped_lines,
-        "dlssnr_evidence": evidence["evidence"],
-        "elapsed_seconds": result.elapsed_seconds,
-    }
-    report_path = LOGS / f"{Path(result.output_path).name}.report.json"
-    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    return str(report_path)
+    app_log.info(
+        "image-render",
+        f"done src={Path(result.input_path).name} out={Path(result.output_path).name} "
+        f"elapsed={result.elapsed_seconds:.1f}s",
+    )
+    return app_log.session_path()
+
+
+def update_report_performance(result: ImageConversionResult) -> None:
+    """No-op: per-job report files no longer exist (see session log)."""
+    return
+
+
+class IncrementalImageArchive:
+    """Build the uncompressed batch ZIP while later images are on the GPU."""
+
+    def __init__(self, path: Path, controller=None):
+        self.path = path
+        self.controller = controller
+        self.output_file = OutputFile(path)
+        self.archive = zipfile.ZipFile(
+            self.output_file.temporary, "w", compression=zipfile.ZIP_STORED, allowZip64=True,
+        )
+        self.closed = False
+        self.error: str | None = None
+        self.count = 0
+
+    def add(self, source_path: str | os.PathLike[str]) -> None:
+        if self.closed or self.error:
+            return
+        source = Path(source_path)
+        try:
+            info = zipfile.ZipInfo.from_file(source, arcname=source.name)
+            info.compress_type = zipfile.ZIP_STORED
+            with source.open("rb") as input_stream, self.archive.open(info, "w", force_zip64=True) as output_stream:
+                while True:
+                    if self.controller is not None and self.controller.cancel.is_set():
+                        raise Cancelled("ZIP creation cancelled.")
+                    chunk = input_stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output_stream.write(chunk)
+            self.count += 1
+        except Cancelled:
+            raise
+        except Exception as exc:
+            # ZIP is a convenience artifact; never turn an already valid image into
+            # a failed render because archive I/O failed.
+            self.error = str(exc)
+
+    def finish(self, *, cancelled: bool) -> str | None:
+        if self.closed:
+            return None
+        self.closed = True
+        try:
+            try:
+                self.archive.close()
+            except Exception as exc:
+                self.error = self.error or str(exc)
+            if not self.count or cancelled or self.error or (self.controller is not None and self.controller.cancel.is_set()):
+                return None
+            self.output_file.publish()
+            return str(self.path)
+        finally:
+            self.output_file.cleanup()
+
+    def abort(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            try:
+                self.archive.close()
+            except Exception:
+                pass
+        finally:
+            self.output_file.cleanup(rollback=True)
+
+
+def _build_manifest(
+    stamp: str,
+    options: ImageConversionOptions,
+    successes: list[ImageConversionResult],
+    failures: list[ImageConversionFailure],
+    cancelled: bool,
+    *, output_dir: Path | None = None, batch_diagnostics: dict | None = None,
+    archive_error: str | None = None,
+) -> str:
+    status = "cancelled" if cancelled else ("partial" if failures else "success")
+    app_log.info(
+        "image-batch",
+        f"{status} ok={len(successes)} failed={len(failures)}"
+        + (f" archive_warning={archive_error}" if archive_error else ""),
+    )
+    return app_log.session_path()
 
 
 def _build_manifest_and_zip(
@@ -110,41 +169,29 @@ def _build_manifest_and_zip(
     *, create_zip: bool = True, output_dir: Path | None = None, batch_diagnostics: dict | None = None,
     controller=None,
 ) -> tuple[str, str | None]:
-    manifest = {
-        "status": "cancelled" if cancelled else ("partial" if failures else "success"),
-        "options": asdict(options),
-        "successes": [asdict(item) for item in successes],
-        "failures": [asdict(item) for item in failures],
-        "batch": batch_diagnostics or {},
-        "output_directory": str(output_dir or OUTPUTS),
-    }
-    manifest_path = LOGS / f"DLSS5_IMAGE_BATCH_{stamp}.manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    """Compatibility helper for callers that do not use IncrementalImageArchive."""
+    manifest_path = _build_manifest(
+        stamp, options, successes, failures, cancelled,
+        output_dir=output_dir, batch_diagnostics=batch_diagnostics,
+    )
     if not successes or not create_zip:
-        return str(manifest_path), None
+        return manifest_path, None
     zip_path = (output_dir or OUTPUTS) / f"DLSS5_IMAGE_BATCH_{stamp}.zip"
-    output_file = OutputFile(zip_path)
+    archive = IncrementalImageArchive(zip_path, controller)
     try:
-        with zipfile.ZipFile(output_file.temporary, "w", compression=zipfile.ZIP_STORED) as archive:
-            for item in successes:
-                info = zipfile.ZipInfo.from_file(item.output_path, arcname=Path(item.output_path).name)
-                with open(item.output_path, "rb") as source, archive.open(info, "w", force_zip64=True) as target:
-                    while True:
-                        if controller is not None and controller.cancel.is_set():
-                            raise Cancelled("ZIP creation cancelled.")
-                        chunk = source.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        target.write(chunk)
-        if controller is not None and controller.cancel.is_set():
-            raise Cancelled("ZIP creation cancelled.")
-        output_file.publish()
+        for item in successes:
+            archive.add(item.output_path)
+        result = archive.finish(cancelled=cancelled)
+        if archive.error:
+            manifest_path = _build_manifest(
+                stamp, options, successes, failures, cancelled,
+                output_dir=output_dir, batch_diagnostics=batch_diagnostics,
+                archive_error=archive.error,
+            )
+        return manifest_path, result
     except Cancelled:
-        manifest["status"] = "cancelled"
-        if batch_diagnostics:
-            manifest["batch"]["statistics"]["state"] = "Cancelled"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        return str(manifest_path), None
-    finally:
-        output_file.cleanup()
-    return str(manifest_path), str(zip_path)
+        archive.abort()
+        return _build_manifest(
+            stamp, options, successes, failures, True,
+            output_dir=output_dir, batch_diagnostics=batch_diagnostics,
+        ), None

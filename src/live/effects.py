@@ -1,14 +1,15 @@
-"""Debounced effect snapshots and a deadline confined to one native worker."""
+"""Debounced effect snapshots for the serialized in-process bridge."""
 from __future__ import annotations
 
 import subprocess
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 
 from ..core.jobs import Cancelled, JobController
 from ..core.runtime import resolve_native_settings
+from ..core.nr_composition import mask_selection, report_options
 
 EFFECT_DEBOUNCE_SECONDS = 0.5
 EFFECT_REPLACEMENT_TIMEOUT = 15.0
@@ -16,18 +17,27 @@ EFFECT_REPLACEMENT_TIMEOUT = 15.0
 
 @dataclass(frozen=True, slots=True)
 class EffectSettings:
-    nr_preset: str
     nr_style: str
     nr_intensity: float
+    nr_passes: int
     local_tone_strength: float
     local_structure_strength: float
     skin_structure_strength: float
+    nr_color_strength: float
+    tone_preservation: float
+    face_skin_protection: float
+    grain_preservation: float
+    shimmer_suppression: float
+    mask_feather: int
+    nr_mask: object | None
     automatic_mask: bool
-    dlss_model_preset: str
+    nr_gpu_mode: bool
 
     @classmethod
     def from_options(cls, options) -> EffectSettings:
-        result = cls(**{field.name: getattr(options, field.name) for field in fields(cls)})
+        values = {field.name: getattr(options, field.name) for field in fields(cls)}
+        values["nr_mask"] = mask_selection(values["nr_mask"])
+        result = cls(**values)
         resolve_native_settings(result)
         return result
 
@@ -83,14 +93,14 @@ class EffectUpdates:
             return self._applying
 
     def complete(self, request: EffectRequest, *, pts: int, milliseconds: float,
-                 error: str = "", restored: bool = True, worker_pid: int | None = None) -> None:
+                 error: str = "", restored: bool = True) -> None:
         with self._lock:
             changed = [field.name for field in fields(EffectSettings)
                        if getattr(self.applied, field.name) != getattr(request.settings, field.name)]
-            self._history.append({"revision": request.revision, "settings": asdict(request.settings),
+            self._history.append({"revision": request.revision, "settings": report_options(request.settings),
                 "changed": changed, "pts": pts, "refresh_ms": milliseconds,
                 "request_to_frame_ms": (self._clock() - request.requested_at) * 1000,
-                "error": error, "restored": bool(error) and restored, "worker_pid": worker_pid})
+                 "error": error, "restored": bool(error) and restored})
             self._applying = None
             self._error = error
             if error:
@@ -128,18 +138,14 @@ class EffectUpdates:
 
     def report(self) -> dict:
         with self._lock:
-            return {"initial": asdict(self.initial), "applied": asdict(self.applied),
-                    "requested": asdict(self.requested), "requests": self._revision,
+            return {"initial": report_options(self.initial), "applied": report_options(self.applied),
+                    "requested": report_options(self.requested), "requests": self._revision,
                     "applied_count": self._successes, "failed_count": self._failures,
                     "history": list(self._history)}
 
 
 class NativeDeadline(JobController):
-    """Kill only this replacement on timeout; Stop still cancels the whole job.
-
-    The returned worker keeps using this controller after the timer is disarmed.
-    Its processes remain registered with the parent until normal native cleanup.
-    """
+    """Bound an effect-session replacement; Stop still cancels the whole job."""
 
     def __init__(self, parent: JobController, seconds: float) -> None:
         super().__init__()
@@ -192,4 +198,4 @@ class NativeDeadline(JobController):
             if self.cancel.is_set():
                 raise Cancelled("Live stopped.") from exc
             if self.expired.is_set():
-                raise TimeoutError(f"DLSS initialization and verification exceeded {self.seconds:g} seconds.") from exc
+                raise TimeoutError(f"Bridge initialization and verification exceeded {self.seconds:g} seconds.") from exc

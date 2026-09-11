@@ -10,7 +10,7 @@ from pathlib import Path
 from ..core.ffmpeg import HDR_ALLOWED_CODECS
 from ..core.paths import CONFIG_PATH
 from ..core.naming import RENAME_MODES, validate_rename
-from ..core.runtime import DLSS_MODEL_PRESETS, NR_PRESETS, NR_STYLES, resolve_upscaling_mode
+from ..core.runtime import NR_STYLES, resolve_upscaling_mode
 from ..frame_interpolation.models import ENGINE_CHOICES, FPS_CHOICES
 from .migration import _migrate_codec
 from .models import (
@@ -63,6 +63,10 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
     def image_quality() -> int:
         value = number("image_quality", 1, 100, DEFAULT_SETTINGS.image_quality)
         return int(value) if float(value).is_integer() else DEFAULT_SETTINGS.image_quality
+
+    def integer(key: str, minimum: int, maximum: int, default: int) -> int:
+        value = number(key, minimum, maximum, default)
+        return int(value) if float(value).is_integer() else default
 
     def boolean(key: str, default: bool) -> bool:
         raw_value = section.get(key)
@@ -145,9 +149,9 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         or DEFAULT_SETTINGS.ai_gpu_uuid,
         video_gpu_uuid=section.get("video_gpu_uuid", DEFAULT_SETTINGS.video_gpu_uuid).strip()
         or DEFAULT_SETTINGS.video_gpu_uuid,
-        nr_preset=choice("nr_preset", tuple(NR_PRESETS), DEFAULT_SETTINGS.nr_preset),
         nr_style=choice("nr_style", tuple(NR_STYLES), DEFAULT_SETTINGS.nr_style),
         nr_intensity=number("nr_intensity", 0.0, 2.0, DEFAULT_SETTINGS.nr_intensity),
+        nr_passes=integer("nr_passes", 1, 4, DEFAULT_SETTINGS.nr_passes),
         local_tone_strength=number(
             "local_tone_strength", 0.0, 2.0, DEFAULT_SETTINGS.local_tone_strength
         ),
@@ -157,7 +161,26 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
         skin_structure_strength=number(
             "skin_structure_strength", -1.0, 2.0, DEFAULT_SETTINGS.skin_structure_strength
         ),
+        nr_color_strength=number(
+            "nr_color_strength", 0.0, 1.0, DEFAULT_SETTINGS.nr_color_strength
+        ),
+        tone_preservation=number(
+            "tone_preservation", 0.0, 1.0, DEFAULT_SETTINGS.tone_preservation
+        ),
+        face_skin_protection=number(
+            "face_skin_protection", 0.0, 1.0, DEFAULT_SETTINGS.face_skin_protection
+        ),
+        grain_preservation=number(
+            "grain_preservation", 0.0, 1.0, DEFAULT_SETTINGS.grain_preservation
+        ),
+        shimmer_suppression=number(
+            "shimmer_suppression", 0.0, 1.0, DEFAULT_SETTINGS.shimmer_suppression
+        ),
+        mask_feather=int(number(
+            "mask_feather", 0, 128, DEFAULT_SETTINGS.mask_feather
+        )),
         automatic_mask=boolean("automatic_mask", DEFAULT_SETTINGS.automatic_mask),
+        nr_gpu_mode=boolean("nr_gpu_mode", DEFAULT_SETTINGS.nr_gpu_mode),
         upscaling_factor=upscaling_factor(),
         codec=codec_choice("codec", DEFAULT_SETTINGS.codec),
         container=choice("container", CONTAINER_CHOICES, DEFAULT_SETTINGS.container),
@@ -167,11 +190,6 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "image_format", IMAGE_FORMAT_CHOICES, DEFAULT_SETTINGS.image_format
         ),
         image_quality=image_quality(),
-        dlss_model_preset=choice(
-            "dlss_model_preset",
-            tuple(DLSS_MODEL_PRESETS),
-            DEFAULT_SETTINGS.dlss_model_preset,
-        ),
         image_rename_mode=image_rename_mode,
         image_custom_suffix=image_custom_suffix,
         video_rename_mode=video_rename_mode,
@@ -203,6 +221,9 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
             "preview_encoding",
             PREVIEW_ENCODING_CHOICES,
             DEFAULT_SETTINGS.preview_encoding,
+        ),
+        full_size_image_previews=boolean(
+            "full_size_image_previews", DEFAULT_SETTINGS.full_size_image_previews
         ),
         upscale_mode=choice(
             "upscale_mode",
@@ -257,13 +278,20 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "upscale_mode": settings.upscale_mode,
         "ai_gpu_uuid": settings.ai_gpu_uuid,
         "video_gpu_uuid": settings.video_gpu_uuid,
-        "nr_preset": settings.nr_preset,
         "nr_style": settings.nr_style,
         "nr_intensity": f"{settings.nr_intensity:.2f}",
+        "nr_passes": str(settings.nr_passes),
         "local_tone_strength": f"{settings.local_tone_strength:.2f}",
         "local_structure_strength": f"{settings.local_structure_strength:.2f}",
         "skin_structure_strength": f"{settings.skin_structure_strength:.2f}",
+        "nr_color_strength": f"{settings.nr_color_strength:.2f}",
+        "tone_preservation": f"{settings.tone_preservation:.2f}",
+        "face_skin_protection": f"{settings.face_skin_protection:.2f}",
+        "grain_preservation": f"{settings.grain_preservation:.2f}",
+        "shimmer_suppression": f"{settings.shimmer_suppression:.2f}",
+        "mask_feather": str(settings.mask_feather),
         "automatic_mask": str(settings.automatic_mask).lower(),
+        "nr_gpu_mode": str(settings.nr_gpu_mode).lower(),
         "upscaling_factor": f"{settings.upscaling_factor:g}",
         "codec": settings.codec,
         "container": settings.container,
@@ -275,7 +303,6 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "image_custom_suffix": settings.image_custom_suffix,
         "video_rename_mode": settings.video_rename_mode,
         "video_custom_suffix": settings.video_custom_suffix,
-        "dlss_model_preset": settings.dlss_model_preset,
         "frame_interpolation_target_fps": settings.frame_interpolation_target_fps,
         "frame_interpolation_engine": settings.frame_interpolation_engine,
         "frame_interpolation_codec": settings.frame_interpolation_codec,
@@ -285,6 +312,7 @@ def save_settings(path: str | os.PathLike[str], settings: UISettings) -> None:
         "frame_interpolation_rename_mode": settings.frame_interpolation_rename_mode,
         "frame_interpolation_custom_suffix": settings.frame_interpolation_custom_suffix,
         "preview_encoding": settings.preview_encoding,
+        "full_size_image_previews": str(settings.full_size_image_previews).lower(),
     }
 
     temporary = config_path.with_name(f".{config_path.name}.tmp")
@@ -318,3 +346,10 @@ def current_preview_encoding() -> str:
     with SETTINGS_STATE.lock:
         settings = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
     return normalize_preview_encoding(settings.preview_encoding)
+
+
+def full_size_image_previews_enabled() -> bool:
+    """Return the saved image-preview quality mode for one operation snapshot."""
+    with SETTINGS_STATE.lock:
+        settings = SETTINGS_STATE.current or load_settings(CONFIG_PATH)
+    return bool(settings.full_size_image_previews)

@@ -6,6 +6,12 @@ Portable Windows application for applying DLSS 5 Neural Rendering to images and 
 
 <img width="1810" height="1000" alt="Screenshot 2026-09-03 005153" src="https://github.com/user-attachments/assets/ad15df03-2934-4a20-90ca-5a6514a5de32" />
 
+## Installation
+
+1. Download the [latest release](https://github.com/Merserk/dlss5-visual-enhancer/releases/latest).
+2. Unpack the downloaded ZIP archive.
+3. Run `start.bat`.
+
 ### Original
 
 https://github.com/user-attachments/assets/8df8bd4c-01b4-47dd-9705-3614a0b0ff75
@@ -17,12 +23,6 @@ https://github.com/user-attachments/assets/cff68783-4ee9-4c99-8b36-4eee2a6437ec
 ### Frame Generation (DLSSG)
 
 https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
-
-## Installation
-
-1. Download the [latest release](https://github.com/Merserk/dlss5-visual-enhancer/releases/latest).
-2. Unpack the downloaded ZIP archive.
-3. Run `start.bat`.
 
 ## Main features
 

@@ -24,8 +24,6 @@ https://github.com/user-attachments/assets/81c29005-e4f0-4acf-b9f7-d58850bb055f
 2. Unpack the downloaded ZIP archive.
 3. Run `start.bat`.
 
-The application is portable and uses the Python runtime and media tools included with the release package.
-
 ## Main features
 
 - **Neuroframe Engine:** new self-contained DLSS 5 Neural Rendering engine built around the NVIDIA NGX/DLSS runtime. Neural Rendering no longer depends on an external graphics injector or add-on. The engine supports a GPU-focused VRAM path and a RAM staging path that can be selected from Settings.

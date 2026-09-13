@@ -6,7 +6,7 @@ def build_about_tab():
         """
         <section class="about-details" aria-labelledby="about-name">
             <h2 id="about-name">DLSS 5 Visual Enhancer</h2>
-            <p class="about-version">Version v8.0</p>
+            <p class="about-version">Version v9.0</p>
             <div class="about-links">
                 <p>
                     <a href="https://github.com/Merserk/dlss5-visual-enhancer"

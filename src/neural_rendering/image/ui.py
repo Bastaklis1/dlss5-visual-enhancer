@@ -298,6 +298,7 @@ class ImageTab:
     input_path: object = None
     output_path: object = None
     job_state: object = None
+    refresh_realtime_preview_after: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -381,7 +382,7 @@ def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
 
 
 def bind_image_events(tab: ImageTab) -> None:
-    bind_batch_ui(
+    tab.refresh_realtime_preview_after = bind_batch_ui(
         tab, render_image_batch, kind="image", preview_mode=preview_input_images,
         archive_prefix="DLSS5_IMAGE_BATCH",
         preview_actions=[(tab.preview, preview_rendered_image)],

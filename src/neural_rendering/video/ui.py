@@ -9,7 +9,7 @@ from ...core.batch_ui import (
     BATCH_HEADERS, bind_batch_ui, build_media_clear_button, build_media_select_button,
     build_path_controls, build_save_controls,
 )
-from ...core.ffmpeg import hdr_mode_supported
+from ...core.ffmpeg import container_for_codec, hdr_mode_supported
 from ...core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
 from ...core.naming import RENAME_MODES
 from ...core.runtime import NR_STYLES, UPSCALING_MODES
@@ -286,6 +286,7 @@ class VideoTab:
     input_path: object = None
     output_path: object = None
     job_state: object = None
+    refresh_realtime_preview_after: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -343,7 +344,10 @@ def build_video_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
                 codec = gr.Dropdown(
                     CODEC_CHOICES, value=settings.codec, label="Video codec",
                 )
-                container = gr.Dropdown(CONTAINER_CHOICES, value=settings.container, label="Container")
+                container = gr.Dropdown(
+                    CONTAINER_CHOICES, value=container_for_codec(settings.codec),
+                    label="Container (automatic)", interactive=False,
+                )
             with gr.Row():
                 rename_mode = gr.Radio(
                     RENAME_MODES, value=settings.video_rename_mode, label="Rename",
@@ -379,7 +383,7 @@ def build_video_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
 
 
 def bind_video_events(tab: VideoTab) -> None:
-    bind_batch_ui(
+    tab.refresh_realtime_preview_after = bind_batch_ui(
         tab, render_video_batch, kind="video", preview_mode=update_video_preview_mode,
         archive_prefix="DLSS5_VIDEO_BATCH",
         preview_actions=[(tab.preview_frame, preview_one_frame), (tab.preview, preview_video)],
@@ -387,4 +391,10 @@ def bind_video_events(tab: VideoTab) -> None:
         realtime_components=tab.neural,
     )
     tab.rename_mode.change(rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False)
-    tab.codec.change(hdr_mode_update, inputs=tab.codec, outputs=tab.hdr_mode, queue=False)
+    tab.codec.change(
+        lambda selected: (
+            gr.update(value=container_for_codec(selected)),
+            hdr_mode_update(selected),
+        ),
+        inputs=tab.codec, outputs=[tab.container, tab.hdr_mode], queue=False,
+    )

@@ -9,6 +9,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
+from .app_context import register_allowed_directory
 from .naming import require_available_output
 from .paths import OUTPUTS
 
@@ -57,9 +58,11 @@ def resolve_inputs(input_path: str | None, uploads, kind: str) -> list[str]:
         if path.is_file():
             if not supported_file(path, kind):
                 raise ValueError(f"Not a supported {kind} file: {path.name}")
+            register_allowed_directory(path.parent)
             return [str(path)]
         if not path.is_dir():
             raise ValueError(f"Input path does not exist or is not accessible: {path}")
+        register_allowed_directory(path)
         files = sorted(
             (item for item in path.iterdir() if item.is_file() and supported_file(item, kind)),
             key=lambda item: (item.name.casefold(), item.name),
@@ -84,6 +87,13 @@ def prepare_output_dir(value=None, *, default: Path = OUTPUTS, user_input: bool 
     # Check actual create permission, including ACLs and network shares.
     with tempfile.TemporaryFile(dir=directory):
         pass
+    # Registered here (not just once at launch for the default OUTPUTS dir)
+    # so a disk-mode custom output folder -- which could be anywhere -- is
+    # always safe for a later "Send to Comparison" to actually load, and so
+    # this always matches the exact resolved path files are really written
+    # to, sidestepping any mismatch between this and a separately-computed
+    # allowed_paths entry (e.g. symlinks, junctions, or other path quirks).
+    register_allowed_directory(directory)
     return directory
 
 

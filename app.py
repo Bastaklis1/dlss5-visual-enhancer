@@ -23,6 +23,7 @@ from src.about.ui import build_about_tab
 from src.compare.grid_ui import bind_grid_events, build_grid_tab
 from src.compare.ui import bind_comparison_events, build_compare_tab
 from src.compare.video_ui import SYNC_PLAYER_HEAD_SCRIPT
+from src.core.app_context import set_blocks
 from src.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
     CACHE_SWEEP_INTERVAL_SECONDS,
@@ -31,6 +32,7 @@ from src.core.cache_cleanup import (
 from src.core.paths import LIVE_DIR, LOGS, OUTPUTS
 from src.core.runtime import prepare_runtime
 from src.core.terminal import init_console
+from src.diagnostics.ui import bind_diagnostics_events, build_diagnostics_tab
 from src.frame_interpolation.ui import build_frame_interpolation_tab
 from src.live.ui import build_live_tab
 from src.neural_rendering.image.decoder import initialize_image_runtime
@@ -236,6 +238,8 @@ def build_app() -> gr.Blocks:
                 grid_tab = build_grid_tab(settings)
             with gr.Tab("Settings", id="settings"):
                 settings_tab = build_settings_tab(settings, ai_gpu_choices, video_gpu_choices)
+            with gr.Tab("Diagnostics", id="diagnostics"):
+                diagnostics_tab = build_diagnostics_tab()
             with gr.Tab("About", id="about"):
                 build_about_tab()
 
@@ -247,15 +251,13 @@ def build_app() -> gr.Blocks:
             live_tab,
             upscale_tab,
         )
-        # Video, Frame Interpolation, Live, and Upscale aren't wired into Comparison yet
-        # (each needs a synced player or a different flow, not the image before/after
-        # slider) — that's a later phase.
         bind_comparison_events(
             compare_tab, tabs, image_tab=neural_rendering_tab.image, grid_tab=grid_tab,
             video_tab=neural_rendering_tab.video, frame_tab=frame_tab,
             upscale_image_tab=upscale_tab.image, upscale_video_tab=upscale_tab.video,
         )
         bind_grid_events(grid_tab, neural_rendering_tab.image)
+        bind_diagnostics_events(diagnostics_tab)
     return demo
 
 def main() -> None:
@@ -304,6 +306,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     demo = build_app()
+    set_blocks(demo)
     # Replace loading screen with final DLSS 5 Visual Enhancer splash
     try:
         ui.render_screen()
@@ -316,7 +319,7 @@ def main() -> None:
             server_name="127.0.0.1",
             inbrowser=True,
             share=False,
-            allowed_paths=[str(OUTPUTS.resolve())],
+            allowed_paths=[str(OUTPUTS.resolve()), str(LOGS.resolve())],
             show_error=True,
             quiet=True,
             head=SYNC_PLAYER_HEAD_SCRIPT,

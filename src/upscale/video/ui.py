@@ -12,6 +12,7 @@ from ...core.batch_ui import (
 from ...core.disk_paths import resolve_inputs
 from ...core.ffmpeg import CODEC_CHOICES, ENCODING_QUALITIES, container_for_codec, hdr_mode_supported
 from ...core.naming import RENAME_MODES
+from ...core.preview_duration import build_duration_control
 from ...settings.storage import processing_gpu_settings
 from .batch import upscale_videos
 from .components import ManagedVideo
@@ -41,12 +42,12 @@ def render_upscale_batch(paths, *values, progress=None, output_dir=None, control
     return gr.update(value=output, visible=not direct_disk, label="SDR tone-mapped preview (download original for HDR)" if options.hdr_enabled and detail.startswith("SDR") else "Output video"), files, [], status
 
 
-def preview_frame(paths, *values, progress=gr.Progress(track_tqdm=False)):
-    return preview_upscale(paths, options_from_values(values), one_frame=True, progress=lambda v,m: progress(v, desc=m))
-
-
-def preview_clip(paths, *values, progress=gr.Progress(track_tqdm=False)):
-    return preview_upscale(paths, options_from_values(values), progress=lambda v,m: progress(v, desc=m))
+def preview_with_duration(paths, *values, progress=gr.Progress(track_tqdm=False)):
+    *settings_values, duration = values
+    return preview_upscale(
+        paths, options_from_values(settings_values), duration=duration,
+        progress=lambda v, m: progress(v, desc=m),
+    )
 
 
 def describe_size(paths, input_path, *values):
@@ -75,7 +76,7 @@ class UpscaleTab:
     select_source: object
     clear_source: object
     controls: dict
-    preview_frame: object
+    preview_duration: object
     preview: object
     render: object
     stop: object
@@ -84,11 +85,13 @@ class UpscaleTab:
     save_download: object
     zip_button: object
     zip_download: object
+    send_to_compare: object
     status: object
     results: object
     input_path: object
     output_path: object
     job_state: object = None
+    last_preview_path: object = None
 
     @property
     def settings_inputs(self):
@@ -100,7 +103,7 @@ class UpscaleTab:
 
     @property
     def preview_inputs(self):
-        return self.render_inputs
+        return [*self.render_inputs, self.preview_duration]
 
 
 def build_upscale_tab(settings):
@@ -123,8 +126,8 @@ def build_upscale_tab(settings):
             with gr.Row():
                 render = gr.Button("Upscale video(s)", variant="primary")
                 stop = gr.Button("Stop", variant="stop")
-                preview_frame_button = gr.Button("Preview 1 frame", visible=False)
-                preview_button = gr.Button("Preview 3 sec", visible=False)
+                preview_duration = build_duration_control(allow_single_frame=True)
+                preview_button = gr.Button("Preview", visible=False)
                 reset = gr.Button("Reset settings")
             with gr.Column():
                 c["vsr_enabled"] = gr.Checkbox(value=opts.vsr_enabled, label="Enable")
@@ -167,14 +170,18 @@ def build_upscale_tab(settings):
                 label="Output video", interactive=False, visible=True, height=520,
             )
             save_download, zip_button, zip_download = build_save_controls("video", "upscale-video")
+            send_to_compare = gr.Button("Send to Comparison")
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(headers=BATCH_HEADERS, datatype=["str"]*len(BATCH_HEADERS), interactive=False, label="Batch results", wrap=True)
-    tab = UpscaleTab(sources, input_preview, input_actions, select_source, clear_source, c, preview_frame_button, preview_button, render, stop, reset,
-                     output_video, save_download, zip_button, zip_download, status, results, input_path, output_path)
+    tab = UpscaleTab(sources, input_preview, input_actions, select_source, clear_source, c, preview_duration, preview_button, render, stop, reset,
+                     output_video, save_download, zip_button, zip_download, send_to_compare, status, results, input_path, output_path)
+    tab.last_preview_path = gr.State(None)
     bind_batch_ui(
         tab, render_upscale_batch, kind="video", preview_mode=preview_mode,
         archive_prefix="RTXVIDEO_VIDEO_BATCH",
-        preview_actions=[(tab.preview_frame, preview_frame), (tab.preview, preview_clip)],
+        preview_actions=[(tab.preview, preview_with_duration)],
+        preview_controls=[tab.preview_duration],
+        preview_result_state=tab.last_preview_path,
     )
     c["hdr_enabled"].change(lambda enabled: gr.update(visible=enabled), inputs=c["hdr_enabled"], outputs=hdr_controls, queue=False)
     c["codec"].change(

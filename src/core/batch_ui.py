@@ -333,13 +333,26 @@ def _archive_trigger_js(elem_id: str) -> str:
 
 def bind_batch_ui(
     tab, render_function, *, kind, preview_mode, archive_prefix: str, preview_actions=(),
-    realtime_preview=None, realtime_components=(),
+    realtime_preview=None, realtime_components=(), preview_controls=(), preview_result_state=None,
 ):
     """Bind one batch tab, including direct single-file and lazy multi-file downloads.
 
     Render callbacks return four values: display media, successful master output
     paths, batch rows, and status text.  The archive is intentionally *not* part
     of rendering; it is created only when the user clicks Save as ZIP.
+
+    `preview_controls` are non-button preview components (e.g. the shared
+    duration dropdown from `core.preview_duration`) that should show/hide and
+    enable/disable in lockstep with the preview buttons, without themselves
+    having a `.click()` handler wired up.
+
+    `preview_result_state`, if given, is a `gr.State` that gets the most
+    recent successful preview's output path -- letting "Send to Comparison"
+    offer the preview itself as a candidate, not just a completed full render
+    from `tab.results`. Only covers the manual Preview-button path
+    (`guarded_preview` below); the newer automatic/realtime preview
+    (`realtime_preview`) is a separate v9.0 mechanism and isn't wired into
+    this yet -- a reasonable follow-up, not required for parity with v7.0.
     """
     tab.job_state = gr.State(value=lambda: uuid.uuid4().hex, delete_callback=release_view)
     is_image = kind == "image"
@@ -350,12 +363,23 @@ def bind_batch_ui(
     archive_download = tab.zip_download
     media_outputs = [display_media, direct_save, archive_button, archive_download]
     preview_buttons = [button for button, _fn in preview_actions]
+    preview_visibility = [*preview_buttons, *preview_controls]
     controls = [
         tab.sources, tab.select_source, tab.clear_source, tab.input_path, tab.output_path,
-        tab.render, tab.reset, *preview_buttons,
+        tab.render, tab.reset, *preview_visibility,
     ]
     outputs = [*media_outputs, tab.results, tab.status, *controls]
     path_inputs = [tab.job_state, tab.input_path, tab.output_path]
+
+    def _resolve_preview_path(value):
+        """Preview functions sometimes wrap their output path in gr.update(...)
+        (Upscale Video does, to also set visibility/label) and sometimes
+        return the path directly (Neural Rendering Video, Frame
+        Interpolation). Normalize either shape to the actual path so it can
+        be stored for a later "send this preview to Comparison" action."""
+        if hasattr(value, "get"):
+            return value.get("value")
+        return value
 
     def empty_save_controls():
         return (
@@ -442,12 +466,12 @@ def bind_batch_ui(
             with view.lock:
                 if revision == view.revision:
                     view.input_ready = True
-            return [gr.skip()] * (1 + len(media_outputs) + len(preview_buttons) + 2)
+            return [gr.skip()] * (1 + len(media_outputs) + len(preview_visibility) + 2)
         show_input_media = False
         try:
             if disk:
                 values = [gr.update(value=None, visible="hidden"), *empty_media(True),
-                          *[gr.update(visible=False) for _ in preview_buttons]]
+                          *[gr.update(visible=False) for _ in preview_visibility]]
             elif is_image:
                 previews = preview_mode(args[0])
                 show_input_media = bool(previews)
@@ -455,7 +479,7 @@ def bind_batch_ui(
                 values = [
                     gr.update(value=previews, visible=_stable_visible(show_input_media)),
                     *empty_media(False),
-                    *[gr.update(visible=source_count == 1) for _ in preview_buttons],
+                    *[gr.update(visible=source_count == 1) for _ in preview_visibility],
                 ]
             else:
                 input_update, output_update, *buttons = preview_mode(*args)
@@ -469,7 +493,7 @@ def bind_batch_ui(
             raise
         with view.lock:
             if revision != view.revision:
-                return [gr.skip()] * (1 + len(media_outputs) + len(preview_buttons) + 2)
+                return [gr.skip()] * (1 + len(media_outputs) + len(preview_visibility) + 2)
             view.input_ready = True
         source_update, actions_update = input_surface_updates(show_input_media, input_path)
         return [*values, source_update, actions_update]
@@ -478,7 +502,7 @@ def bind_batch_ui(
     if hasattr(tab, "target_fps"):
         source_args += [tab.target_fps, tab.engine]
     refresh_outputs = [
-        input_media, *media_outputs, *preview_buttons,
+        input_media, *media_outputs, *preview_visibility,
         tab.sources, tab.input_actions,
     ]
     tab.select_source.upload(
@@ -632,9 +656,14 @@ def bind_batch_ui(
     )
 
     def guarded_preview(function):
+        extra_slots = int(preview_result_state is not None)
+
         def preview(key, input_path, output_path, *args, progress=gr.Progress(track_tqdm=False)):
             def empty_preview(media, status):
-                return (media, status, *empty_save_controls())
+                values = (media, status, *empty_save_controls())
+                if preview_result_state is not None:
+                    values += (gr.skip(),)  # a blocked/cancelled preview isn't a new "last preview"
+                return values
 
             view = _view(key)
             if direct_disk_mode(input_path, output_path):
@@ -656,7 +685,7 @@ def bind_batch_ui(
             # Hide every save action before expensive preview work starts so a
             # previous completed render can never be downloaded as if it were
             # the new preview/result.
-            yield (gr.skip(), gr.skip(), *empty_save_controls())
+            yield (gr.skip(), gr.skip(), *empty_save_controls(), *((gr.skip(),) if extra_slots else ()))
             try:
                 with use_job_controller(job.controller):
                     result = function(*args, progress=progress)
@@ -666,9 +695,10 @@ def bind_batch_ui(
                 with view.lock:
                     stale = view.revision != revision or view.disk
                 if stale:
-                    yield (gr.skip(),) * 5
+                    yield (gr.skip(),) * (5 + extra_slots)
                     return
-                yield (*result, *empty_save_controls())
+                extra = (_resolve_preview_path(result[0]),) if preview_result_state is not None else ()
+                yield (*result, *empty_save_controls(), *extra)
             finally:
                 job.done.set()
                 with view.lock:
@@ -677,10 +707,13 @@ def bind_batch_ui(
         return preview
 
     for button, function in preview_actions:
+        preview_outputs = [display_media, tab.status, direct_save, archive_button, archive_download]
+        if preview_result_state is not None:
+            preview_outputs.append(preview_result_state)
         button.click(
             guarded_preview(function),
             inputs=[*path_inputs, *tab.preview_inputs],
-            outputs=[display_media, tab.status, direct_save, archive_button, archive_download],
+            outputs=preview_outputs,
             concurrency_limit=None,
             show_progress="hidden",
         )

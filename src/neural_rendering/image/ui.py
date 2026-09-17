@@ -12,6 +12,7 @@ from ...core.batch_ui import (
 from PIL import Image
 
 from ...core.naming import RENAME_MODES
+from ...core.paths import OUTPUTS
 from ...core.runtime import NR_STYLES, UPSCALING_MODES
 from ...settings.models import AUTOMATIC_MASK_CHOICES, UISettings, automatic_mask_choice, parse_automatic_mask
 from ...settings.storage import full_size_image_previews_enabled, processing_gpu_settings
@@ -181,9 +182,12 @@ def render_image_batch(
         progress(value, desc=message)
 
     try:
-        result = convert_images(input_paths, options, progress=report, output_dir=output_dir,
-                                controller=controller, on_item_update=on_item_update,
-                                generate_previews=not direct_disk and not full_size, create_zip=False)
+        result = convert_images(
+            input_paths, options, progress=report,
+            output_dir=output_dir if direct_disk else (output_dir or (OUTPUTS / "images")),
+            controller=controller, on_item_update=on_item_update,
+            generate_previews=not direct_disk and not full_size, create_zip=False,
+        )
     except Exception as exc:
         traceback.print_exc()
         if on_item_update is not None:
@@ -293,12 +297,14 @@ class ImageTab:
     save_download: object
     zip_button: object
     zip_download: object
+    send_to_compare: object
     status: object
     results: object
     input_path: object = None
     output_path: object = None
     job_state: object = None
     refresh_realtime_preview_after: object = None
+    preview_result_state: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -366,6 +372,7 @@ def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
                 elem_id="image-output-preview",
             )
             save_download, zip_button, zip_download = build_save_controls("image", "nr-image")
+            send_to_compare = gr.Button("Send to Comparison")
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
                 headers=BATCH_HEADERS,
@@ -374,7 +381,8 @@ def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
             )
     tab = ImageTab(
         sources, input_gallery, input_actions, select_source, clear_source, neural, composition, mask_state, gpu_mode_state, output_format, quality, rename_mode,
-        custom_suffix, render, stop, preview, reset, output_gallery, save_download, zip_button, zip_download, status, results
+        custom_suffix, render, stop, preview, reset, output_gallery, save_download, zip_button, zip_download,
+        send_to_compare, status, results
     )
     tab.input_path, tab.output_path = input_path, output_path
     bind_image_events(tab)
@@ -382,12 +390,14 @@ def build_image_tab(settings: UISettings, gpu_mode_state: object, mask_state: ob
 
 
 def bind_image_events(tab: ImageTab) -> None:
+    tab.preview_result_state = gr.State(value=None)
     tab.refresh_realtime_preview_after = bind_batch_ui(
         tab, render_image_batch, kind="image", preview_mode=preview_input_images,
         archive_prefix="DLSS5_IMAGE_BATCH",
         preview_actions=[(tab.preview, preview_rendered_image)],
         realtime_preview=preview_rendered_image,
         realtime_components=tab.neural,
+        preview_result_state=tab.preview_result_state,
     )
     tab.rename_mode.change(
         rename_suffix_update, inputs=tab.rename_mode, outputs=tab.custom_suffix, queue=False,

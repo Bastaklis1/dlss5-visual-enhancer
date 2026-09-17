@@ -10,6 +10,7 @@ from ...core.ffmpeg.preview import (
     is_browser_playable, make_browser_preview, normalize_preview_encoding,
     resolve_final_preview, resolve_preview_codec, wants_compat_preview,
 )
+from ...core.preview_duration import resolve_duration
 from ...settings.models import coerce_hdr_mode, parse_automatic_mask
 from ...settings.storage import current_preview_encoding, processing_gpu_settings
 from .models import ConversionOptions
@@ -195,6 +196,49 @@ def update_video_preview_mode(paths: list[str] | str | None):
         gr.update(visible=single),
         gr.update(visible=single),
     )
+
+def preview_with_duration(
+    input_path: list[str] | str | None,
+    nr_style: str,
+    nr_intensity: float,
+    nr_passes: float,
+    local_tone_strength: float,
+    local_structure_strength: float,
+    skin_structure_strength: float,
+    upscaling_factor: float,
+    automatic_mask: str,
+    nr_color_strength: float,
+    tone_preservation: float,
+    face_skin_protection: float,
+    grain_preservation: float,
+    mask_feather: float,
+    shimmer_suppression: float,
+    nr_mask: object | None,
+    nr_gpu_mode: bool,
+    codec: str,
+    container: str,
+    quality: str,
+    hdr_mode: bool,
+    duration: str,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """The fork's single "Preview" button, duration-selectable (1 frame/3s/
+    5s/10s via core.preview_duration) -- replaces the old fixed "Preview 1
+    frame"/"Preview 3 sec" button pair. Distinct from preview_one_frame,
+    which v9.0 upstream added as the realtime/automatic preview's own
+    callback (fires on slider change) and needs to keep its own signature
+    for that wiring."""
+    selected = first_video_path(input_path)
+    preview_seconds, preview_frames = resolve_duration(duration)
+    return _process_video(
+        selected, nr_style, nr_intensity, nr_passes, local_tone_strength, local_structure_strength,
+        skin_structure_strength, upscaling_factor, automatic_mask,
+        nr_color_strength, tone_preservation, face_skin_protection, grain_preservation,
+        mask_feather, shimmer_suppression, nr_mask, nr_gpu_mode,
+        codec, container, quality, hdr_mode,
+        progress, preview_seconds, preview_frames,
+    )
+
 
 def preview_video(
     input_path: list[str] | str | None,

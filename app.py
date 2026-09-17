@@ -30,6 +30,10 @@ except Exception:
 import gradio as gr
 
 from src.about.ui import build_about_tab
+from src.compare.grid_ui import bind_grid_events, build_grid_tab
+from src.compare.ui import bind_comparison_events, build_compare_tab
+from src.compare.video_ui import SYNC_PLAYER_HEAD_SCRIPT
+from src.core.app_context import set_blocks
 from src.core.batch_ui import bind_input_surface_reactivation
 from src.core.cache_cleanup import (
     CACHE_MAX_AGE_SECONDS,
@@ -37,6 +41,7 @@ from src.core.cache_cleanup import (
     cleanup_old_caches,
 )
 from src.core.paths import LIVE_DIR, LOGS, OUTPUTS
+from src.diagnostics.ui import bind_diagnostics_events, build_diagnostics_tab
 from src.core.runtime import prepare_runtime
 from src.core.terminal import init_console
 from src.frame_interpolation.ui import build_frame_interpolation_tab
@@ -356,7 +361,7 @@ def build_app() -> gr.Blocks:
         # Video processors derive CUDA versus host staging from their codec.
         processing_engine_state = gr.State(value=True)
         nr_mask_state = gr.State(value=None)
-        with gr.Tabs(selected="neural-rendering", elem_id="main-tabs"):
+        with gr.Tabs(selected="neural-rendering", elem_id="main-tabs") as tabs:
             # Keep every tab tree mounted from first paint. Stateful File/Gallery/Video
             # components otherwise get lazily mounted when a tab is first selected,
             # which can briefly restore their construction-time visibility/value state.
@@ -366,6 +371,12 @@ def build_app() -> gr.Blocks:
                 upscale_tab = build_upscale_tab(settings)
             with gr.Tab("Frame Interpolation", id="frame-interpolation", render_children=True) as frame_root_tab:
                 frame_tab = build_frame_interpolation_tab(settings)
+            with gr.Tab("Comparison", id="compare", render_children=True) as compare_root_tab:
+                compare_tab = build_compare_tab()
+            with gr.Tab("Grid", id="grid", render_children=True) as grid_root_tab:
+                grid_tab = build_grid_tab(settings)
+            with gr.Tab("Diagnostics", id="diagnostics", render_children=True) as diagnostics_root_tab:
+                diagnostics_tab = build_diagnostics_tab()
             with gr.Tab("Live", id="live", render_children=True) as live_root_tab:
                 live_tab = build_live_tab(settings, processing_engine_state, nr_mask_state)
             with gr.Tab("Settings", id="settings", render_children=True) as settings_root_tab:
@@ -381,8 +392,8 @@ def build_app() -> gr.Blocks:
             });
         }"""
         for root_tab in (
-            neural_root_tab, upscale_root_tab, frame_root_tab,
-            live_root_tab, settings_root_tab, about_root_tab,
+            neural_root_tab, upscale_root_tab, frame_root_tab, compare_root_tab,
+            grid_root_tab, diagnostics_root_tab, live_root_tab, settings_root_tab, about_root_tab,
         ):
             root_tab.select(
                 None, js=pause_media_js, queue=False, show_progress="hidden",
@@ -397,6 +408,14 @@ def build_app() -> gr.Blocks:
         bind_input_surface_reactivation(upscale_root_tab, upscale_tab.image, kind="image", event_name="select")
         bind_input_surface_reactivation(upscale_root_tab, upscale_tab.video, kind="video", event_name="select")
         bind_input_surface_reactivation(frame_root_tab, frame_tab, kind="video", event_name="select")
+
+        bind_comparison_events(
+            compare_tab, tabs, image_tab=neural_rendering_tab.image, grid_tab=grid_tab,
+            video_tab=neural_rendering_tab.video, frame_tab=frame_tab,
+            upscale_image_tab=upscale_tab.image, upscale_video_tab=upscale_tab.video,
+        )
+        bind_grid_events(grid_tab, neural_rendering_tab.image)
+        bind_diagnostics_events(diagnostics_tab)
 
         bind_settings_events(
             settings_tab,
@@ -513,6 +532,7 @@ def main() -> None:
         pass
 
     demo = build_app()
+    set_blocks(demo)
     # Replace loading screen with final DLSS 5 Visual Enhancer splash
     try:
         ui.render_screen()
@@ -525,9 +545,10 @@ def main() -> None:
             server_name="127.0.0.1",
             inbrowser=True,
             share=False,
-            allowed_paths=[str(OUTPUTS.resolve())],
+            allowed_paths=[str(OUTPUTS.resolve()), str(LOGS.resolve())],
             show_error=True,
             quiet=True,
+            head=SYNC_PLAYER_HEAD_SCRIPT,
         )
     except KeyboardInterrupt:
         pass

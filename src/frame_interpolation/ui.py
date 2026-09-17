@@ -13,6 +13,8 @@ from ..core.batch_ui import (
 from ..core.ffmpeg import container_for_codec, hdr_mode_supported
 from ..core.ffmpeg.preview import normalize_preview_encoding, resolve_final_preview
 from ..core.naming import RENAME_MODES
+from ..core.paths import OUTPUTS
+from ..core.preview_duration import build_duration_control
 from ..settings.models import CODEC_CHOICES, CONTAINER_CHOICES, QUALITY_CHOICES, UISettings, coerce_hdr_mode
 from ..settings.storage import current_preview_encoding, processing_gpu_settings
 from .batch import interpolate_videos
@@ -68,8 +70,11 @@ def render_frame_interpolation_batch(
         progress(value, desc=message)
 
     try:
-        result = interpolate_videos(paths, options, report, output_dir=output_dir,
-                                    controller=controller, on_item_update=on_item_update)
+        result = interpolate_videos(
+            paths, options, report,
+            output_dir=output_dir if direct_disk else (output_dir or (OUTPUTS / "frame_interpolation")),
+            controller=controller, on_item_update=on_item_update,
+        )
     except Exception as exc:
         traceback.print_exc()
         if on_item_update is not None:
@@ -134,6 +139,7 @@ class FrameInterpolationTab:
     rename_mode: object
     custom_suffix: object
     hdr_mode: object
+    preview_duration: object
     preview: object
     render: object
     stop: object
@@ -142,11 +148,13 @@ class FrameInterpolationTab:
     save_download: object
     zip_button: object
     zip_download: object
+    send_to_compare: object
     status: object
     results: object
     input_path: object = None
     output_path: object = None
     job_state: object = None
+    last_preview_path: object = None
 
     @property
     def render_inputs(self) -> list[object]:
@@ -157,7 +165,10 @@ class FrameInterpolationTab:
 
     @property
     def preview_inputs(self) -> list[object]:
-        return [self.sources, self.target_fps, self.engine, self.codec, self.container, self.quality]
+        return [
+            self.sources, self.target_fps, self.engine, self.codec, self.container, self.quality,
+            self.preview_duration,
+        ]
 
     @property
     def settings_inputs(self) -> list[object]:
@@ -186,7 +197,8 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 clear_source = build_media_clear_button("frame-interpolation-clear-input")
             with gr.Row():
                 render = gr.Button("Interpolate video(s)", variant="primary")
-                preview = gr.Button("Preview 3 sec", visible=False)
+                preview_duration = build_duration_control(allow_single_frame=False)
+                preview = gr.Button("Preview", visible=False)
                 stop = gr.Button("Stop", variant="stop")
                 reset = gr.Button("Reset settings")
             with gr.Column():
@@ -231,6 +243,7 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
                 label="Interpolated output", interactive=False, visible=True, height=520,
             )
             save_download, zip_button, zip_download = build_save_controls("video", "frame-interpolation")
+            send_to_compare = gr.Button("Send to Comparison")
             status = gr.Textbox(label="Status", interactive=False, lines=5, max_lines=12)
             results = gr.Dataframe(
                 headers=BATCH_HEADERS,
@@ -242,10 +255,11 @@ def build_frame_interpolation_tab(settings: UISettings) -> FrameInterpolationTab
         select_source=select_source, clear_source=clear_source, target_fps=target_fps,
         engine=engine, quality=quality, codec=codec,
         container=container, rename_mode=rename_mode, custom_suffix=custom_suffix,
-        hdr_mode=hdr_mode, preview=preview, render=render, stop=stop, reset=reset,
+        hdr_mode=hdr_mode, preview_duration=preview_duration, preview=preview, render=render, stop=stop, reset=reset,
         output_video=output_video, save_download=save_download, zip_button=zip_button,
-        zip_download=zip_download, status=status, results=results)
+        zip_download=zip_download, send_to_compare=send_to_compare, status=status, results=results)
     tab.input_path, tab.output_path = input_path, output_path
+    tab.last_preview_path = gr.State(None)
     bind_frame_interpolation_events(tab)
     return tab
 
@@ -255,6 +269,8 @@ def bind_frame_interpolation_events(tab: FrameInterpolationTab) -> None:
         tab, render_frame_interpolation_batch, kind="video",
         preview_mode=update_frame_interpolation_preview_mode, archive_prefix="DLSSFG_VIDEO_BATCH",
         preview_actions=[(tab.preview, preview_frame_interpolation)],
+        preview_controls=[tab.preview_duration],
+        preview_result_state=tab.last_preview_path,
     )
     tab.codec.change(
         codec_settings_update, inputs=tab.codec,

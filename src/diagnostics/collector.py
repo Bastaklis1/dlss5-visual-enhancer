@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -261,6 +262,57 @@ def _classify_report(name: str, parent_name: str) -> str:
     if name.startswith(("upscale-", "upscale-image-")) and name.endswith(".json"):
         return "Batch manifest" if "batch-" in name else "Render report"
     return "Other"
+
+
+_LOG_LINE = re.compile(r"^\[(\d\d:\d\d:\d\d)\] (INFO|ERROR) ([\w-]+): (.*)$")
+
+# Every tag app_log.info()/error()/fail() actually uses in the real v9.0
+# source (confirmed by grepping every call site), grouped into the same
+# feature areas the old per-file report browser used to separate.
+_TAG_AREAS = {
+    "image-render": "Neural Rendering (Image)", "image-batch": "Neural Rendering (Image)",
+    "video-render": "Neural Rendering (Video)", "video-render-cuda": "Neural Rendering (Video)",
+    "video-batch": "Neural Rendering (Video)",
+    "upscale": "Upscale", "upscale-batch": "Upscale", "upscale-cuda": "Upscale", "upscale-host": "Upscale",
+    "upscale-image": "Upscale (Image)", "upscale-image-batch": "Upscale (Image)",
+    "frame-interp": "Frame Interpolation", "frame-interp-batch": "Frame Interpolation",
+    "live": "Live", "live-ffmpeg": "Live", "live-ffprobe": "Live", "live-mpv": "Live", "live-yt-dlp": "Live",
+    "ffmpeg": "System", "ffmpeg-mux": "System", "ffmpeg-preview": "System", "ffprobe": "System",
+    "cache": "System", "app": "System", "startup": "System",
+}
+
+
+def collect_render_activity(limit: int = 200, sessions: int = 1) -> list[dict[str, Any]]:
+    """Render outcomes and errors, parsed from the session log(s) -- the real
+    v9.0 replacement for the old per-file report browser (see the v9.0 note
+    above _classify_report()). Reads the `sessions` most recent
+    app-<timestamp>.log files (default: just the current one), newest
+    lines first, up to `limit` total. Returns dicts with time/area/tag/
+    level/message -- deliberately flat, since every line is already a
+    short, compact, human-readable event (app_log.py caps messages at 300
+    chars) rather than a structured report to unpack."""
+    try:
+        logs = sorted(LOGS.glob("app-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:max(sessions, 1)]
+    except OSError:
+        logs = []
+    rows: list[dict[str, Any]] = []
+    for log_path in logs:
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            match = _LOG_LINE.match(line)
+            if not match:
+                continue
+            time_str, level, tag, message = match.groups()
+            rows.append({
+                "time": time_str, "session": log_path.name, "area": _TAG_AREAS.get(tag, tag),
+                "tag": tag, "level": level, "message": message,
+            })
+            if len(rows) >= limit:
+                return rows
+    return rows
 
 
 def collect_reports(limit: int = 200) -> list[dict[str, Any]]:

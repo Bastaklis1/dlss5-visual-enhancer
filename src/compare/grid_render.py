@@ -80,6 +80,33 @@ GRID_AXES: dict[str, GridAxis] = {
         "skin_structure_strength", "Skin Structure Strength", "skin_structure_strength", "continuous",
         value_min=-1.0, value_max=2.0,
     ),
+    # Added post-9.0-migration: the masking/composition fields didn't exist
+    # at v7.0 (see grid_render.py's v9.0 note above) -- sweepable now that
+    # the underlying ImageConversionOptions fields are real.
+    "nr_passes": GridAxis(
+        "nr_passes", "NR Passes", "nr_passes", "continuous", value_min=1.0, value_max=4.0,
+        to_option=int,
+    ),
+    "nr_color_strength": GridAxis(
+        "nr_color_strength", "NR Color Strength", "nr_color_strength", "continuous",
+        value_min=0.0, value_max=1.0,
+    ),
+    "tone_preservation": GridAxis(
+        "tone_preservation", "Tone Preservation", "tone_preservation", "continuous",
+        value_min=0.0, value_max=1.0,
+    ),
+    "face_skin_protection": GridAxis(
+        "face_skin_protection", "Face/Skin Protection", "face_skin_protection", "continuous",
+        value_min=0.0, value_max=1.0,
+    ),
+    "grain_preservation": GridAxis(
+        "grain_preservation", "Grain Preservation", "grain_preservation", "continuous",
+        value_min=0.0, value_max=1.0,
+    ),
+    "mask_feather": GridAxis(
+        "mask_feather", "Mask Feather", "mask_feather", "continuous", value_min=0.0, value_max=128.0,
+        to_option=int,
+    ),
 }
 
 X_AXIS_CHOICES = [(axis.label, key) for key, axis in GRID_AXES.items()]
@@ -109,7 +136,7 @@ def _resolve_axis_values(axis_key: str, categorical_values, continuous_text) -> 
             parsed = float(raw)
         except ValueError:
             continue
-        values.append((f"{parsed:g}", parsed))
+        values.append((f"{parsed:g}", axis.to_option(parsed)))
     return values
 
 

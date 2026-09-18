@@ -17,6 +17,7 @@ import gradio as gr
 from . import collector
 
 REPORT_HEADERS = ["Name", "Kind", "Size", "Modified"]
+RENDER_ACTIVITY_HEADERS = ["Time", "Area", "Level", "Message"]
 GPU_HEADERS = ["#", "Name", "Driver", "Memory", "PCI Bus", "RTX-compatible", "Role"]
 RUNTIME_FILE_HEADERS = ["File", "Required", "Status", "Size", "Modified"]
 ENCODER_HEADERS = ["Encoder", "Available"]
@@ -115,6 +116,13 @@ def _report_rows() -> tuple[list[list[str]], list[str]]:
     return rows, paths
 
 
+def _render_activity_rows(sessions: int = 1) -> list[list[str]]:
+    return [
+        [e["time"], e["area"], e["level"], e["message"]]
+        for e in collector.collect_render_activity(sessions=sessions)
+    ]
+
+
 def _operational_log_rows() -> tuple[list[list[str]], list[str]]:
     """Same shape as _report_rows(): (display rows, parallel path list)."""
     logs = collector.collect_operational_logs()
@@ -146,6 +154,8 @@ class DiagnosticsTab:
     report_paths: object  # gr.State, parallel to reports_table's rows
     open_report_folder_btn: object
     open_report_folder_status: object
+    render_activity_table: object
+    refresh_render_activity_btn: object
     operational_logs_table: object
     operational_log_paths: object  # gr.State, parallel to operational_logs_table's rows
     operational_log_viewer: object
@@ -196,8 +206,10 @@ def build_diagnostics_tab() -> DiagnosticsTab:
 
     with gr.Accordion("Generation reports", open=False):
         gr.Markdown(
-            "Every render writes a report here — successes, batch manifests, "
-            "and failures, across every tab. Select a row to view its contents."
+            "v9.0 no longer writes a separate report file per render (see "
+            "**Render activity** below for that) -- this now only ever shows "
+            "the small `.err` file written on a real failure. Select a row "
+            "to view its contents."
         )
         reports_table = gr.Dataframe(
             headers=REPORT_HEADERS, value=report_rows, interactive=False, wrap=True,
@@ -208,6 +220,18 @@ def build_diagnostics_tab() -> DiagnosticsTab:
             open_report_folder_btn = gr.Button("Open containing folder")
         open_report_folder_status = gr.Markdown("")
         report_viewer = gr.Code(label="Selected report", language="json", value="", buttons=["copy"])
+
+    with gr.Accordion("Render activity (session log)", open=False):
+        gr.Markdown(
+            "Every render's outcome and any errors, across every tab, as "
+            "they were actually logged this session -- v9.0 writes one "
+            "compact line per event to the current session log instead of "
+            "a separate file per render. Newest first."
+        )
+        render_activity_table = gr.Dataframe(
+            headers=RENDER_ACTIVITY_HEADERS, value=_render_activity_rows(), interactive=False, wrap=True,
+        )
+        refresh_render_activity_btn = gr.Button("Refresh render activity")
 
     with gr.Accordion("Maintenance", open=False):
         gr.Markdown("**Application logs** — the app's own running logs, not per-render reports.")
@@ -252,6 +276,7 @@ def build_diagnostics_tab() -> DiagnosticsTab:
         reports_table=reports_table, report_viewer=report_viewer,
         refresh_reports_btn=refresh_reports_btn, report_paths=report_paths,
         open_report_folder_btn=open_report_folder_btn, open_report_folder_status=open_report_folder_status,
+        render_activity_table=render_activity_table, refresh_render_activity_btn=refresh_render_activity_btn,
         operational_logs_table=operational_logs_table, operational_log_paths=operational_log_paths,
         operational_log_viewer=operational_log_viewer,
         open_operational_log_folder_btn=open_operational_log_folder_btn,
@@ -343,6 +368,7 @@ def _refresh_all():
         _environment_markdown(),
         gr.update(value=report_rows), report_paths,
         gr.update(value=op_log_rows), op_log_paths,
+        gr.update(value=_render_activity_rows()),
         collector.build_diagnostic_summary(),
     )
 
@@ -367,6 +393,9 @@ def bind_diagnostics_events(tab: DiagnosticsTab) -> None:
         lambda paths: collector.open_containing_folder(paths[0] if paths else str(collector.LOGS)),
         inputs=[tab.report_paths], outputs=[tab.open_report_folder_status], queue=False,
     )
+    tab.refresh_render_activity_btn.click(
+        lambda: gr.update(value=_render_activity_rows()), outputs=[tab.render_activity_table], queue=False,
+    )
     tab.operational_logs_table.select(
         _view_selected_operational_log, inputs=[tab.operational_log_paths],
         outputs=[tab.operational_log_viewer], queue=False,
@@ -390,7 +419,8 @@ def bind_diagnostics_events(tab: DiagnosticsTab) -> None:
         outputs=[
             tab.gpu_table, tab.gpu_status, tab.runtime_files_table, tab.encoder_table,
             tab.environment_markdown, tab.reports_table, tab.report_paths,
-            tab.operational_logs_table, tab.operational_log_paths, tab.summary_box,
+            tab.operational_logs_table, tab.operational_log_paths, tab.render_activity_table,
+            tab.summary_box,
         ],
         queue=False,
     )

@@ -1,7 +1,7 @@
 # DLSS 5 Visual Enhancer
 
 Will update later. Permanent 9.0 offshoot from before restrictive license applied. 
-Future plans to fully rewrite with an open source worker and open source philosophy. 
+Future plans to fully rewrite with an open source philosophy. 
 
 
 ## License and third-party notices
